@@ -7,13 +7,6 @@ import { ChatInput } from "./chat-input";
 import { ChatMessage as Message } from "./chat-message";
 import { TypingIndicator } from "./typing-indicator";
 
-const starters = [
-  "Explain Successive products",
-  "Show me case studies",
-  "What is Successive PRISM?",
-  "Show the latest Successive resources",
-  "How can I contact Successive?",
-];
 const defaultWelcome =
   "Hello! I’m the Successive AI Assistant. I can help you explore Successive’s products, customer stories, resources, events, and more. What would you like to know?";
 const storageKey = "successive-chat:conversation:v1";
@@ -248,18 +241,6 @@ export function ChatWindow({
             onRetry={send}
           />
         ))}
-        {messages.length === 1 && (
-          <div className="starters">
-            <div>
-              <Sparkles size={14} /> Try asking
-            </div>
-            {starters.map((s) => (
-              <button onClick={() => send(s)} key={s}>
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
         {loading && (
           <div className="message-row assistant">
             <div className="avatar">
