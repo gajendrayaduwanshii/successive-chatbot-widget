@@ -55,6 +55,7 @@ describe("intent detection", () => {
     expect(detectIntent("who is Successive")).toBe("about");
     expect(detectIntent("Show customer stories")).toBe("case_studies");
     expect(detectIntent("Book a demo")).toBe("contact");
+    expect(detectIntent("I need help")).toBe("contact");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
     expect(

@@ -39,6 +39,9 @@ export function detectIntent(query: string): Intent {
       "talk to",
       "book a demo",
       "reach successive",
+      "need help",
+      "help me",
+      "get help",
     ])
   )
     return "contact";

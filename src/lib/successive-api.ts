@@ -112,6 +112,9 @@ const renderedContent = (item: WordPressItem): string =>
     ? item.content
     : (item.content?.rendered ?? "");
 
+const readableContentLength = (item: WordPressItem): number =>
+  htmlToParagraphs(renderedContent(item)).join(" ").length;
+
 async function enrichRenderedContent(
   item: WordPressItem,
   attempt = 0,
@@ -136,7 +139,14 @@ async function enrichRenderedContent(
     // A successful document without <main> uses a different template. Retrying
     // the identical response cannot add that element, so retain its REST data.
     if (!main) return item;
-    const plainText = htmlToParagraphs(main).join("\n");
+    const contentOnly = main
+      .replace(
+        /<(?:form|nav|footer|aside|noscript|svg|dialog)\b[^>]*>[\s\S]*?<\/(?:form|nav|footer|aside|noscript|svg|dialog)>/gi,
+        " ",
+      )
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
+    const plainText = htmlToParagraphs(contentOnly).join("\n");
     if (!plainText) return item;
     return { ...item, content: { rendered: plainText } };
   } catch {
@@ -177,15 +187,17 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
     if (failure?.status === "rejected") throw failure.reason;
     return [];
   }
-  // Every standard page is template-hydrated because most Successive page REST
-  // bodies are empty or summary-only. Posts already expose complete HTML in
-  // REST; only the exceptional empty post needs its public page as a fallback.
-  // All HTML is converted to clean paragraph text before it reaches the index.
+  // Pages and case studies are always template-hydrated because their REST
+  // bodies are commonly empty or summary-only. Other custom collections use
+  // public HTML when their REST body is insufficient. Posts keep their strong
+  // REST body and hydrate only the exceptional empty record.
   const itemsToHydrate = items.filter(
     (item) =>
       item.type === "page" ||
-      item.type === "industries" ||
-      (item.type === "post" && !renderedContent(item).trim()),
+      item.type === "case_study" ||
+      (item.type === "post"
+        ? readableContentLength(item) === 0
+        : readableContentLength(item) < 500),
   );
   const enrichedItems = await enrichWithConcurrency(itemsToHydrate);
   const enrichedByKey = new Map(
@@ -255,7 +267,7 @@ export async function fetchSuccessive(path: string): Promise<WordPressItem[]> {
 
   if (url.pathname.startsWith("/pages/")) {
     params.set("slug", url.pathname.slice("/pages/".length));
-    return fetchCollection("pages", params);
+    return enrichWithConcurrency(await fetchCollection("pages", params));
   }
   if (url.pathname === "/pages") return fetchCollection("pages", params);
   if (url.pathname === "/posts") return fetchCollection("posts", params);

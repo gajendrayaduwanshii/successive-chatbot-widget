@@ -142,8 +142,9 @@ export async function POST(request: NextRequest) {
   // Contact Us page and return one API-backed card; never run broad retrieval
   // that can mix in unrelated posts, case studies, or privacy content.
   if (intent === "contact") {
+    const canonicalContactUrl = `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/contact/`;
     try {
-      const item = (await fetchSuccessive("/pages/contact-us"))[0];
+      const item = (await fetchSuccessive("/pages/contact"))[0];
       if (!item) throw new Error("Contact page is unavailable");
       const document = buildSearchDocument(item);
       const description =
@@ -169,7 +170,7 @@ export async function POST(request: NextRequest) {
                 badge: "page",
               },
             ],
-            sources: [],
+            sources: [{ title: document.title, url: document.url }],
             suggestions: [],
             confidence: "high",
             insufficientContext: false,
@@ -178,11 +179,29 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     } catch {
-      return error(
-        503,
-        "CONTENT_UNAVAILABLE",
-        "Successive’s contact page is temporarily unavailable.",
-        cors.headers,
+      const description =
+        "Use the official Successive contact page to share your requirements or request assistance from the team.";
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: `## Contact Successive\n\nNeed help or want to discuss a requirement? Visit the official [Contact Us](${canonicalContactUrl}) page to connect with the Successive team.\n\n${description}`,
+            cards: [
+              {
+                type: "page",
+                title: "Get In Touch",
+                description,
+                url: canonicalContactUrl,
+                badge: "page",
+              },
+            ],
+            sources: [{ title: "Get In Touch", url: canonicalContactUrl }],
+            suggestions: [],
+            confidence: "high",
+            insufficientContext: false,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
   }
@@ -669,7 +688,7 @@ function ensureDescriptiveGroundedAnswer(
 ): string {
   const primary = matches[0]?.document;
   const simpleNavigation = primary
-    ? ["careers", "contact-us"].includes(primary.slug)
+    ? ["careers", "contact"].includes(primary.slug)
     : false;
   const hasHeading = /^#{1,3}\s+\S/m.test(answer);
   const withHeading =
