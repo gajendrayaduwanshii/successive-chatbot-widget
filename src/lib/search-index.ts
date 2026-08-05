@@ -168,7 +168,11 @@ export function buildSearchDocument(
   const descriptions = deduplicateSegments([
     ...editor,
     ...extracted.descriptions,
-  ]).filter((text) => segmentQuality(text) >= 30);
+  ]).filter(
+    (text) =>
+      segmentQuality(text) >= 30 &&
+      !/your browser does not support the video tag/i.test(text),
+  );
   const faqText = extracted.faqItems.flatMap((faq) => [
     faq.question,
     faq.answer,
@@ -177,7 +181,11 @@ export function buildSearchDocument(
     ...editor,
     ...extracted.textSegments,
     ...faqText,
-  ]).filter((text) => segmentQuality(text) >= 25);
+  ]).filter(
+    (text) =>
+      segmentQuality(text) >= 25 &&
+      !/your browser does not support the video tag/i.test(text),
+  );
   const normalizedTitle = normalizeSearchText(title);
   const titleTokens = normalizedTitle.split(" ");
   const successiveIndex = titleTokens.indexOf("successive");
