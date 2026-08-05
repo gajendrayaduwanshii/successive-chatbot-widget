@@ -5,7 +5,7 @@
 ```text
 Website/widget -> /api/ag-ui -> /api/chat
   -> language preparation and intent detection
-  -> all paginated Successive posts + pages
+  -> all paginated public Successive content collections
   -> normalized full-content search index
   -> ranked content chunks
   -> grounded LLM response
@@ -24,7 +24,8 @@ Website/widget -> /api/ag-ui -> /api/chat
 ## Content rules
 
 - Successive WordPress is the only factual knowledge source.
-- Load all pages of posts and pages; do not silently truncate data.
+- Load every page of all public content collections; never load users.
+- Hydrate industry pages because the REST records expose summaries only.
 - Do not invent claims, URLs, customers, metrics, or services.
 - Keep the AI key server-only.
 - Return an explicit error when WordPress or the AI provider is unavailable.

@@ -10,7 +10,22 @@ export class SuccessiveApiError extends Error {
   }
 }
 
-type Collection = "posts" | "pages";
+const CONTENT_COLLECTIONS = [
+  "posts",
+  "pages",
+  "accelerators",
+  "award",
+  "careers",
+  "case_study",
+  "employee-perspective",
+  "industries",
+  "media-coverage",
+  "partners",
+  "press-release",
+  "thought-leadership",
+] as const;
+
+type Collection = (typeof CONTENT_COLLECTIONS)[number];
 
 function endpoint(collection: Collection, params?: URLSearchParams): string {
   const base = getEnv().SUCCESSIVE_API_BASE_URL.replace(/\/$/, "");
@@ -83,12 +98,41 @@ async function fetchCollection(
   return [...first.items, ...rest.flatMap(({ items }) => items)];
 }
 
+async function enrichIndustryPage(item: WordPressItem): Promise<WordPressItem> {
+  if (!item.link) return item;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(item.link, {
+      signal: controller.signal,
+      next: { revalidate: 300 },
+      headers: { Accept: "text/html" },
+    });
+    if (!response.ok) return item;
+    const html = await response.text();
+    const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
+    if (!main) return item;
+    return { ...item, content: { rendered: main } };
+  } catch {
+    // The REST summary remains usable if the rendered page is unavailable.
+    return item;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
-  const results = await Promise.all([
-    fetchCollection("posts"),
-    fetchCollection("pages"),
-  ]);
-  return results.flat();
+  const results = await Promise.all(
+    CONTENT_COLLECTIONS.map((collection) => fetchCollection(collection)),
+  );
+  const items = results.flat();
+  const enrichedIndustries = await Promise.all(
+    items.filter((item) => item.type === "industries").map(enrichIndustryPage),
+  );
+  const industriesById = new Map(
+    enrichedIndustries.map((item) => [item.id, item]),
+  );
+  return items.map((item) => industriesById.get(item.id) ?? item);
 }
 
 /**

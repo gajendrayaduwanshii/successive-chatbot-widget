@@ -33,7 +33,7 @@ describe("Successive WordPress v2 adapter", () => {
 
     const items = await fetchAllPublishedContent();
     expect(items.map(({ type }) => type)).toEqual(["post", "page"]);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(12);
     expect(
       vi
         .mocked(fetch)

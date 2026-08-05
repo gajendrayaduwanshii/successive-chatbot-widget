@@ -6,14 +6,20 @@ Kagen chatbot is not modified.
 
 ## Data sources
 
-The server reads every paginated record from:
+The server reads every paginated record from the public WordPress v2 content
+collections, including:
 
 - `https://successive.tech/wp-json/wp/v2/posts`
 - `https://successive.tech/wp-json/wp/v2/pages`
+- `accelerators`, `award`, `careers`, `case_study`, `employee-perspective`
+- `industries`, `media-coverage`, `partners`, `press-release`
+- `thought-leadership`
 
 Posts and pages are requested with `_embed=1`, so featured media and author
 details are available to the content normalizer without calling the users
-endpoint. The derived search index is cached for five minutes.
+endpoint. Industry REST records contain only summaries, so their seven public
+pages are additionally hydrated from the rendered `<main>` content. The derived
+search index is cached for five minutes.
 
 ## Setup
 
