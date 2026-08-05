@@ -110,6 +110,7 @@ const HYDRATED_PAGE_SLUGS = new Set([
   "careers",
   "case-studies",
   "contact-us",
+  "custom-web-app-development",
   "digital-transformation-services",
   "home",
   "industries",
