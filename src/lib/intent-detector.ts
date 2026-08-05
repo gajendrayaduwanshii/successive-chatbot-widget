@@ -18,14 +18,14 @@ export function detectIntent(query: string): Intent {
   // as real content intents instead of requiring a full sentence.
   if (/^(about|about us|company|company info(?:rmation)?)$/.test(q))
     return "about";
+  if (/^(?:show me )?(?:customers|clients|customer examples?)$/.test(q))
+    return "case_studies";
   if (
     includes(q, [
       "case study",
       "case studies",
       "customer story",
       "customer stories",
-      "customers",
-      "clients",
       "success story",
       "success stories",
     ])

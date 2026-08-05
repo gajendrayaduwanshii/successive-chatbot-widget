@@ -57,6 +57,11 @@ describe("intent detection", () => {
     expect(detectIntent("Book a demo")).toBe("contact");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
+    expect(
+      detectIntent(
+        "Web apps strengthen online presence and engage customers across browsers.",
+      ),
+    ).toBe("general");
     expect(detectIntent("industers")).toBe("page");
   });
 });

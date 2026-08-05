@@ -42,7 +42,7 @@ async function fetchPage(
   attempt = 0,
 ): Promise<{ items: WordPressItem[]; totalPages: number }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  const timeout = setTimeout(() => controller.abort(), 12000);
   const query = new URLSearchParams(params);
   query.set("page", String(page));
   try {
@@ -172,35 +172,31 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
 export async function fetchRelevantRenderedPages(
   query: string,
 ): Promise<WordPressItem[]> {
+  if (/\b(?:web app|web apps|browser|online presence)\b/i.test(query)) {
+    const canonicalPages = await fetchCollection(
+      "pages",
+      new URLSearchParams({ slug: "custom-web-app-development" }),
+    );
+    return Promise.all(canonicalPages.map(enrichRenderedPage));
+  }
   let searches = [query];
-  const directSlugs: string[] = [];
   if (/\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(query)) {
     searches = [query, "artificial intelligence", "generative AI"];
-  } else if (/\b(?:web app|web apps|browser|online presence)\b/i.test(query)) {
-    searches = [query, "custom web app development"];
-    directSlugs.push("custom-web-app-development");
   }
-  const [directResults, searchResults] = await Promise.all([
-    Promise.all(
-      directSlugs.map((slug) =>
-        fetchCollection("pages", new URLSearchParams({ slug })),
-      ),
+  const searchSettled = await Promise.allSettled(
+    searches.map((search) =>
+      fetchCollection("pages", new URLSearchParams({ search, per_page: "20" })),
     ),
-    Promise.all(
-      searches.map((search) =>
-        fetchCollection(
-          "pages",
-          new URLSearchParams({ search, per_page: "20" }),
-        ),
-      ),
-    ),
-  ]);
+  );
+  const fulfilledItems = (
+    results: PromiseSettledResult<WordPressItem[]>[],
+  ): WordPressItem[] =>
+    results.flatMap((result) =>
+      result.status === "fulfilled" ? result.value : [],
+    );
   const pages = [
     ...new Map(
-      [...directResults.flat(), ...searchResults.flat()].map((page) => [
-        page.id,
-        page,
-      ]),
+      fulfilledItems(searchSettled).map((page) => [page.id, page]),
     ).values(),
   ].slice(0, 10);
   return Promise.all(pages.map(enrichRenderedPage));
