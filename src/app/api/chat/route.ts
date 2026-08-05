@@ -698,17 +698,25 @@ function bestStoryDescription(
     ...selectedPassages,
     ...document.textSegments,
   ];
-  const substantial = candidates.find((value) => {
+  const substantial = candidates.filter((value) => {
     const clean = value.replace(/\s+/g, " ").trim();
-    return clean.length >= 100 && normalizeHeading(clean) !== normalizedTitle;
+    return clean.length >= 60 && normalizeHeading(clean) !== normalizedTitle;
   });
-  return cleanStoryDescription(substantial ?? candidates[0] ?? document.title);
+  const unique = substantial.filter((value, index) => {
+    const clean = normalizeHeading(value);
+    return !substantial
+      .slice(0, index)
+      .some((previous) => normalizeHeading(previous).includes(clean));
+  });
+  return cleanStoryDescription(
+    unique.slice(0, 3).join(" ") || candidates[0] || document.title,
+  );
 }
 
 function cleanStoryDescription(value: string): string {
   const clean = value.replace(/\s+/g, " ").trim();
-  if (clean.length <= 240) return clean;
-  const shortened = clean.slice(0, 240);
+  if (clean.length <= 420) return clean;
+  const shortened = clean.slice(0, 420);
   const sentenceEnd = Math.max(
     shortened.lastIndexOf(". "),
     shortened.lastIndexOf("! "),
