@@ -39,6 +39,7 @@ async function fetchPage(
   collection: Collection,
   page: number,
   params = new URLSearchParams(),
+  attempt = 0,
 ): Promise<{ items: WordPressItem[]; totalPages: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
@@ -71,6 +72,12 @@ async function fetchPage(
       ),
     };
   } catch (error) {
+    if (
+      attempt === 0 &&
+      (!(error instanceof SuccessiveApiError) || error.kind !== "invalid")
+    ) {
+      return fetchPage(collection, page, params, attempt + 1);
+    }
     if (error instanceof SuccessiveApiError) throw error;
     if (error instanceof Error && error.name === "AbortError") {
       throw new SuccessiveApiError("WordPress request timed out", "timeout");
@@ -122,10 +129,17 @@ async function enrichIndustryPage(item: WordPressItem): Promise<WordPressItem> {
 }
 
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
-  const results = await Promise.all(
+  const settled = await Promise.allSettled(
     CONTENT_COLLECTIONS.map((collection) => fetchCollection(collection)),
   );
-  const items = results.flat();
+  const items = settled.flatMap((result) =>
+    result.status === "fulfilled" ? result.value : [],
+  );
+  if (!items.length) {
+    const failure = settled.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    return [];
+  }
   const enrichedIndustries = await Promise.all(
     items.filter((item) => item.type === "industries").map(enrichIndustryPage),
   );
