@@ -166,9 +166,20 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
 export async function fetchRelevantRenderedPages(
   query: string,
 ): Promise<WordPressItem[]> {
-  const params = new URLSearchParams({ search: query, per_page: "20" });
-  const pages = await fetchCollection("pages", params);
-  return Promise.all(pages.slice(0, 12).map(enrichRenderedPage));
+  const searches = /\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(
+    query,
+  )
+    ? [query, "artificial intelligence", "generative AI"]
+    : [query];
+  const results = await Promise.all(
+    searches.map((search) =>
+      fetchCollection("pages", new URLSearchParams({ search, per_page: "20" })),
+    ),
+  );
+  const pages = [
+    ...new Map(results.flat().map((page) => [page.id, page])).values(),
+  ].slice(0, 18);
+  return Promise.all(pages.map(enrichRenderedPage));
 }
 
 /**
