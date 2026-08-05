@@ -507,8 +507,7 @@ export async function POST(request: NextRequest) {
       cards: presentedMatches.map(({ document, selectedPassages }) => ({
         type: cardType(document.type),
         title: document.title,
-        description:
-          document.descriptions[0] ?? selectedPassages[0] ?? document.title,
+        description: bestStoryDescription(document, selectedPassages),
         url: document.url,
         image: document.image,
         badge: document.type,
@@ -668,16 +667,42 @@ function ensureDescriptiveGroundedAnswer(
     selectedPassages: string[];
   }>,
 ): string {
-  const sentences = answer.match(/[^.!?]+[.!?]+/g)?.length ?? 0;
-  if (answer.trim().length >= 180 && sentences >= 2) return answer;
+  const primary = matches[0]?.document;
+  const simpleNavigation = primary
+    ? ["careers", "contact-us"].includes(primary.slug)
+    : false;
+  const hasHeading = /^#{1,3}\s+\S/m.test(answer);
+  const withHeading =
+    primary && !simpleNavigation && !hasHeading
+      ? `## ${primary.title}\n\n${answer.trim()}`
+      : answer.trim();
+  const sentences = withHeading.match(/[^.!?]+[.!?]+/g)?.length ?? 0;
+  if (withHeading.length >= 180 && sentences >= 2) return withHeading;
 
   const details = matches.slice(0, 2).map(({ document, selectedPassages }) => {
-    const description = cleanStoryDescription(
-      document.descriptions[0] ?? selectedPassages[0] ?? document.title,
-    );
+    const description = bestStoryDescription(document, selectedPassages);
     return `[${document.title.replace(/[\[\]]/g, "")}](${document.url}) provides additional context: ${description}`;
   });
-  return details.length ? `${answer.trim()}\n\n${details.join(" ")}` : answer;
+  return details.length
+    ? `${withHeading}\n\n${details.join("\n\n")}`
+    : withHeading;
+}
+
+function bestStoryDescription(
+  document: SuccessiveSearchDocument,
+  selectedPassages: string[],
+): string {
+  const normalizedTitle = normalizeHeading(document.title);
+  const candidates = [
+    ...document.descriptions,
+    ...selectedPassages,
+    ...document.textSegments,
+  ];
+  const substantial = candidates.find((value) => {
+    const clean = value.replace(/\s+/g, " ").trim();
+    return clean.length >= 100 && normalizeHeading(clean) !== normalizedTitle;
+  });
+  return cleanStoryDescription(substantial ?? candidates[0] ?? document.title);
 }
 
 function cleanStoryDescription(value: string): string {
