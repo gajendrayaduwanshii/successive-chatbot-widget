@@ -10,7 +10,7 @@ export function isGreeting(message: string): boolean {
 export function greetingResponse(): AssistantResponse {
   return {
     answer:
-      "Hi! I’m the Successive AI Assistant. What would you like to explore today?",
+      "Hey there! Welcome to the Successive AI Assistant. What would you like to explore today?",
     cards: [],
     suggestions: [
       "Explore Successive services",
