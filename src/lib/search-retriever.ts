@@ -343,11 +343,10 @@ export async function retrieveFromIndex(
     };
   const categoryIndex = index.filter((document) => {
     if (intent === "products" || intent === "product_detail") {
-      return (
-        document.type === "product" ||
-        document.productLike ||
-        (document.type === "page" && document.slug === "products")
-      );
+      // Successive publishes services/solutions as standard pages and posts,
+      // not a custom `product` post type. Keep both collections eligible and
+      // let full-text relevance select AI, engineering, cloud, data, etc.
+      return ["page", "post", "product"].includes(document.type);
     }
     if (intent === "case_studies") {
       return (
