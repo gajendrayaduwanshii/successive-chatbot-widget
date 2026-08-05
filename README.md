@@ -4,6 +4,10 @@ Standalone Next.js chatbot and embeddable widget grounded in Successive
 Digital's public WordPress content. This is a separate project; the sibling
 Kagen chatbot is not modified.
 
+See [Successive Content API Audit](docs/SUCCESSIVE_CONTENT_API_AUDIT.md) for
+the live page-wise and post-wise API coverage, content completeness, pagination,
+and HTML-hydration requirements.
+
 ## Data sources
 
 The server reads every paginated record from the public WordPress v2 content
