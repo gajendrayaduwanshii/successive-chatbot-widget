@@ -115,7 +115,10 @@ const HYDRATED_PAGE_SLUGS = new Set([
   "industries",
 ]);
 
-async function enrichRenderedPage(item: WordPressItem): Promise<WordPressItem> {
+async function enrichRenderedPage(
+  item: WordPressItem,
+  attempt = 0,
+): Promise<WordPressItem> {
   if (!item.link) return item;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
@@ -125,14 +128,16 @@ async function enrichRenderedPage(item: WordPressItem): Promise<WordPressItem> {
       next: { revalidate: 300 },
       headers: { Accept: "text/html" },
     });
-    if (!response.ok) return item;
+    if (!response.ok) {
+      return attempt === 0 ? enrichRenderedPage(item, 1) : item;
+    }
     const html = await response.text();
     const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
-    if (!main) return item;
+    if (!main) return attempt === 0 ? enrichRenderedPage(item, 1) : item;
     return { ...item, content: { rendered: main } };
   } catch {
     // The REST summary remains usable if the rendered page is unavailable.
-    return item;
+    return attempt === 0 ? enrichRenderedPage(item, 1) : item;
   } finally {
     clearTimeout(timeout);
   }
@@ -178,7 +183,7 @@ export async function fetchRelevantRenderedPages(
   );
   const pages = [
     ...new Map(results.flat().map((page) => [page.id, page])).values(),
-  ].slice(0, 18);
+  ].slice(0, 10);
   return Promise.all(pages.map(enrichRenderedPage));
 }
 
