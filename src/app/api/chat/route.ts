@@ -51,8 +51,10 @@ const error = (
   );
 
 export async function OPTIONS(request: NextRequest) {
-  const cors = corsHeaders(request.headers.get("origin"));
-  if (!cors.isAllowed)
+  const origin = request.headers.get("origin");
+  const cors = corsHeaders(origin);
+  const isSameOrigin = origin === new URL(request.url).origin;
+  if (!cors.isAllowed && !isSameOrigin)
     return error(
       403,
       "ORIGIN_NOT_ALLOWED",
@@ -62,8 +64,10 @@ export async function OPTIONS(request: NextRequest) {
   return new NextResponse(null, { status: 204, headers: cors.headers });
 }
 export async function POST(request: NextRequest) {
-  const cors = corsHeaders(request.headers.get("origin"));
-  if (!cors.isAllowed)
+  const origin = request.headers.get("origin");
+  const cors = corsHeaders(origin);
+  const isSameOrigin = origin === new URL(request.url).origin;
+  if (!cors.isAllowed && !isSameOrigin)
     return error(
       403,
       "ORIGIN_NOT_ALLOWED",
