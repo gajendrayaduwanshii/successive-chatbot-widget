@@ -305,7 +305,7 @@ export async function retrieveFromIndex(
   const normalizedQuery = normalizeQuery(query);
   const intent = detectIntent(query);
   let index = baseIndex;
-  if (["products", "product_detail", "about", "page"].includes(intent)) {
+  if (!["blogs", "case_studies", "events"].includes(intent)) {
     try {
       const relevantPages = buildSearchIndex(
         await fetchRelevantRenderedPages(normalizedQuery || query),
