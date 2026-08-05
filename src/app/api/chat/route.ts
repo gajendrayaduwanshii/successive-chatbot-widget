@@ -677,7 +677,11 @@ function ensureDescriptiveGroundedAnswer(
       ? `## ${primary.title}\n\n${answer.trim()}`
       : answer.trim();
   const sentences = withHeading.match(/[^.!?]+[.!?]+/g)?.length ?? 0;
-  if (withHeading.length >= 180 && sentences >= 2) return withHeading;
+  const hasInlinePageLink = matches.some(({ document }) =>
+    withHeading.includes(`](${document.url})`),
+  );
+  if (withHeading.length >= 180 && sentences >= 2 && hasInlinePageLink)
+    return withHeading;
 
   const details = matches.slice(0, 2).map(({ document, selectedPassages }) => {
     const description = bestStoryDescription(document, selectedPassages);
