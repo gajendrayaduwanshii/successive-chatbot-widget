@@ -64,6 +64,8 @@ export function detectIntent(query: string): Intent {
       "services",
       "offering",
       "offerings",
+      "development",
+      "consulting",
       "solution",
       "solutions",
       "platform",
