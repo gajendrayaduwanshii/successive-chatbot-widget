@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Successive Widget Plain HTML Test</title>
+    <style>
+      body {
+        margin: 0;
+        font:
+          16px/1.6 system-ui,
+          sans-serif;
+        color: #172033;
+        background: #f5f7fb;
+      }
+      main {
+        max-width: 900px;
+        margin: 10vh auto;
+        padding: 32px;
+      }
+      h1 {
+        font-size: clamp(38px, 7vw, 72px);
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>SUCCESSIVE / PLAIN HTML HOST</p>
+      <h1>A host page with no React or widget dependencies.</h1>
+      <p>
+        This page verifies that the iframe widget is style-isolated and
+        installable with one script tag.
+      </p>
+    </main>
+    <script
+      src="/successive-chat-widget.js"
+      data-api-url="/api/chat"
+      data-title="Ask Successive AI"
+      data-primary-color="#0063ce"
+      data-position="bottom-right"
+      data-button-label="Chat with Successive"
+      defer
+    ></script>
+  </body>
+</html>
