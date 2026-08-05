@@ -301,15 +301,9 @@ export async function retrieveFromIndex(
   const index = await loadSearchIndex();
   const normalizedQuery = normalizeQuery(query);
   const intent = detectIntent(query);
-  const isProductList =
-    intent === "products" &&
-    normalizedQuery
-      .split(" ")
-      .every((term) =>
-        ["successive", "product", "products", "solution", "solutions"].includes(
-          term,
-        ),
-      );
+  // Successive exposes services and offerings as ordinary posts/pages. Do not
+  // apply the legacy custom-product post-type shortcut.
+  const isProductList = false;
   if (isProductList) {
     const matches = index
       .filter(

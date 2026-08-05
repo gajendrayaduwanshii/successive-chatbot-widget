@@ -535,7 +535,7 @@ function cardType(
 
 function buildHelpfulFallback(localizedFallback: string): string {
   const site = getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "");
-  return `${localizedFallback} Try searching the [Successive website](${site}/?s=) or explore [Successive products](${site}/products/) for more context.`;
+  return `${localizedFallback} Try searching the [Successive website](${site}/?s=) or explore [Successive services](${site}/digital-transformation-services/) for more context.`;
 }
 
 function buildContactAnswer(
