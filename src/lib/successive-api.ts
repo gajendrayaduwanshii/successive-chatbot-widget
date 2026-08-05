@@ -1,3 +1,4 @@
+import { unstable_cache } from "next/cache";
 import { getEnv } from "./env";
 import { htmlToParagraphs } from "./html-utils";
 import type { WordPressItem } from "@/types/wordpress";
@@ -122,7 +123,10 @@ async function enrichRenderedContent(
     const response = await fetch(item.link, {
       signal: controller.signal,
       next: { revalidate: 300 },
-      headers: { Accept: "text/html" },
+      headers: {
+        Accept: "text/html",
+        "User-Agent": "Mozilla/5.0 SuccessiveAIContentIndexer/1.0",
+      },
     });
     if (!response.ok) {
       return attempt === 0 ? enrichRenderedContent(item, 1) : item;
@@ -145,7 +149,7 @@ async function enrichRenderedContent(
 
 async function enrichWithConcurrency(
   items: WordPressItem[],
-  concurrency = 16,
+  concurrency = 32,
 ): Promise<WordPressItem[]> {
   const enriched = [...items];
   let cursor = 0;
@@ -161,7 +165,7 @@ async function enrichWithConcurrency(
   return enriched;
 }
 
-export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
+async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
   const settled = await Promise.allSettled(
     CONTENT_COLLECTIONS.map((collection) => fetchCollection(collection)),
   );
@@ -190,6 +194,20 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
   return items.map(
     (item) => enrichedByKey.get(`${item.type}:${item.id}`) ?? item,
   );
+}
+
+const fetchCachedPublishedContent = unstable_cache(
+  fetchAllPublishedContentUncached,
+  ["successive-hydrated-content-v1"],
+  { revalidate: 300 },
+);
+
+export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
+  // Tests use deterministic fetch mocks; production uses Vercel's shared data
+  // cache so a hydrated 900+ document corpus is reused across function instances.
+  return process.env.NODE_ENV === "test"
+    ? fetchAllPublishedContentUncached()
+    : fetchCachedPublishedContent();
 }
 
 export async function fetchRelevantRenderedPages(

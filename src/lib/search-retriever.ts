@@ -393,7 +393,13 @@ export async function retrieveFromIndex(
       // Successive publishes services/solutions as standard pages and posts,
       // not a custom `product` post type. Keep both collections eligible and
       // let full-text relevance select AI, engineering, cloud, data, etc.
-      return document.type === "page" || document.type === "product";
+      return (
+        document.type === "page" ||
+        document.type === "product" ||
+        (document.type === "post" &&
+          (document.normalizedTitle === normalizeSearchText(query) ||
+            document.aliases.includes(normalizedQuery)))
+      );
     }
     if (intent === "case_studies") {
       return (
