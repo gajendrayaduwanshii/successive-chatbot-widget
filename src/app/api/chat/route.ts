@@ -491,13 +491,20 @@ export async function POST(request: NextRequest) {
         cors.headers,
       );
     }
+    const groundedAnswer = ensureDescriptiveGroundedAnswer(
+      validated.data.answer,
+      selectedMatches,
+    );
+    const linkedMatches = selectedMatches.filter(({ document }) =>
+      groundedAnswer.includes(`](${document.url})`),
+    );
+    const presentedMatches = linkedMatches.length
+      ? linkedMatches
+      : selectedMatches.slice(0, 3);
     response = {
       ...validated.data,
-      answer: ensureDescriptiveGroundedAnswer(
-        validated.data.answer,
-        selectedMatches,
-      ),
-      cards: selectedMatches.map(({ document, selectedPassages }) => ({
+      answer: groundedAnswer,
+      cards: presentedMatches.map(({ document, selectedPassages }) => ({
         type: cardType(document.type),
         title: document.title,
         description:
@@ -506,7 +513,7 @@ export async function POST(request: NextRequest) {
         image: document.image,
         badge: document.type,
       })),
-      sources: selectedMatches.map(({ document }) => ({
+      sources: presentedMatches.map(({ document }) => ({
         title: document.title,
         url: document.url,
       })),
