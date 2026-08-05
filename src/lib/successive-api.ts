@@ -42,7 +42,7 @@ async function fetchPage(
   attempt = 0,
 ): Promise<{ items: WordPressItem[]; totalPages: number }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
   const query = new URLSearchParams(params);
   query.set("page", String(page));
   try {
@@ -122,7 +122,7 @@ async function enrichRenderedPage(
 ): Promise<WordPressItem> {
   if (!item.link) return item;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const response = await fetch(item.link, {
       signal: controller.signal,
@@ -172,18 +172,36 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
 export async function fetchRelevantRenderedPages(
   query: string,
 ): Promise<WordPressItem[]> {
-  const searches = /\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(
-    query,
-  )
-    ? [query, "artificial intelligence", "generative AI"]
-    : [query];
-  const results = await Promise.all(
-    searches.map((search) =>
-      fetchCollection("pages", new URLSearchParams({ search, per_page: "20" })),
+  let searches = [query];
+  const directSlugs: string[] = [];
+  if (/\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(query)) {
+    searches = [query, "artificial intelligence", "generative AI"];
+  } else if (/\b(?:web app|web apps|browser|online presence)\b/i.test(query)) {
+    searches = [query, "custom web app development"];
+    directSlugs.push("custom-web-app-development");
+  }
+  const [directResults, searchResults] = await Promise.all([
+    Promise.all(
+      directSlugs.map((slug) =>
+        fetchCollection("pages", new URLSearchParams({ slug })),
+      ),
     ),
-  );
+    Promise.all(
+      searches.map((search) =>
+        fetchCollection(
+          "pages",
+          new URLSearchParams({ search, per_page: "20" }),
+        ),
+      ),
+    ),
+  ]);
   const pages = [
-    ...new Map(results.flat().map((page) => [page.id, page])).values(),
+    ...new Map(
+      [...directResults.flat(), ...searchResults.flat()].map((page) => [
+        page.id,
+        page,
+      ]),
+    ).values(),
   ].slice(0, 10);
   return Promise.all(pages.map(enrichRenderedPage));
 }
