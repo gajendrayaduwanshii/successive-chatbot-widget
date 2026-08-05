@@ -41,6 +41,38 @@ describe("Successive WordPress v2 adapter", () => {
     ).toBe(false);
   });
 
+  it("hydrates every page and stores rendered HTML as clean paragraph text", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/pages"))
+          return response([
+            {
+              id: 20,
+              type: "page",
+              slug: "web-apps",
+              link: "https://successive.tech/web-apps/",
+              title: { rendered: "Web Apps" },
+              content: { rendered: "" },
+            },
+          ]);
+        if (url.pathname === "/web-apps/")
+          return new Response(
+            "<main><h1>Web Apps</h1><script>ignore()</script><p>Clean searchable content.</p></main>",
+            { status: 200, headers: { "Content-Type": "text/html" } },
+          );
+        return response([]);
+      }),
+    );
+
+    const items = await fetchAllPublishedContent();
+    expect(items[0]?.content).toEqual({
+      rendered: "Web Apps\nClean searchable content.",
+    });
+    expect(String(items[0]?.content)).not.toContain("ignore");
+  });
+
   it("follows X-WP-TotalPages for complete collection data", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = new URL(String(input));

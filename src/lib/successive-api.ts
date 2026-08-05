@@ -1,4 +1,5 @@
 import { getEnv } from "./env";
+import { htmlToParagraphs } from "./html-utils";
 import type { WordPressItem } from "@/types/wordpress";
 
 export class SuccessiveApiError extends Error {
@@ -105,18 +106,12 @@ async function fetchCollection(
   return [...first.items, ...rest.flatMap(({ items }) => items)];
 }
 
-const HYDRATED_PAGE_SLUGS = new Set([
-  "about-us",
-  "careers",
-  "case-studies",
-  "contact-us",
-  "custom-web-app-development",
-  "digital-transformation-services",
-  "home",
-  "industries",
-]);
+const renderedContent = (item: WordPressItem): string =>
+  typeof item.content === "string"
+    ? item.content
+    : (item.content?.rendered ?? "");
 
-async function enrichRenderedPage(
+async function enrichRenderedContent(
   item: WordPressItem,
   attempt = 0,
 ): Promise<WordPressItem> {
@@ -130,18 +125,40 @@ async function enrichRenderedPage(
       headers: { Accept: "text/html" },
     });
     if (!response.ok) {
-      return attempt === 0 ? enrichRenderedPage(item, 1) : item;
+      return attempt === 0 ? enrichRenderedContent(item, 1) : item;
     }
     const html = await response.text();
     const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
-    if (!main) return attempt === 0 ? enrichRenderedPage(item, 1) : item;
-    return { ...item, content: { rendered: main } };
+    // A successful document without <main> uses a different template. Retrying
+    // the identical response cannot add that element, so retain its REST data.
+    if (!main) return item;
+    const plainText = htmlToParagraphs(main).join("\n");
+    if (!plainText) return item;
+    return { ...item, content: { rendered: plainText } };
   } catch {
     // The REST summary remains usable if the rendered page is unavailable.
-    return attempt === 0 ? enrichRenderedPage(item, 1) : item;
+    return attempt === 0 ? enrichRenderedContent(item, 1) : item;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function enrichWithConcurrency(
+  items: WordPressItem[],
+  concurrency = 16,
+): Promise<WordPressItem[]> {
+  const enriched = [...items];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      enriched[index] = await enrichRenderedContent(items[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, worker),
+  );
+  return enriched;
 }
 
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
@@ -156,17 +173,23 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
     if (failure?.status === "rejected") throw failure.reason;
     return [];
   }
-  const enrichedPages = await Promise.all(
-    items
-      .filter(
-        (item) =>
-          item.type === "industries" ||
-          (item.type === "page" && HYDRATED_PAGE_SLUGS.has(item.slug ?? "")),
-      )
-      .map(enrichRenderedPage),
+  // Every standard page is template-hydrated because most Successive page REST
+  // bodies are empty or summary-only. Posts already expose complete HTML in
+  // REST; only the exceptional empty post needs its public page as a fallback.
+  // All HTML is converted to clean paragraph text before it reaches the index.
+  const itemsToHydrate = items.filter(
+    (item) =>
+      item.type === "page" ||
+      item.type === "industries" ||
+      (item.type === "post" && !renderedContent(item).trim()),
   );
-  const enrichedById = new Map(enrichedPages.map((item) => [item.id, item]));
-  return items.map((item) => enrichedById.get(item.id) ?? item);
+  const enrichedItems = await enrichWithConcurrency(itemsToHydrate);
+  const enrichedByKey = new Map(
+    enrichedItems.map((item) => [`${item.type}:${item.id}`, item]),
+  );
+  return items.map(
+    (item) => enrichedByKey.get(`${item.type}:${item.id}`) ?? item,
+  );
 }
 
 export async function fetchRelevantRenderedPages(
@@ -177,7 +200,7 @@ export async function fetchRelevantRenderedPages(
       "pages",
       new URLSearchParams({ slug: "custom-web-app-development" }),
     );
-    return Promise.all(canonicalPages.map(enrichRenderedPage));
+    return enrichWithConcurrency(canonicalPages);
   }
   let searches = [query];
   if (/\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(query)) {
@@ -199,7 +222,7 @@ export async function fetchRelevantRenderedPages(
       fulfilledItems(searchSettled).map((page) => [page.id, page]),
     ).values(),
   ].slice(0, 10);
-  return Promise.all(pages.map(enrichRenderedPage));
+  return enrichWithConcurrency(pages);
 }
 
 /**
