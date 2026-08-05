@@ -335,7 +335,7 @@ export async function POST(request: NextRequest) {
   if (intent === "blogs" && /\bblogs?\b/i.test(effectiveMessage)) {
     try {
       const [listingItems, postItems] = await Promise.all([
-        fetchSuccessive("/pages/blog").catch(() => []),
+        fetchSuccessive("/pages/blogs-and-insights").catch(() => []),
         fetchSuccessive("/content?type=post&per_page=100"),
       ]);
       const listing = listingItems[0]
@@ -366,7 +366,7 @@ export async function POST(request: NextRequest) {
             type: "page" as const,
             title: "Blogs",
             description: "Explore Successive's published blog articles.",
-            url: `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/blog/`,
+            url: `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/blogs-and-insights/`,
             badge: "blogs",
           };
       return NextResponse.json(
