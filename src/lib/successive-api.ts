@@ -163,6 +163,14 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
   return items.map((item) => enrichedById.get(item.id) ?? item);
 }
 
+export async function fetchRelevantRenderedPages(
+  query: string,
+): Promise<WordPressItem[]> {
+  const params = new URLSearchParams({ search: query, per_page: "20" });
+  const pages = await fetchCollection("pages", params);
+  return Promise.all(pages.slice(0, 12).map(enrichRenderedPage));
+}
+
 /**
  * Compatibility adapter for the original chatbot call sites. It translates the
  * old custom content paths into Successive's standard WordPress v2 endpoints.

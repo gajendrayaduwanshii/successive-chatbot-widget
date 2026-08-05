@@ -1,4 +1,7 @@
-import { fetchAllPublishedContent } from "./successive-api";
+import {
+  fetchAllPublishedContent,
+  fetchRelevantRenderedPages,
+} from "./successive-api";
 import { detectIntent } from "./intent-detector";
 import {
   buildSearchIndex,
@@ -298,9 +301,29 @@ export function rankSearchDocument(
 export async function retrieveFromIndex(
   query: string,
 ): Promise<RetrievalResult> {
-  const index = await loadSearchIndex();
+  const baseIndex = await loadSearchIndex();
   const normalizedQuery = normalizeQuery(query);
   const intent = detectIntent(query);
+  let index = baseIndex;
+  if (["products", "product_detail", "about", "page"].includes(intent)) {
+    try {
+      const relevantPages = buildSearchIndex(
+        await fetchRelevantRenderedPages(normalizedQuery || query),
+      );
+      const merged = new Map(
+        baseIndex.map((document) => [
+          `${document.type}:${document.id}`,
+          document,
+        ]),
+      );
+      relevantPages.forEach((document) =>
+        merged.set(`${document.type}:${document.id}`, document),
+      );
+      index = [...merged.values()];
+    } catch {
+      // The complete cached corpus remains available if targeted hydration fails.
+    }
+  }
   // Successive exposes services and offerings as ordinary posts/pages. Do not
   // apply the legacy custom-product post-type shortcut.
   const isProductList = false;
@@ -370,7 +393,7 @@ export async function retrieveFromIndex(
       // Successive publishes services/solutions as standard pages and posts,
       // not a custom `product` post type. Keep both collections eligible and
       // let full-text relevance select AI, engineering, cloud, data, etc.
-      return true;
+      return document.type !== "post";
     }
     if (intent === "case_studies") {
       return (
