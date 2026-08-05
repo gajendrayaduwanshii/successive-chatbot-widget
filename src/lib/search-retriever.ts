@@ -363,14 +363,17 @@ export async function retrieveFromIndex(
     return true;
   });
   const idf = buildInverseDocumentFrequency(categoryIndex);
-  const matches = categoryIndex
+  const rankedMatches = categoryIndex
     .map((document) => rankSearchDocument(document, query, idf))
     .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)
     .sort(
       (a, b) =>
         b.score - a.score ||
         b.document.contentQuality - a.document.contentQuality,
-    )
+    );
+  const relativeCutoff = Math.max(48, (rankedMatches[0]?.score ?? 0) * 0.65);
+  const matches = rankedMatches
+    .filter((match) => match.score >= relativeCutoff)
     .slice(0, 5);
   return {
     normalizedQuery,
