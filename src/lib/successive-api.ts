@@ -105,7 +105,17 @@ async function fetchCollection(
   return [...first.items, ...rest.flatMap(({ items }) => items)];
 }
 
-async function enrichIndustryPage(item: WordPressItem): Promise<WordPressItem> {
+const HYDRATED_PAGE_SLUGS = new Set([
+  "about-us",
+  "careers",
+  "case-studies",
+  "contact-us",
+  "digital-transformation-services",
+  "home",
+  "industries",
+]);
+
+async function enrichRenderedPage(item: WordPressItem): Promise<WordPressItem> {
   if (!item.link) return item;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
@@ -140,13 +150,17 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
     if (failure?.status === "rejected") throw failure.reason;
     return [];
   }
-  const enrichedIndustries = await Promise.all(
-    items.filter((item) => item.type === "industries").map(enrichIndustryPage),
+  const enrichedPages = await Promise.all(
+    items
+      .filter(
+        (item) =>
+          item.type === "industries" ||
+          (item.type === "page" && HYDRATED_PAGE_SLUGS.has(item.slug ?? "")),
+      )
+      .map(enrichRenderedPage),
   );
-  const industriesById = new Map(
-    enrichedIndustries.map((item) => [item.id, item]),
-  );
-  return items.map((item) => industriesById.get(item.id) ?? item);
+  const enrichedById = new Map(enrichedPages.map((item) => [item.id, item]));
+  return items.map((item) => enrichedById.get(item.id) ?? item);
 }
 
 /**

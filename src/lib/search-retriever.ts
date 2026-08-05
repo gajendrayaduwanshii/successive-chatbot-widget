@@ -82,8 +82,8 @@ export function normalizeQuery(query: string): string {
   // website page. This keeps answers grounded while supporting the terse
   // queries people naturally enter in a chat widget.
   const topicAliases: Record<string, string> = {
-    about: "successive company",
-    "about us": "successive company",
+    about: "about us successive company",
+    "about us": "about us successive company",
     customers: "customer case studies",
     clients: "customer case studies",
     careers: "careers jobs",
@@ -342,6 +342,30 @@ export async function retrieveFromIndex(
       isProductList,
     };
   const categoryIndex = index.filter((document) => {
+    if (intent === "about") {
+      return (
+        document.type === "page" &&
+        ["about-us", "about"].includes(document.slug)
+      );
+    }
+    if (
+      intent === "page" &&
+      /\b(?:career|careers|job|jobs)\b/.test(normalizedQuery)
+    ) {
+      return (
+        document.type === "careers" ||
+        (document.type === "page" && document.slug === "careers")
+      );
+    }
+    if (
+      intent === "page" &&
+      /\b(?:industry|industries)\b/.test(normalizedQuery)
+    ) {
+      return (
+        document.type === "industries" ||
+        (document.type === "page" && document.slug === "industries")
+      );
+    }
     if (intent === "products" || intent === "product_detail") {
       // Successive publishes services/solutions as standard pages and posts,
       // not a custom `product` post type. Keep both collections eligible and
@@ -363,8 +387,9 @@ export async function retrieveFromIndex(
     return true;
   });
   const idf = buildInverseDocumentFrequency(categoryIndex);
+  const scoringQuery = intent === "about" ? "about us" : query;
   const rankedMatches = categoryIndex
-    .map((document) => rankSearchDocument(document, query, idf))
+    .map((document) => rankSearchDocument(document, scoringQuery, idf))
     .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)
     .sort(
       (a, b) =>

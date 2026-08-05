@@ -62,7 +62,7 @@ describe("intent detection", () => {
 });
 describe("short topic query normalization", () => {
   it("expands navigation prompts and common misspellings for retrieval", () => {
-    expect(normalizeQuery("about")).toBe("successive company");
+    expect(normalizeQuery("about")).toBe("us successive company");
     expect(normalizeQuery("customers")).toBe("customer case studies");
     expect(normalizeQuery("careers")).toBe("careers jobs");
     expect(normalizeQuery("industers")).toBe("industries industry");
