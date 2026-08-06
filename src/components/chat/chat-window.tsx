@@ -43,6 +43,7 @@ export function ChatWindow({
   const [loading, setLoading] = useState(false);
   const end = useRef<HTMLDivElement>(null);
   const sessionId = useRef("");
+  const receivedExternalPrompts = useRef(new Set<string>());
   const postParent = useCallback(
     (type: string, payload?: Record<string, unknown>) => {
       if (!embedded) return;
@@ -79,8 +80,7 @@ export function ChatWindow({
     } catch {
       sessionId.current = crypto.randomUUID();
     }
-    postParent("SUCCESSIVE_CHAT_READY");
-  }, [postParent]);
+  }, []);
   useEffect(() => {
     try {
       sessionStorage.setItem(storageKey, JSON.stringify(messages));
@@ -174,6 +174,54 @@ export function ChatWindow({
     },
     [apiUrl, loading, messages, postParent],
   );
+  useEffect(() => {
+    if (!embedded) return;
+    const receiveParentMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const message = event.data as {
+        namespace?: unknown;
+        type?: unknown;
+        payload?: { id?: unknown; message?: unknown };
+      };
+      if (
+        message?.namespace !== "successive-chat" ||
+        message.type !== "SUCCESSIVE_CHAT_SUBMIT" ||
+        typeof message.payload?.message !== "string"
+      )
+        return;
+      let trustedOrigin = parentOrigin;
+      try {
+        if (document.referrer) trustedOrigin = new URL(document.referrer).origin;
+      } catch {
+        /* use the validated parentOrigin query parameter */
+      }
+      if (
+        trustedOrigin &&
+        trustedOrigin !== "null" &&
+        event.origin !== trustedOrigin
+      )
+        return;
+      const text = message.payload.message.trim();
+      if (text.length < 2 || text.length > 1000) return;
+      const requestId =
+        typeof message.payload.id === "string" ? message.payload.id : "";
+      if (requestId) {
+        postParent("SUCCESSIVE_CHAT_SUBMIT_ACK", { id: requestId });
+        if (receivedExternalPrompts.current.has(requestId)) return;
+        receivedExternalPrompts.current.add(requestId);
+      }
+      void send(text);
+    };
+    window.addEventListener("message", receiveParentMessage);
+    return () => window.removeEventListener("message", receiveParentMessage);
+  }, [embedded, parentOrigin, postParent, send]);
+  useEffect(() => {
+    if (!embedded) return;
+    // Announce readiness only after the submit-message listener above has
+    // mounted. Otherwise the parent can flush its queued prompt before this
+    // iframe is able to receive it.
+    postParent("SUCCESSIVE_CHAT_READY");
+  }, [embedded, postParent]);
   const clear = () => {
     setMessages([welcome]);
     try {
@@ -185,7 +233,7 @@ export function ChatWindow({
   const closeEmbed = () => postParent("SUCCESSIVE_CHAT_CLOSE");
   return (
     <section
-      className={`chat-panel ${widget ? "widget-chat" : ""} ${embedded ? "embed-chat" : ""}`}
+      className={`successive-chat-ui chat-panel ${widget ? "widget-chat" : ""} ${embedded ? "embed-chat" : ""}`}
       aria-label="Successive AI chat"
       style={
         primaryColor

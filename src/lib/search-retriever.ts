@@ -2,7 +2,7 @@ import {
   fetchAllPublishedContent,
   fetchRelevantRenderedPages,
 } from "./successive-api";
-import { detectIntent } from "./intent-detector";
+import { detectIntent, type Intent } from "./intent-detector";
 import {
   buildSearchIndex,
   normalizeSearchText,
@@ -91,6 +91,69 @@ export interface RetrievalResult {
   reliableMatchFound: boolean;
   matches: SearchMatch[];
   isProductList: boolean;
+  collectionTotal?: number;
+  collectionLabel?: string;
+}
+
+function requestedCollection(query: string):
+  | { label: string; matches: (document: SuccessiveSearchDocument) => boolean }
+  | undefined {
+  const q = normalizeSearchText(query);
+  if (!/\b(?:total|all|list|count|how many)\b/.test(q)) return undefined;
+  if (/\b(?:webinar|webinars|event|events)\b/.test(q))
+    return {
+      label: "webinars and events",
+      matches: (document) =>
+        /\b(?:webinars?|events?)\b/.test(
+          `${document.normalizedTitle} ${document.slug.replace(/-/g, " ")}`,
+        ),
+    };
+  if (/\bcase stud(?:y|ies)\b/.test(q))
+    return {
+      label: "case studies",
+      matches: (document) => document.type.includes("case"),
+    };
+  if (/\b(?:blog|blogs|articles|insights)\b/.test(q))
+    return { label: "blogs and insights", matches: (document) => document.type === "post" };
+  if (/\b(?:industry|industries)\b/.test(q))
+    return { label: "industries", matches: (document) => document.type === "industries" };
+  if (/\baccelerators?\b/.test(q))
+    return { label: "accelerators", matches: (document) => document.type === "accelerators" };
+  if (/\b(?:press releases?|media coverage|newsroom)\b/.test(q))
+    return {
+      label: "PR and media coverage",
+      matches: (document) => ["press-release", "media-coverage"].includes(document.type),
+    };
+  if (/\b(?:career|careers|jobs)\b/.test(q))
+    return { label: "career pages", matches: (document) => document.type === "careers" };
+  if (/\b(?:partners|alliances)\b/.test(q))
+    return { label: "partners and alliances", matches: (document) => document.type === "partners" };
+  if (/\b(?:awards|recognitions)\b/.test(q))
+    return { label: "awards and recognitions", matches: (document) => document.type === "award" };
+  if (/\b(?:thought leadership|thought-leadership)\b/.test(q))
+    return { label: "thought leadership", matches: (document) => document.type === "thought-leadership" };
+  if (/\b(?:expert|experts|expertise)\b/.test(q))
+    return { label: "expertise pages", matches: (document) => normalizedServiceType(document.service_type) === "expertise" };
+  if (/\b(?:pillar|pillars|piller|pillers)\b/.test(q))
+    return { label: "service pillars", matches: (document) => normalizedServiceType(document.service_type) === "pillar" };
+  if (/\bservices?\b/.test(q))
+    return { label: "services", matches: (document) => normalizedServiceType(document.service_type) === "service" };
+  return undefined;
+}
+
+function isWhitepaperDocument(document: SuccessiveSearchDocument): boolean {
+  if (
+    document.type !== "page" ||
+    document.slug === "whitepaper-listing"
+  )
+    return false;
+  return (
+    document.combinedText.includes("download this whitepaper") ||
+    /(?:white-?paper|ebook)/.test(document.slug) ||
+    /^(?:gen ai implementation guide for banking|create an experience led growth strategy to win customers)$/.test(
+      document.normalizedTitle,
+    )
+  );
 }
 
 export function normalizeQuery(query: string): string {
@@ -128,6 +191,10 @@ export function normalizeQuery(query: string): string {
     induster: "industry",
     industers: "industries",
     servies: "services",
+    whitepeper: "whitepaper",
+    whitepepers: "whitepapers",
+    whtieperper: "whitepaper",
+    whtieperpers: "whitepapers",
   };
   const corrected = tokens.map((token) => corrections[token] ?? token);
   return [...new Set(corrected)].join(" ");
@@ -391,11 +458,19 @@ export function rankSearchDocument(
 
 export async function retrieveFromIndex(
   query: string,
+  currentIntent?: Intent,
+  currentMessage = query,
 ): Promise<RetrievalResult> {
   const baseIndex = await loadSearchIndex();
   const normalizedQuery = normalizeQuery(query);
-  const requestedServiceTypes = detectRequestedServiceTypes(query);
-  const intent = detectIntent(query);
+  const intent =
+    currentIntent && currentIntent !== "general"
+      ? currentIntent
+      : detectIntent(query);
+  const requestedServiceTypes =
+    intent === "products" || intent === "product_detail"
+      ? detectRequestedServiceTypes(currentMessage)
+      : [];
   let index = baseIndex;
   if (!["blogs", "case_studies", "events"].includes(intent)) {
     try {
@@ -456,11 +531,78 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
-  const collectionDocuments = /\b(?:industry|industries)\b/.test(
-    normalizedQuery,
-  )
+  if (/\bwhite ?papers?\b/.test(normalizeQuery(currentMessage))) {
+    const requestedLatest = /\b(?:latest|newest|most recent)\b/.test(
+      normalizeSearchText(query),
+    );
+    const requestedFullCollection = /\b(?:total|all|list|count|how many)\b/.test(
+      normalizeSearchText(currentMessage),
+    );
+    const requestedMore = /\b(?:more|another|other|others|different|next)\b/.test(
+      normalizeSearchText(currentMessage),
+    );
+    const allWhitepapers = index.filter(isWhitepaperDocument).sort(
+      (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
+    );
+    const whitepapers = allWhitepapers
+      .slice(
+        0,
+        requestedLatest ? 1 : requestedFullCollection || requestedMore ? 15 : 3,
+      )
+      .map((document, position) => ({
+        document,
+        score: 200 - position,
+        matchedFields: ["whitepaper-resource", "modified-date-order"],
+        selectedPassages: document.chunks[0]?.text
+          ? [document.chunks[0].text]
+          : [],
+      }))
+      .filter((match) => match.selectedPassages.length > 0);
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: whitepapers.length > 0,
+      matches: whitepapers,
+      isProductList,
+      collectionTotal: allWhitepapers.length,
+      collectionLabel: "whitepapers",
+    };
+  }
+  const collectionRequest = requestedCollection(currentMessage);
+  if (collectionRequest) {
+    const collection = index
+      .filter(collectionRequest.matches)
+      .sort(
+        (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
+      );
+    const matches = collection
+      .slice(0, 15)
+      .map((document, position) => ({
+        document,
+        score: 200 - position,
+        matchedFields: ["collection-list", "modified-date-order"],
+        selectedPassages: document.chunks[0]?.text
+          ? [document.chunks[0].text]
+          : [],
+      }))
+      .filter((match) => match.selectedPassages.length > 0);
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0,
+      matches,
+      isProductList,
+      collectionTotal: collection.length,
+      collectionLabel: collectionRequest.label,
+    };
+  }
+  const normalizedCurrentMessage = normalizeQuery(currentMessage);
+  const collectionDocuments =
+    intent === "page" &&
+    /\b(?:industry|industries)\b/.test(normalizedCurrentMessage)
     ? index.filter((document) => document.type === "industries")
-    : /\b(?:career|careers|job|jobs)\b/.test(normalizedQuery)
+    : intent === "page" &&
+        /\b(?:career|careers|job|jobs)\b/.test(normalizedCurrentMessage)
       ? index.filter(
           (document) =>
             document.type === "careers" || document.slug === "careers",
@@ -488,7 +630,7 @@ export async function retrieveFromIndex(
     };
   }
   const categoryIndex = index.filter((document) => {
-    if (!matchesRequestedServiceType(query, document.service_type))
+    if (!matchesRequestedServiceType(currentMessage, document.service_type))
       return false;
     if (intent === "about") {
       return (
@@ -499,10 +641,21 @@ export async function retrieveFromIndex(
     if (/\bprivacy\b/.test(normalizedQuery)) {
       return document.type === "page" && document.slug === "privacy-policy";
     }
-    if (/\bfull stack\b/.test(normalizedQuery)) {
+    if (intent !== "case_studies" && /\bfull stack\b/.test(normalizedQuery)) {
       return (
         document.type === "page" &&
         document.slug === "full-stack-development-company"
+      );
+    }
+    if (
+      intent !== "case_studies" &&
+      /\b(?:location data|location intelligence|gis|arcgis)\b/.test(
+        normalizedQuery,
+      )
+    ) {
+      return (
+        document.type === "page" &&
+        /(?:location-intelligence|esri-arcgis|^gis$)/.test(document.slug)
       );
     }
     if (/\bsuccessive add\b/.test(normalizeSearchText(query))) {
@@ -520,7 +673,8 @@ export async function retrieveFromIndex(
       );
     }
     if (
-      /\b(?:career|careers|job|jobs)\b/.test(normalizedQuery)
+      intent === "page" &&
+      /\b(?:career|careers|job|jobs)\b/.test(normalizedCurrentMessage)
     ) {
       return (
         document.type === "careers" ||
@@ -528,7 +682,8 @@ export async function retrieveFromIndex(
       );
     }
     if (
-      /\b(?:industry|industries)\b/.test(normalizedQuery)
+      intent === "page" &&
+      /\b(?:industry|industries)\b/.test(normalizedCurrentMessage)
     ) {
       return (
         document.type === "industries" ||
@@ -578,6 +733,15 @@ export async function retrieveFromIndex(
   const scoringQuery = intent === "about" ? "about us" : topicalQuery || query;
   const rankedMatches = categoryIndex
     .map((document) => rankSearchDocument(document, scoringQuery, idf))
+    .map((match) =>
+      intent === "events" && match.document.slug === "webinars"
+        ? {
+            ...match,
+            score: 500,
+            matchedFields: [...match.matchedFields, "event-collection"],
+          }
+        : match,
+    )
     .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)
     .sort(
       (a, b) =>

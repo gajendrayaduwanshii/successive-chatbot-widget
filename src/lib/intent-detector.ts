@@ -13,7 +13,19 @@ const includes = (text: string, terms: string[]) =>
   terms.some((term) => text.includes(term));
 
 export function detectIntent(query: string): Intent {
-  const q = query.toLowerCase().replace(/\s+/g, " ").trim();
+  const q = query
+    .toLowerCase()
+    .replace(/\bservies\b/g, "services")
+    .replace(/\bsulutions?\b/g, "solutions")
+    .replace(/\bhelthcare\b/g, "healthcare")
+    .replace(/\bwebniars?\b/g, "webinars")
+    .replace(/\bwhitepepers?\b/g, "whitepapers")
+    .replace(/\bwhtieperpers?\b/g, "whitepapers")
+    .replace(/\bstduy\b/g, "study")
+    .replace(/\bdevlopment\b/g, "development")
+    .replace(/\breleted\b/g, "related")
+    .replace(/\s+/g, " ")
+    .trim();
   // Visitors often use navigation-style one or two word prompts. Treat those
   // as real content intents instead of requiring a full sentence.
   if (/^(about|about us|company|company info(?:rmation)?)$/.test(q))
@@ -28,10 +40,28 @@ export function detectIntent(query: string): Intent {
       "customer stories",
       "success story",
       "success stories",
+      "another example",
+      "similar example",
+      "similar work",
+      "done something similar",
+      "any example",
+      "any examples",
+      "example for this",
+      "examples for this",
     ])
   )
     return "case_studies";
-  if (includes(q, ["event", "events", "webinar", "webinars"])) return "events";
+  if (
+    includes(q, [
+      "event",
+      "events",
+      "webinar",
+      "webinars",
+      "which one should i attend",
+      "where can i register",
+    ])
+  )
+    return "events";
   if (
     includes(q, [
       "contact",
@@ -44,6 +74,7 @@ export function detectIntent(query: string): Intent {
       "where is successive located",
       "office locations",
       "speak with someone",
+      "what should i do next",
       "project estimate",
       "get an estimate",
     ])
@@ -84,7 +115,21 @@ export function detectIntent(query: string): Intent {
     ])
   )
     return "products";
-  if (includes(q, ["resource", "resources"])) return "resources";
+  if (
+    includes(q, [
+      "resource",
+      "resources",
+      "whitepaper",
+      "whitepapers",
+      "white paper",
+      "white papers",
+      "whitepeper",
+      "whitepepers",
+      "whtieperper",
+      "whtieperpers",
+    ])
+  )
+    return "resources";
   if (includes(q, ["blog", "article", "articles", "insight", "insights"]))
     return "blogs";
   if (

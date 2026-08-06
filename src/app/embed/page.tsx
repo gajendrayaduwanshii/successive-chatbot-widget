@@ -33,12 +33,7 @@ export default async function EmbedPage({
   }
   try {
     if (candidateParentOrigin) {
-      if (candidateParentOrigin === "null") {
-        // Local HTML opened with file:// has an opaque origin. postMessage can
-        // reach an opaque parent only with "*"; the host loader still verifies
-        // both the iframe window and the widget's own origin on receipt.
-        parentOrigin = "*";
-      }
+      if (candidateParentOrigin === "null") parentOrigin = "*";
       const parsed = new URL(candidateParentOrigin);
       if (
         parsed.origin === candidateParentOrigin &&
@@ -50,7 +45,7 @@ export default async function EmbedPage({
       }
     }
   } catch {
-    /* retain the opaque-origin fallback or use the trusted iframe referrer */
+    /* retain opaque-origin fallback or use the trusted iframe referrer */
   }
   return (
     <main

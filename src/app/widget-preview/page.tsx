@@ -27,6 +27,8 @@ export default function WidgetPreview() {
   const [height, setHeight] = useState(650);
   const [openDefault, setOpenDefault] = useState(false);
   const [mobile, setMobile] = useState(false);
+  const [promptInputId, setPromptInputId] = useState("ai-search");
+  const [promptButtonId, setPromptButtonId] = useState("ai-search-button");
   const [open, setOpen] = useState(openDefault);
   const [copied, setCopied] = useState(false);
   const previewFrame = useRef<HTMLIFrameElement>(null);
@@ -73,6 +75,8 @@ export default function WidgetPreview() {
   data-width="${width}"
   data-height="${height}"
   data-open-by-default="${openDefault}"
+  data-prompt-input-id="${promptInputId}"
+  data-prompt-button-id="${promptButtonId}"
   defer
 ></script>`;
   const copy = async () => {
@@ -143,6 +147,30 @@ export default function WidgetPreview() {
               max="850"
               value={height}
               onChange={(e) => setHeight(Number(e.target.value))}
+            />
+          </label>
+          <label>
+            Search input/textarea ID{" "}
+            <input
+              value={promptInputId}
+              placeholder="ai-search"
+              onChange={(event) => {
+                const value = event.target.value;
+                if (/^[A-Za-z][\w:.-]*$/.test(value) || value === "")
+                  setPromptInputId(value);
+              }}
+            />
+          </label>
+          <label>
+            Search button ID{" "}
+            <input
+              value={promptButtonId}
+              placeholder="ai-search-button"
+              onChange={(event) => {
+                const value = event.target.value;
+                if (/^[A-Za-z][\w:.-]*$/.test(value) || value === "")
+                  setPromptButtonId(value);
+              }}
             />
           </label>
           <label className="toggle">

@@ -11,6 +11,7 @@
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
+    ,"test:e2e": "node scripts/e2e-conversation-test.mjs"
   },
   "dependencies": {
     "lucide-react": "latest",

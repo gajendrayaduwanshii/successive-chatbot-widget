@@ -45,6 +45,10 @@ import {
   prepareEnglishQuery,
 } from "./query-language";
 import { greetingResponse, isGreeting } from "./conversation";
+import {
+  buildConversationRetrievalQuery,
+  isVagueBusinessDiscovery,
+} from "./conversation-context";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -56,16 +60,89 @@ describe("intent detection", () => {
     expect(detectIntent("Tell me about Successive services")).toBe("products");
     expect(detectIntent("who is Successive")).toBe("about");
     expect(detectIntent("Show customer stories")).toBe("case_studies");
+    expect(detectIntent("any example")).toBe("case_studies");
+    expect(detectIntent("show me another example")).toBe("case_studies");
+    expect(detectIntent("what servies you provid")).toBe("products");
+    expect(detectIntent("any webniar for cloud")).toBe("events");
+    expect(detectIntent("show case stduy")).toBe("case_studies");
+    expect(detectIntent("we need app devlopment")).toBe("products");
     expect(detectIntent("Book a demo")).toBe("contact");
     expect(detectIntent("I need help")).toBe("general");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
+    expect(detectIntent("latest whitepaper")).toBe("resources");
+    expect(detectIntent("whitepeper")).toBe("resources");
+    expect(detectIntent("whtieperper")).toBe("resources");
     expect(
       detectIntent(
         "Web apps strengthen online presence and engage customers across browsers.",
       ),
     ).toBe("general");
     expect(detectIntent("industers")).toBe("page");
+  });
+});
+
+describe("multi-turn conversation context", () => {
+  it("carries recent business context into referential content transitions", () => {
+    const query = buildConversationRetrievalQuery("Any case studies?", [
+      { role: "user", content: "I work in healthcare." },
+      { role: "assistant", content: "How can we help?" },
+      { role: "user", content: "We want to improve hospital operations." },
+      { role: "assistant", content: "AI may help." },
+      { role: "user", content: "Can AI help us as well?" },
+    ]);
+    expect(query).toContain("healthcare");
+    expect(query).toContain("hospital operations");
+    expect(query).toContain("Any case studies?");
+  });
+
+  it("resets retrieval context when the visitor explicitly changes topic", () => {
+    expect(
+      buildConversationRetrievalQuery("Actually I am more interested in cloud", [
+        { role: "user", content: "Show me AI services" },
+      ]),
+    ).toBe("Actually I am more interested in cloud");
+  });
+
+  it("keeps a standalone AI services query independent from old history", () => {
+    expect(
+      buildConversationRetrievalQuery("ai services", [
+        { role: "user", content: "Which industries can use GIS?" },
+        { role: "assistant", content: "Agriculture and healthcare." },
+        { role: "user", content: "Do you have any webinars?" },
+      ]),
+    ).toBe("ai services");
+  });
+
+  it("keeps a misspelled whitepaper query independent from old history", () => {
+    expect(
+      buildConversationRetrievalQuery("whitepeper", [
+        { role: "user", content: "Show me AI services" },
+      ]),
+    ).toBe("whitepeper");
+  });
+
+  it("does not let an old collection override a new all-services request", () => {
+    expect(
+      buildConversationRetrievalQuery("all service", [
+        { role: "user", content: "all whitepaper" },
+        { role: "assistant", content: "Here are the whitepapers." },
+      ]),
+    ).toBe("all service");
+  });
+
+  it("recognizes fragmented discovery prompts", () => {
+    expect(isVagueBusinessDiscovery("Need help")).toBe(true);
+    expect(isVagueBusinessDiscovery("Cloud migration help")).toBe(false);
+  });
+
+  it("recognizes generic service recommendation requests with typos", () => {
+    expect(isVagueBusinessDiscovery("i need some suggetion for services")).toBe(
+      true,
+    );
+    expect(isVagueBusinessDiscovery("recommend services for my business")).toBe(
+      true,
+    );
   });
 });
 

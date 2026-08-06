@@ -18,6 +18,10 @@ import {
 } from "@/lib/search-index";
 import { retrieveFromIndex } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
+import {
+  buildConversationRetrievalQuery,
+  isVagueBusinessDiscovery,
+} from "@/lib/conversation-context";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -138,17 +142,13 @@ export async function POST(request: NextRequest) {
   }
   const effectiveMessage = preparedQuery.englishQuery;
   const intent = detectIntent(effectiveMessage);
-  const previousUserMessage = [...parsed.data.history]
-    .reverse()
-    .find((message) => message.role === "user")?.content;
-  const referentialFollowUp =
-    /\b(?:that|this|it|these|those|them|simpler|more detail|explain more|how does that)\b/i.test(
-      effectiveMessage,
-    );
-  const retrievalMessage =
-    referentialFollowUp && previousUserMessage
-      ? `${previousUserMessage}. ${effectiveMessage}`
-      : effectiveMessage;
+  const contextualQuery = buildConversationRetrievalQuery(
+    effectiveMessage,
+    parsed.data.history,
+  );
+  const retrievalMessage = isVagueBusinessDiscovery(contextualQuery)
+    ? "digital transformation digital engineering cloud data artificial intelligence experience design services"
+    : contextualQuery;
   // Contact is a deterministic navigation intent. Fetch only the published
   // Contact Us page and return one API-backed card; never run broad retrieval
   // that can mix in unrelated posts, case studies, or privacy content.
@@ -182,7 +182,7 @@ export async function POST(request: NextRequest) {
               },
             ],
             sources: [{ title: document.title, url: document.url }],
-            suggestions: [],
+            suggestions: buildRelatedSuggestions("contact", document.title),
             confidence: "high",
             insufficientContext: false,
           },
@@ -207,7 +207,7 @@ export async function POST(request: NextRequest) {
               },
             ],
             sources: [{ title: "Get In Touch", url: canonicalContactUrl }],
-            suggestions: [],
+            suggestions: buildRelatedSuggestions("contact", "Get In Touch"),
             confidence: "high",
             insufficientContext: false,
           },
@@ -282,7 +282,10 @@ export async function POST(request: NextRequest) {
               title: document.title,
               url: document.url,
             })),
-            suggestions: [],
+            suggestions: buildRelatedSuggestions(
+              "case_studies",
+              caseStudies[0]?.title,
+            ),
             confidence: "high",
             insufficientContext: false,
           },
@@ -386,7 +389,7 @@ export async function POST(request: NextRequest) {
                 url: document.url,
               })),
             ],
-            suggestions: [],
+            suggestions: buildRelatedSuggestions("blogs", posts[0]?.title),
             confidence: "high",
             insufficientContext: false,
           },
@@ -403,7 +406,11 @@ export async function POST(request: NextRequest) {
     }
   }
   try {
-    const retrieval = await retrieveFromIndex(retrievalMessage);
+    const retrieval = await retrieveFromIndex(
+      retrievalMessage,
+      intent,
+      effectiveMessage,
+    );
     if (!retrieval.reliableMatchFound) {
       return NextResponse.json(
         {
@@ -412,7 +419,7 @@ export async function POST(request: NextRequest) {
             answer: buildHelpfulFallback(preparedQuery.fallbackAnswer),
             cards: [],
             sources: [],
-            suggestions: [],
+            suggestions: buildRelatedSuggestions("general"),
             confidence: "low",
             insufficientContext: true,
           },
@@ -420,10 +427,84 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
-    const topScore = retrieval.matches[0]?.score ?? 0;
     // Retrieval already returns the globally ranked Top 5. Do not narrow that
     // set again here: every selected chunk must reach the grounded LLM prompt.
-    const selectedMatches = retrieval.matches;
+    const asksForUnseenResults =
+      /\b(?:more|another|other|others|different|next)\b/i.test(
+        effectiveMessage,
+      );
+    const previouslyPresented = parsed.data.history
+      .filter((item) => item.role === "assistant")
+      .map((item) => item.content.toLowerCase())
+      .join("\n");
+    const selectedMatches = asksForUnseenResults
+      ? retrieval.matches.filter(
+          ({ document }) =>
+            !previouslyPresented.includes(document.url.toLowerCase()) &&
+            !previouslyPresented.includes(document.title.toLowerCase()),
+        )
+      : retrieval.matches;
+    if (asksForUnseenResults && !selectedMatches.length) {
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer:
+              "I’ve already shown the strongest matching items available for this topic. You can broaden the topic, view all available items, or ask for a related case study.",
+            cards: [],
+            sources: [],
+            suggestions: [
+              "Show me all services",
+              "Show me a related case study",
+              "Help me choose the right service",
+            ],
+            confidence: "medium",
+            insufficientContext: false,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
+    const topScore = selectedMatches[0]?.score ?? 0;
+    const isWhitepaperQuery = /\b(?:white ?papers?|whitepepers?|whtieperpers?)\b/i.test(
+      effectiveMessage,
+    );
+    const isWhitepaperCollectionQuery =
+      isWhitepaperQuery &&
+      /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
+    const isExplicitCollectionQuery =
+      retrieval.collectionTotal !== undefined &&
+      /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
+    if (isExplicitCollectionQuery) {
+      const presented = selectedMatches.slice(0, 15);
+      const total = retrieval.collectionTotal ?? presented.length;
+      const label = retrieval.collectionLabel ?? "items";
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: buildCollectionListAnswer(label, total, presented),
+            cards: presented.map(({ document, selectedPassages }) => ({
+              type: cardType(document.type),
+              title: document.title,
+              description: bestStoryDescription(document, selectedPassages),
+              url: document.url,
+              image: document.image,
+              badge: document.type,
+              service_type: document.service_type,
+            })),
+            sources: presented.map(({ document }) => ({
+              title: document.title,
+              url: document.url,
+            })),
+            suggestions: buildCollectionSuggestions(label, total),
+            confidence: "high",
+            insufficientContext: false,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
     const context: NormalizedContent[] = selectedMatches.map(
       ({ document, selectedPassages }) => ({
         id: document.id,
@@ -462,13 +543,19 @@ export async function POST(request: NextRequest) {
     } catch {
       // Continue with a deterministic source-backed story below.
     }
-    const generatedAnswer =
+    let generatedAnswer =
       generatedData?.answer ?? buildGroundedRetrievalAnswer(selectedMatches);
-    if (
+    if (isWhitepaperCollectionQuery) {
+      generatedAnswer = buildWhitepaperCollectionAnswer(selectedMatches);
+    }
+    const explicitNoEvidence =
       /\b(?:could not|couldn't|cannot|can't) find reliable information\b/i.test(
         generatedAnswer,
-      )
-    ) {
+      );
+    const onlyLowCoverageEvidence = selectedMatches.every((match) =>
+      match.matchedFields.includes("low-query-coverage"),
+    );
+    if (explicitNoEvidence && onlyLowCoverageEvidence) {
       return NextResponse.json(
         {
           success: true,
@@ -476,7 +563,7 @@ export async function POST(request: NextRequest) {
             answer: buildHelpfulFallback(preparedQuery.fallbackAnswer),
             cards: [],
             sources: [],
-            suggestions: [],
+            suggestions: buildRelatedSuggestions("general"),
             confidence: "low",
             insufficientContext: true,
           },
@@ -484,11 +571,16 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    if (explicitNoEvidence)
+      generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
     const groundedAnswer = ensureDescriptiveGroundedAnswer(
       generatedAnswer,
       selectedMatches,
     );
-    const presentedMatches = selectedMatches.slice(0, 3);
+    const presentedMatches =
+      isWhitepaperQuery && selectedMatches.length <= 15
+        ? selectedMatches
+        : selectedMatches.slice(0, 3);
     const response = {
       ...(generatedData ?? {
         answer: groundedAnswer,
@@ -512,6 +604,14 @@ export async function POST(request: NextRequest) {
         title: document.title,
         url: document.url,
       })),
+      suggestions: isWhitepaperQuery
+        ? buildCollectionSuggestions(
+            "whitepapers",
+            retrieval.collectionTotal ?? presentedMatches.length,
+          )
+        : generatedData?.suggestions?.length
+          ? generatedData.suggestions
+          : buildRelatedSuggestions(intent, presentedMatches[0]?.document.title),
       confidence: topScore >= 100 ? "high" : "medium",
       insufficientContext: false,
     };
@@ -557,6 +657,102 @@ function buildGroundedRetrievalAnswer(
       return `**[${document.title.replace(/[\[\]]/g, "")}](${document.url})**\n\n${description}`;
     })
     .join("\n\n");
+}
+
+function buildWhitepaperCollectionAnswer(
+  matches: Array<{
+    document: SuccessiveSearchDocument;
+    selectedPassages: string[];
+  }>,
+): string {
+  const items = matches
+    .map(
+      ({ document }, index) =>
+        `${index + 1}. [${document.title.replace(/[\[\]]/g, "")}](${document.url})`,
+    )
+    .join("\n");
+  return `## Published Whitepapers\n\nSuccessive currently has **${matches.length} published whitepapers** available in the website API:\n\n${items}`;
+}
+
+function buildCollectionListAnswer(
+  label: string,
+  total: number,
+  matches: Array<{ document: SuccessiveSearchDocument }>,
+): string {
+  const shown = matches.length;
+  const summary =
+    total <= 15
+      ? `The configured Successive website API currently contains **${total} published item${total === 1 ? "" : "s"}** in ${label}.`
+      : `The configured Successive website API currently contains **${total} published items** in ${label}. Here are the latest **${shown}**.`;
+  const items = matches
+    .map(
+      ({ document }, index) =>
+        `${index + 1}. [${document.title.replace(/[\[\]]/g, "")}](${document.url})`,
+    )
+    .join("\n");
+  return `## ${label.replace(/\b\w/g, (letter) => letter.toUpperCase())}\n\n${summary}\n\n${items}`;
+}
+
+function buildCollectionSuggestions(label: string, total: number): string[] {
+  const singular = label
+    .replace("blogs and insights", "resource")
+    .replace("webinars and events", "webinar")
+    .replace("case studies", "case study")
+    .replace("whitepapers", "whitepaper")
+    .replace(/ies$/, "y")
+    .replace(/s$/, "");
+  return [
+    "Tell me more about the first one",
+    `Show me the latest ${singular}`,
+    total > 1
+      ? `Help me choose from these ${label}`
+      : `How can this ${singular} help my business?`,
+  ];
+}
+
+function buildRelatedSuggestions(
+  intent: ReturnType<typeof detectIntent>,
+  primaryTitle?: string,
+): string[] {
+  const title = primaryTitle?.replace(/\s+/g, " ").trim().slice(0, 90);
+  const learnMore = title
+    ? `Tell me more about ${title}`
+    : "Show me relevant Successive services";
+  if (intent === "products" || intent === "product_detail")
+    return [
+      learnMore,
+      "Show me a related case study",
+      "How can Successive implement this for my business?",
+    ];
+  if (intent === "case_studies")
+    return [
+      learnMore,
+      "Show me another related case study",
+      "Which Successive service supports this?",
+    ];
+  if (intent === "blogs" || intent === "resources")
+    return [
+      learnMore,
+      "Show me another related resource",
+      "Which Successive service is related to this?",
+    ];
+  if (intent === "events")
+    return [
+      learnMore,
+      "Show me another related webinar",
+      "Which Successive service is related to this topic?",
+    ];
+  if (intent === "contact")
+    return [
+      "Show me Successive services",
+      "Show me relevant case studies",
+      "Tell me about Successive industries",
+    ];
+  return [
+    learnMore,
+    "Show me a related case study",
+    "Show me related Successive services",
+  ];
 }
 
 function buildContactAnswer(

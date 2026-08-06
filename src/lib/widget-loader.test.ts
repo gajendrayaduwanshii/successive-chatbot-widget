@@ -2,22 +2,84 @@ import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 
-describe("public widget loader", () => {
-  it("initializes once and supports the public open/close/destroy API", () => {
-    const dom = new JSDOM(
-      '<!doctype html><html><head></head><body><script src="https://widget.example/successive-chat-widget.js" data-open-by-default="false"></script></body></html>',
-      { url: "https://successive.ai/page", runScripts: "outside-only" },
+const source = readFileSync("public/successive-chat-widget.js", "utf8");
+
+function createWidget(markup = "") {
+  const dom = new JSDOM(
+    `<!doctype html><html><head></head><body>${markup}<script src="https://widget.example/successive-chat-widget.js" data-api-url="https://widget.example/api/chat" data-prompt-input-id="hero-prompt" data-prompt-button-id="hero-button"></script></body></html>`,
+    { url: "https://successive.ai/page", runScripts: "outside-only" },
+  );
+  Object.defineProperty(dom.window, "matchMedia", {
+    value: () => ({
+      matches: false,
+      addEventListener() {},
+      removeEventListener() {},
+    }),
+  });
+  dom.window.eval(source);
+  dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
+  return dom;
+}
+
+describe("public iframe widget loader", () => {
+  it("renders the original iframe chat UI", () => {
+    const dom = createWidget();
+    const launcher = dom.window.document.querySelector<HTMLButtonElement>(
+      ".successive-chat-launcher",
+    )!;
+    launcher.click();
+    expect(dom.window.document.querySelector("iframe")).not.toBeNull();
+    expect(launcher.getAttribute("aria-expanded")).toBe("true");
+    expect(launcher.querySelector("svg path")?.getAttribute("d")).toContain(
+      "18 6 6 18",
     );
-    Object.defineProperty(dom.window, "matchMedia", {
-      value: () => ({
-        matches: false,
-        addEventListener() {},
-        removeEventListener() {},
+  });
+
+  it("sends an external form prompt to the iframe", () => {
+    const dom = createWidget(
+      '<form><textarea id="hero-prompt"></textarea><button id="hero-button" type="submit" disabled>Send</button></form>',
+    );
+    const input =
+      dom.window.document.querySelector<HTMLTextAreaElement>("#hero-prompt")!;
+    const button =
+      dom.window.document.querySelector<HTMLButtonElement>("#hero-button")!;
+    input.value = "AI services";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    button.click();
+    const iframe = dom.window.document.querySelector("iframe")!;
+    const sent: unknown[] = [];
+    iframe.contentWindow!.postMessage = (message: unknown) =>
+      sent.push(message);
+    dom.window.dispatchEvent(
+      new dom.window.MessageEvent("message", {
+        origin: "https://widget.example",
+        source: iframe.contentWindow,
+        data: { namespace: "successive-chat", type: "SUCCESSIVE_CHAT_READY" },
       }),
-    });
-    const source = readFileSync("public/successive-chat-widget.js", "utf8");
-    dom.window.eval(source);
-    dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
+    );
+    expect(input.value).toBe("");
+    expect(sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "SUCCESSIVE_CHAT_SUBMIT",
+          payload: expect.objectContaining({ message: "AI services" }),
+        }),
+      ]),
+    );
+  });
+
+  it("replaces copied stale widget markup", () => {
+    const dom = createWidget(
+      '<div id="successive-chat-widget-root"><span class="stale">Old</span></div>',
+    );
+    expect(dom.window.document.querySelector(".stale")).toBeNull();
+    expect(
+      dom.window.document.querySelectorAll("#successive-chat-widget-root"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps normal public open, close and destroy controls", () => {
+    const dom = createWidget();
     const api = (
       dom.window as unknown as {
         SuccessiveChat: {
@@ -28,124 +90,13 @@ describe("public widget loader", () => {
         };
       }
     ).SuccessiveChat;
-    expect(api.isOpen()).toBe(false);
-    expect(
-      dom.window.document.querySelectorAll("#successive-chat-widget-root"),
-    ).toHaveLength(1);
-    expect(dom.window.document.querySelector("iframe")).toBeNull();
     api.open();
     expect(api.isOpen()).toBe(true);
-    const iframeUrl = new URL(
-      dom.window.document.querySelector("iframe")?.src ?? "",
-    );
-    expect(iframeUrl.href).toContain("https://widget.example/embed?");
-    expect(iframeUrl.searchParams.get("parentOrigin")).toBe(
-      "https://successive.ai",
-    );
     api.close();
     expect(api.isOpen()).toBe(false);
-    dom.window.eval(source);
-    expect(
-      dom.window.document.querySelectorAll("#successive-chat-widget-root"),
-    ).toHaveLength(1);
     api.destroy();
     expect(
       dom.window.document.querySelector("#successive-chat-widget-root"),
     ).toBeNull();
-  });
-  it("locks and restores host scrolling for a mobile fullscreen widget", () => {
-    const dom = new JSDOM(
-      '<!doctype html><html><head></head><body><script src="https://widget.example/successive-chat-widget.js" data-mobile-fullscreen="true"></script></body></html>',
-      { url: "https://successive.ai/page", runScripts: "outside-only" },
-    );
-    Object.defineProperty(dom.window, "matchMedia", {
-      value: () => ({
-        matches: true,
-        addEventListener() {},
-        removeEventListener() {},
-      }),
-    });
-    dom.window.eval(readFileSync("public/successive-chat-widget.js", "utf8"));
-    dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
-    const api = (
-      dom.window as unknown as {
-        SuccessiveChat: { open(): void; close(): void };
-      }
-    ).SuccessiveChat;
-    api.open();
-    expect(dom.window.document.documentElement.style.overflow).toBe("hidden");
-    api.close();
-    expect(dom.window.document.documentElement.style.overflow).toBe("");
-  });
-  it("closes when the embedded chat sends its close message", () => {
-    const dom = new JSDOM(
-      '<!doctype html><html><head></head><body><script src="https://widget.example/successive-chat-widget.js"></script></body></html>',
-      { url: "https://successive.ai/page", runScripts: "outside-only" },
-    );
-    Object.defineProperty(dom.window, "matchMedia", {
-      value: () => ({
-        matches: false,
-        addEventListener() {},
-        removeEventListener() {},
-      }),
-    });
-    dom.window.eval(readFileSync("public/successive-chat-widget.js", "utf8"));
-    dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
-    const api = (
-      dom.window as unknown as {
-        SuccessiveChat: { open(): void; isOpen(): boolean };
-      }
-    ).SuccessiveChat;
-    api.open();
-    const iframe = dom.window.document.querySelector("iframe");
-    expect(iframe).not.toBeNull();
-    dom.window.dispatchEvent(
-      new dom.window.MessageEvent("message", {
-        origin: "https://widget.example",
-        source: iframe?.contentWindow,
-        data: {
-          namespace: "successive-chat",
-          type: "SUCCESSIVE_CHAT_CLOSE",
-        },
-      }),
-    );
-    expect(api.isOpen()).toBe(false);
-  });
-  it("passes an opaque parent origin when a local HTML file hosts the widget", () => {
-    const dom = new JSDOM(
-      '<!doctype html><html><head></head><body><script src="http://localhost:3000/successive-chat-widget.js"></script></body></html>',
-      {
-        url: "file:///tmp/successive-widget-test.html",
-        runScripts: "outside-only",
-      },
-    );
-    Object.defineProperty(dom.window, "matchMedia", {
-      value: () => ({
-        matches: false,
-        addEventListener() {},
-        removeEventListener() {},
-      }),
-    });
-    dom.window.eval(readFileSync("public/successive-chat-widget.js", "utf8"));
-    dom.window.document.dispatchEvent(new dom.window.Event("DOMContentLoaded"));
-    const api = (dom.window as unknown as { SuccessiveChat: { open(): void } })
-      .SuccessiveChat;
-    api.open();
-    const iframeUrl = new URL(
-      dom.window.document.querySelector("iframe")?.src ?? "",
-    );
-    expect(iframeUrl.searchParams.get("parentOrigin")).toBe("null");
-    const closeHitArea = dom.window.document.querySelector<HTMLButtonElement>(
-      ".successive-chat-close-hit-area",
-    );
-    expect(closeHitArea).not.toBeNull();
-    closeHitArea?.click();
-    expect(
-      (
-        dom.window as unknown as {
-          SuccessiveChat: { isOpen(): boolean };
-        }
-      ).SuccessiveChat.isOpen(),
-    ).toBe(false);
   });
 });

@@ -89,11 +89,17 @@
     width: clamp(data.width, 400, 320, 520),
     height: clamp(data.height, 650, 450, 850),
     mobileFullscreen: bool(data.mobileFullscreen, true),
+    promptInputId: safeText(data.promptInputId, "", 100),
+    promptButtonId: safeText(data.promptButtonId, "", 100),
+    containerId: safeText(data.containerId, "", 100),
   };
 
   var root, launcher, panel, frame, closeHitArea, unread, style;
   var open = false;
   var ready = false;
+  var pendingMessages = [];
+  var retryTimer = null;
+  var unbindPromptInput = null;
   var previousOverflow = "";
   var mobileQuery = window.matchMedia("(max-width: 640px)");
   var iconChat =
@@ -167,6 +173,76 @@
         widgetOrigin,
       );
   };
+  var postSubmittedMessage = function (item) {
+    if (!ready || !frame || !frame.contentWindow) return false;
+    frame.contentWindow.postMessage(
+      {
+        namespace: "successive-chat",
+        type: "SUCCESSIVE_CHAT_SUBMIT",
+        payload: { id: item.id, message: item.message },
+      },
+      widgetOrigin,
+    );
+    return true;
+  };
+  var schedulePendingRetry = function () {
+    if (retryTimer || !pendingMessages.length) return;
+    retryTimer = window.setTimeout(function () {
+      retryTimer = null;
+      if (ready) pendingMessages.forEach(postSubmittedMessage);
+      if (pendingMessages.length) schedulePendingRetry();
+    }, 750);
+  };
+  var sendMessage = function (value) {
+    var message = typeof value === "string" ? value.trim() : "";
+    if (message.length < 2 || message.length > 1000) return false;
+    var item = {
+      id:
+        "prompt-" +
+        Date.now().toString(36) +
+        "-" +
+        Math.random().toString(36).slice(2, 10),
+      message: message,
+    };
+    pendingMessages.push(item);
+    openWidget();
+    postSubmittedMessage(item);
+    schedulePendingRetry();
+    return true;
+  };
+  var bindPromptInput = function () {
+    if (!config.promptInputId) return;
+    var input = document.getElementById(config.promptInputId);
+    if (!input || !("value" in input)) return;
+    var form = input.form || input.closest("form");
+    var button = config.promptButtonId
+      ? document.getElementById(config.promptButtonId)
+      : null;
+    var update = function () {
+      if (button) button.disabled = String(input.value || "").trim().length < 2;
+    };
+    var submit = function (event) {
+      if (event) event.preventDefault();
+      if (sendMessage(String(input.value || ""))) input.value = "";
+      update();
+    };
+    var keydown = function (event) {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      event.preventDefault();
+      submit(event);
+    };
+    input.addEventListener("input", update);
+    input.addEventListener("keydown", keydown);
+    if (form) form.addEventListener("submit", submit);
+    else if (button) button.addEventListener("click", submit);
+    update();
+    unbindPromptInput = function () {
+      input.removeEventListener("input", update);
+      input.removeEventListener("keydown", keydown);
+      if (form) form.removeEventListener("submit", submit);
+      else if (button) button.removeEventListener("click", submit);
+    };
+  };
   var closeWidget = function () {
     if (!open) return;
     open = false;
@@ -204,12 +280,27 @@
         "SUCCESSIVE_CHAT_RESIZE",
         "SUCCESSIVE_CHAT_UNREAD",
         "SUCCESSIVE_CHAT_ERROR",
+        "SUCCESSIVE_CHAT_SUBMIT_ACK",
       ].indexOf(message.type) < 0
     )
       return;
     if (message.type === "SUCCESSIVE_CHAT_READY") {
       ready = true;
       dispatch("ready");
+      pendingMessages.forEach(postSubmittedMessage);
+      schedulePendingRetry();
+    } else if (
+      message.type === "SUCCESSIVE_CHAT_SUBMIT_ACK" &&
+      message.payload &&
+      typeof message.payload.id === "string"
+    ) {
+      pendingMessages = pendingMessages.filter(function (item) {
+        return item.id !== message.payload.id;
+      });
+      if (!pendingMessages.length && retryTimer) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
     } else if (message.type === "SUCCESSIVE_CHAT_CLOSE") {
       closeWidget();
     } else if (
@@ -236,12 +327,17 @@
   var destroy = function () {
     setPageLock(false);
     window.removeEventListener("message", onMessage);
+    if (unbindPromptInput) unbindPromptInput();
+    if (retryTimer) window.clearTimeout(retryTimer);
     if (root) root.remove();
     if (style) style.remove();
     delete window.SuccessiveChat;
   };
   var init = function () {
-    if (document.getElementById("successive-chat-widget-root")) return;
+    var staleRoot = document.getElementById("successive-chat-widget-root");
+    if (staleRoot) staleRoot.remove();
+    var staleStyle = document.getElementById("successive-chat-widget-styles");
+    if (staleStyle) staleStyle.remove();
     style = document.createElement("style");
     style.id = "successive-chat-widget-styles";
     style.textContent =
@@ -290,9 +386,25 @@
     root.appendChild(panel);
     root.appendChild(launcher);
     root.appendChild(unread);
-    document.body.appendChild(root);
+    var mountContainer = config.containerId
+      ? document.getElementById(config.containerId)
+      : null;
+    var promptInput = config.promptInputId
+      ? document.getElementById(config.promptInputId)
+      : null;
+    var promptButton = config.promptButtonId
+      ? document.getElementById(config.promptButtonId)
+      : null;
+    if (
+      mountContainer &&
+      ((promptInput && mountContainer.contains(promptInput)) ||
+        (promptButton && mountContainer.contains(promptButton)))
+    )
+      mountContainer = null;
+    (mountContainer || document.body).appendChild(root);
     window.addEventListener("message", onMessage);
     renderState();
+    bindPromptInput();
     if (config.openByDefault) openWidget();
   };
 
@@ -301,6 +413,7 @@
     open: openWidget,
     close: closeWidget,
     toggle: toggleWidget,
+    sendMessage: sendMessage,
     destroy: destroy,
     isOpen: function () {
       return open;
