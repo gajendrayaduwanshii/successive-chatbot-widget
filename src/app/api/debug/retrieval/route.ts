@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
         title: match.document.title,
         slug: match.document.slug,
         type: match.document.type,
+        serviceType: match.document.service_type,
         score: match.score,
         matchedFields: match.matchedFields,
         contentQuality: match.document.contentQuality,

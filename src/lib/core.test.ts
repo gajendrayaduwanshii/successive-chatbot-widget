@@ -33,6 +33,8 @@ import {
   normalizeWordPressUrl,
 } from "./search-index";
 import {
+  detectRequestedServiceTypes,
+  matchesRequestedServiceType,
   normalizeQuery,
   rankSearchDocument,
   retrieveFromIndex,
@@ -55,7 +57,7 @@ describe("intent detection", () => {
     expect(detectIntent("who is Successive")).toBe("about");
     expect(detectIntent("Show customer stories")).toBe("case_studies");
     expect(detectIntent("Book a demo")).toBe("contact");
-    expect(detectIntent("I need help")).toBe("contact");
+    expect(detectIntent("I need help")).toBe("general");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
     expect(
@@ -64,6 +66,42 @@ describe("intent detection", () => {
       ),
     ).toBe("general");
     expect(detectIntent("industers")).toBe("page");
+  });
+});
+
+describe("service type query filtering", () => {
+  it("maps dropdown wording and common misspellings to strict ACF values", () => {
+    expect(detectRequestedServiceTypes("show cloud pillar services")).toEqual([
+      "service",
+      "pillar",
+    ]);
+    expect(detectRequestedServiceTypes("show piller")).toEqual(["pillar"]);
+    expect(detectRequestedServiceTypes("AI expert")).toEqual(["expertise"]);
+    expect(detectRequestedServiceTypes("service pillar exper")).toEqual([
+      "service",
+      "pillar",
+      "expertise",
+    ]);
+  });
+
+  it("keeps only documents matching the requested ACF service type", () => {
+    expect(matchesRequestedServiceType("cloud pillar services", "Pillar")).toBe(
+      true,
+    );
+    expect(
+      matchesRequestedServiceType("cloud pillar services", "Expertise"),
+    ).toBe(false);
+    expect(
+      matchesRequestedServiceType("cloud service", "Sub-service"),
+    ).toBe(true);
+    expect(matchesRequestedServiceType("service pillar", "Piller")).toBe(true);
+    expect(matchesRequestedServiceType("service pillar", "Sub-service")).toBe(
+      true,
+    );
+    expect(matchesRequestedServiceType("service pillar", "Expertise")).toBe(
+      false,
+    );
+    expect(matchesRequestedServiceType("cloud services", undefined)).toBe(false);
   });
 });
 describe("short topic query normalization", () => {
@@ -122,6 +160,7 @@ describe("assistant response transport normalization", () => {
           url: "https://successive.ai/example",
           image: "not-a-url",
           badge: "B".repeat(80),
+          service_type: "Sub-service",
         },
       ],
       suggestions: ["S".repeat(200)],
@@ -140,6 +179,7 @@ describe("assistant response transport normalization", () => {
       description: "D".repeat(500),
       image: undefined,
       badge: "B".repeat(50),
+      service_type: "Sub-service",
     });
     expect(result.data.suggestions[0]).toHaveLength(160);
     expect(result.data.sources[0]?.title).toHaveLength(200);
@@ -269,7 +309,7 @@ describe("structured responses", () => {
   });
 });
 // These tests document the custom Kagen endpoint contract retained in the
-// reference project. Successive uses standard wp/v2 collections; its adapter
+// reference project. Successive uses custom v1 collections; its adapter
 // has dedicated tests in successive-api.test.ts.
 describe.skip("legacy custom WordPress retrieval", () => {
   it("returns every product and excludes other content for a product-list query", async () => {
@@ -682,6 +722,20 @@ describe("widget configuration", () => {
   });
 });
 describe("complete ACF search indexing", () => {
+  it("preserves the service type used by service story cards", () => {
+    const document = buildSearchDocument({
+      id: 2603,
+      type: "page",
+      slug: "full-stack-development-company",
+      link: "https://successive.ai/full-stack-development-company/",
+      title: { rendered: "Full-Stack Development Services" },
+      acf: {
+        service_type: "Sub-service",
+        description2: "Complete full-stack service content.",
+      },
+    });
+    expect(document.service_type).toBe("Sub-service");
+  });
   it("preserves paragraphs and overlap while chunking long content", () => {
     const chunks = buildSearchChunks(10, [
       `First paragraph ${"foundation ".repeat(90)}`,
@@ -778,7 +832,7 @@ describe("complete ACF search indexing", () => {
       "successive eye",
     );
     expect(normalizeQuery("Please explain Successive ADD")).toBe(
-      "successive add",
+      "agentic driven delivery legacy systems",
     );
   });
   it("does not treat an isolated EYE acronym as the Successive EYE entity", () => {

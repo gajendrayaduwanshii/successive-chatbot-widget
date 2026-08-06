@@ -53,6 +53,16 @@ export function flattenAcf(value: JsonValue | undefined): {
 const rendered = (value: WordPressItem["title"] | WordPressItem["content"]) =>
   typeof value === "string" ? value : (value?.rendered ?? "");
 
+export function extractServiceType(
+  value: JsonValue | undefined,
+): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const serviceType = value.service_type;
+  if (typeof serviceType !== "string") return;
+  const clean = htmlToText(serviceType).trim();
+  return clean || undefined;
+}
+
 function preferredAcfSummary(value: JsonValue | undefined): string {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const record = value as Record<string, JsonValue>;
@@ -110,5 +120,6 @@ export function normalizeContent(item: WordPressItem): NormalizedContent {
     modified: item.modified ?? item.date,
     acfText: acf.text,
     extractedUrls: acf.urls,
+    service_type: extractServiceType(item.acf),
   };
 }

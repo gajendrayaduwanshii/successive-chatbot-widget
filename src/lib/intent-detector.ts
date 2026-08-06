@@ -39,9 +39,13 @@ export function detectIntent(query: string): Intent {
       "talk to",
       "book a demo",
       "reach successive",
-      "need help",
-      "help me",
-      "get help",
+      "where are successive offices",
+      "where are your offices",
+      "where is successive located",
+      "office locations",
+      "speak with someone",
+      "project estimate",
+      "get an estimate",
     ])
   )
     return "contact";
@@ -55,7 +59,12 @@ export function detectIntent(query: string): Intent {
   )
     return "product_detail";
   if (
-    includes(q, ["company", "who is successive", "successive ai"]) ||
+    includes(q, [
+      "company",
+      "who is successive",
+      "what does successive",
+      "successive ai",
+    ]) ||
     /^(?:tell me )?about (?:successive|the company)$/.test(q)
   )
     return "about";

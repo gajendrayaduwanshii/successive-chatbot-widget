@@ -7,6 +7,7 @@ export const cardSchema = z.object({
   url: z.string().url(),
   image: z.string().url().optional(),
   badge: z.string().max(50).optional(),
+  service_type: z.string().min(1).max(50).optional(),
 });
 export const assistantResponseSchema = z.object({
   answer: z.string().min(1).max(8000),
@@ -42,6 +43,10 @@ export function normalizeAssistantResponse(value: unknown) {
           badge:
             typeof card.badge === "string"
               ? card.badge.slice(0, 50)
+              : undefined,
+          service_type:
+            typeof card.service_type === "string"
+              ? card.service_type.slice(0, 50)
               : undefined,
         };
         const parsed = cardSchema.safeParse(normalized);

@@ -4,7 +4,7 @@ const serverEnvSchema = z.object({
   SUCCESSIVE_API_BASE_URL: z
     .string()
     .url()
-    .default("https://successive.tech/wp-json/wp/v2"),
+    .default("https://successive.tech/wp-json/successive-digital/v1"),
   SUCCESSIVE_PUBLIC_SITE_URL: z
     .string()
     .url()

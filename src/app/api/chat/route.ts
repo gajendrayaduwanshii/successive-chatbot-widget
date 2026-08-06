@@ -138,6 +138,17 @@ export async function POST(request: NextRequest) {
   }
   const effectiveMessage = preparedQuery.englishQuery;
   const intent = detectIntent(effectiveMessage);
+  const previousUserMessage = [...parsed.data.history]
+    .reverse()
+    .find((message) => message.role === "user")?.content;
+  const referentialFollowUp =
+    /\b(?:that|this|it|these|those|them|simpler|more detail|explain more|how does that)\b/i.test(
+      effectiveMessage,
+    );
+  const retrievalMessage =
+    referentialFollowUp && previousUserMessage
+      ? `${previousUserMessage}. ${effectiveMessage}`
+      : effectiveMessage;
   // Contact is a deterministic navigation intent. Fetch only the published
   // Contact Us page and return one API-backed card; never run broad retrieval
   // that can mix in unrelated posts, case studies, or privacy content.
@@ -205,84 +216,23 @@ export async function POST(request: NextRequest) {
       );
     }
   }
-  // Collection-specific branches below are retained for compatibility with a
-  // custom WordPress namespace. Successive's standard wp/v2 API is searched
-  // through the complete posts/pages index instead.
-  const usesCustomContentNamespace =
-    !getEnv().SUCCESSIVE_API_BASE_URL.includes("/wp-json/wp/v2");
-  if (usesCustomContentNamespace && /\bproducts?\b/i.test(effectiveMessage)) {
-    try {
-      const [listingItems, productItems] = await Promise.all([
-        fetchSuccessive("/pages/products"),
-        fetchSuccessive("/content?type=product&per_page=100"),
-      ]);
-      const listing = listingItems[0]
-        ? buildSearchDocument(listingItems[0])
-        : undefined;
-      const products = productItems
-        .filter((item) => item.type === "product")
-        .map(buildSearchDocument)
-        .sort(
-          (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
-        )
-        .slice(0, 5);
-      if (!listing || !products.length) {
-        throw new Error("Product collection is unavailable");
-      }
-      const documents = [listing, ...products];
-      return NextResponse.json(
-        {
-          success: true,
-          data: {
-            answer: await buildCollectionStory(
-              "products",
-              { title: listing.title, url: listing.url },
-              products,
-              effectiveMessage,
-              preparedQuery.responseLanguage,
-              preparedQuery.fallbackAnswer,
-              parsed.data.history,
-            ),
-            cards: documents.map((document, index) => ({
-              type: index === 0 ? "page" : "product",
-              title: document.title,
-              description: (
-                document.descriptions[0] ??
-                document.textSegments[0] ??
-                document.title
-              ).slice(0, 500),
-              url: document.url,
-              image: document.image,
-              badge: index === 0 ? "products" : "product",
-            })),
-            sources: documents.map((document) => ({
-              title: document.title,
-              url: document.url,
-            })),
-            suggestions: [],
-            confidence: "high",
-            insufficientContext: false,
-          },
-        },
-        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
-      );
-    } catch {
-      return error(
-        503,
-        "CONTENT_UNAVAILABLE",
-        "Successive’s product collection is temporarily unavailable.",
-        cors.headers,
-      );
-    }
-  }
   // Case-study collection requests must never fall through to keyword-based
   // global retrieval, where blog posts mentioning "case studies" can outrank
   // the actual collection. Return the listing page followed by the five most
   // recently modified published case studies.
+  const caseStudyTopic = effectiveMessage
+    .toLowerCase()
+    .replace(
+      /\b(?:show|give|tell|me|your|the|latest|recent|new|case|study|studies|success|stories|story|about|on|regarding|find|please)\b/g,
+      " ",
+    )
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (
-    usesCustomContentNamespace &&
     intent === "case_studies" &&
-    /\bcase\s+stud(?:y|ies)\b/i.test(effectiveMessage)
+    /\bcase\s+stud(?:y|ies)\b/i.test(effectiveMessage) &&
+    !caseStudyTopic
   ) {
     try {
       const [listingItems, caseStudyItems] = await Promise.all([
@@ -351,7 +301,20 @@ export async function POST(request: NextRequest) {
   // A request for blogs means the published collection, not a keyword search
   // for the word "blog". This also handles conversational multilingual queries
   // asking for information about the published blog collection.
-  if (intent === "blogs" && /\bblogs?\b/i.test(effectiveMessage)) {
+  const blogTopic = effectiveMessage
+    .toLowerCase()
+    .replace(
+      /\b(?:show|give|tell|me|your|the|latest|recent|new|blogs?|articles?|insights?|about|on|regarding|please)\b/g,
+      " ",
+    )
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (
+    intent === "blogs" &&
+    /\bblogs?\b/i.test(effectiveMessage) &&
+    !blogTopic
+  ) {
     try {
       const [listingItems, postItems] = await Promise.all([
         fetchSuccessive("/pages/blogs-and-insights").catch(() => []),
@@ -440,7 +403,7 @@ export async function POST(request: NextRequest) {
     }
   }
   try {
-    const retrieval = await retrieveFromIndex(effectiveMessage);
+    const retrieval = await retrieveFromIndex(retrievalMessage);
     if (!retrieval.reliableMatchFound) {
       return NextResponse.json(
         {
@@ -474,9 +437,10 @@ export async function POST(request: NextRequest) {
         modified: document.modified,
         acfText: "",
         extractedUrls: [],
+        service_type: document.service_type,
       }),
     );
-    let response;
+    let generatedData;
     if (!getEnv().AI_API_KEY) {
       return error(
         503,
@@ -486,42 +450,54 @@ export async function POST(request: NextRequest) {
       );
     }
     try {
-      response = await getLLMProvider().generateStructuredResponse({
+      const generated = await getLLMProvider().generateStructuredResponse({
         message: effectiveMessage,
         responseLanguage: preparedQuery.responseLanguage,
         fallbackAnswer: preparedQuery.fallbackAnswer,
         history: parsed.data.history.slice(-10),
         context,
       });
+      const validated = assistantResponseSchema.safeParse(generated);
+      if (validated.success) generatedData = validated.data;
     } catch {
-      return error(
-        503,
-        "AI_RESPONSE_UNAVAILABLE",
-        "A verified answer could not be generated from the published Successive content. Please try again.",
-        cors.headers,
-      );
+      // Continue with a deterministic source-backed story below.
     }
-    const validated = assistantResponseSchema.safeParse(response);
-    if (!validated.success) {
-      return error(
-        503,
-        "INVALID_AI_RESPONSE",
-        "The generated answer could not be safely validated. Please try again.",
-        cors.headers,
+    const generatedAnswer =
+      generatedData?.answer ?? buildGroundedRetrievalAnswer(selectedMatches);
+    if (
+      /\b(?:could not|couldn't|cannot|can't) find reliable information\b/i.test(
+        generatedAnswer,
+      )
+    ) {
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: buildHelpfulFallback(preparedQuery.fallbackAnswer),
+            cards: [],
+            sources: [],
+            suggestions: [],
+            confidence: "low",
+            insufficientContext: true,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
     const groundedAnswer = ensureDescriptiveGroundedAnswer(
-      validated.data.answer,
+      generatedAnswer,
       selectedMatches,
     );
-    const linkedMatches = selectedMatches.filter(({ document }) =>
-      groundedAnswer.includes(`](${document.url})`),
-    );
-    const presentedMatches = linkedMatches.length
-      ? linkedMatches
-      : selectedMatches.slice(0, 3);
-    response = {
-      ...validated.data,
+    const presentedMatches = selectedMatches.slice(0, 3);
+    const response = {
+      ...(generatedData ?? {
+        answer: groundedAnswer,
+        cards: [],
+        sources: [],
+        suggestions: [],
+        confidence: "medium" as const,
+        insufficientContext: false,
+      }),
       answer: groundedAnswer,
       cards: presentedMatches.map(({ document, selectedPassages }) => ({
         type: cardType(document.type),
@@ -530,6 +506,7 @@ export async function POST(request: NextRequest) {
         url: document.url,
         image: document.image,
         badge: document.type,
+        service_type: document.service_type,
       })),
       sources: presentedMatches.map(({ document }) => ({
         title: document.title,
@@ -565,6 +542,21 @@ function cardType(
 function buildHelpfulFallback(localizedFallback: string): string {
   const site = getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "");
   return `${localizedFallback} Try searching the [Successive website](${site}/?s=) or explore [Successive services](${site}/digital-transformation-services/) for more context.`;
+}
+
+function buildGroundedRetrievalAnswer(
+  matches: Array<{
+    document: SuccessiveSearchDocument;
+    selectedPassages: string[];
+  }>,
+): string {
+  return matches
+    .slice(0, 3)
+    .map(({ document, selectedPassages }) => {
+      const description = bestStoryDescription(document, selectedPassages);
+      return `**[${document.title.replace(/[\[\]]/g, "")}](${document.url})**\n\n${description}`;
+    })
+    .join("\n\n");
 }
 
 function buildContactAnswer(

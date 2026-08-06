@@ -13,10 +13,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ag-ui/client": "^0.0.57",
-    "@ag-ui/core": "^0.0.57",
-    "@copilotkit/react-core": "^1.63.2",
-    "@copilotkit/react-ui": "^1.63.2",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "latest",

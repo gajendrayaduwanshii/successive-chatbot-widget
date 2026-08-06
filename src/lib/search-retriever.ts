@@ -12,6 +12,8 @@ import {
 
 const STOPWORDS = new Set([
   "do",
+  "i",
+  "am",
   "you",
   "know",
   "about",
@@ -38,6 +40,23 @@ const STOPWORDS = new Set([
   "with",
   "this",
   "that",
+  "option",
+  "options",
+  "which",
+  "serve",
+  "serves",
+  "latest",
+  "recent",
+  "blog",
+  "blogs",
+  "article",
+  "articles",
+  "planning",
+  "program",
+  "programme",
+  "offer",
+  "offers",
+  "find",
 ]);
 
 // Lightweight synonym expansion gives paraphrases semantic-style recall
@@ -51,6 +70,9 @@ const SYNONYM_GROUPS = [
   ["document", "content", "knowledge"],
   ["customer", "client", "consumer"],
   ["secure", "security", "protected"],
+  ["event", "events", "webinar", "webinars"],
+  ["location", "locations", "office", "offices", "address"],
+  ["modernization", "modernisation", "migration", "transformation"],
 ];
 const INDEX_CACHE_MS = 5 * 60 * 1000;
 let cachedIndex:
@@ -75,10 +97,11 @@ export function normalizeQuery(query: string): string {
   const normalized = normalizeSearchText(query);
   // Recover a known high-level topic even when visitors add misspellings or
   // accidental keyboard noise around it (for example, "ai servies fhfghf").
-  const recognizedTopic =
-    /\bai\b.*\b(?:service|services|servies|solution|solutions)\b/.test(
-      normalized,
-    )
+  const recognizedTopic = /\bsuccessive add\b/.test(normalized)
+    ? "agentic driven delivery legacy systems"
+    : /\bai\b.*\b(?:service|services|servies|solution|solutions)\b/.test(
+          normalized,
+        )
       ? "ai services"
       : normalized;
   // Short topic prompts need enough meaning to retrieve the corresponding
@@ -108,6 +131,52 @@ export function normalizeQuery(query: string): string {
   };
   const corrected = tokens.map((token) => corrections[token] ?? token);
   return [...new Set(corrected)].join(" ");
+}
+
+type RequestedServiceType = "service" | "pillar" | "expertise";
+
+export function detectRequestedServiceTypes(
+  query: string,
+): RequestedServiceType[] {
+  const normalized = normalizeSearchText(query);
+  const requested: RequestedServiceType[] = [];
+  if (/\b(?:service|services|servire|servires)\b/.test(normalized))
+    requested.push("service");
+  if (/\b(?:pillar|pillars|piller|pillers)\b/.test(normalized))
+    requested.push("pillar");
+  if (/\b(?:expert|experts|expertise|exper)\b/.test(normalized))
+    requested.push("expertise");
+  return requested;
+}
+
+function normalizedServiceType(value: string | undefined): string {
+  const normalized = normalizeSearchText(value ?? "").replace(/\s+/g, "-");
+  // WordPress currently stores the dropdown values as `Sub-service` and the
+  // misspelled `Piller`. Visitors use the cleaner words service and pillar.
+  if (normalized === "sub-service") return "service";
+  if (normalized === "piller") return "pillar";
+  return normalized;
+}
+
+export function matchesRequestedServiceType(
+  query: string,
+  serviceType: string | undefined,
+): boolean {
+  const requested = detectRequestedServiceTypes(query);
+  return (
+    requested.length === 0 ||
+    requested.includes(normalizedServiceType(serviceType) as RequestedServiceType)
+  );
+}
+
+function withoutServiceTypeTerms(query: string): string {
+  return normalizeSearchText(query)
+    .replace(
+      /\b(?:services?|servires?|expertise|experts?|exper|pillars?|pillers?)\b/g,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function stem(token: string): string {
@@ -257,7 +326,9 @@ export function rankSearchDocument(
     (alias) =>
       alias === normalizedQuery ||
       (alias.length >= 3 &&
-        normalizedQuery.includes(alias) &&
+        (` ${normalizedQuery} `.includes(` ${alias} `) ||
+          normalizedQuery.startsWith(`${alias} `) ||
+          normalizedQuery.endsWith(` ${alias}`)) &&
         (!normalizedQuery.startsWith("successive ") ||
           alias.startsWith("successive "))),
   );
@@ -267,6 +338,13 @@ export function rankSearchDocument(
   }
   const titleTerms = new Set(document.normalizedTitle.split(" ").map(stem));
   const queryTerms = normalizedQuery.split(" ").map(stem).filter(Boolean);
+  const titleOverlap = [...new Set(queryTerms)].filter((term) =>
+    titleTerms.has(term),
+  ).length;
+  if (titleOverlap) {
+    documentBonus += Math.min(60, titleOverlap * 20);
+    matchedFields.push("title-token-overlap");
+  }
   if (queryTerms.length && queryTerms.every((term) => titleTerms.has(term))) {
     documentBonus += 50;
     matchedFields.push("all-tokens-title");
@@ -280,6 +358,19 @@ export function rankSearchDocument(
     .sort((a, b) => b.score - a.score || a.chunk.position - b.chunk.position);
   const best = rankedChunks[0];
   let score = documentBonus + (best?.score ?? 0);
+  if (queryTerms.length >= 4) {
+    const documentTerms = new Set(document.combinedText.split(" ").map(stem));
+    const documentCoverage =
+      [...new Set(queryTerms)].filter((term) => documentTerms.has(term)).length /
+      new Set(queryTerms).size;
+    if (
+      documentCoverage < 0.6 &&
+      !best?.fields.includes("semantic-expansion")
+    ) {
+      score -= 100;
+      matchedFields.push("low-query-coverage");
+    }
+  }
   if (document.contentQuality < 25) score -= 30;
   if (
     /privacy|sitemap|thank-you|thank you/i.test(
@@ -303,6 +394,7 @@ export async function retrieveFromIndex(
 ): Promise<RetrievalResult> {
   const baseIndex = await loadSearchIndex();
   const normalizedQuery = normalizeQuery(query);
+  const requestedServiceTypes = detectRequestedServiceTypes(query);
   const intent = detectIntent(query);
   let index = baseIndex;
   if (!["blogs", "case_studies", "events"].includes(intent)) {
@@ -321,7 +413,7 @@ export async function retrieveFromIndex(
       );
       index = [...merged.values()];
     } catch {
-      // The complete cached corpus remains available if targeted hydration fails.
+      // The complete cached corpus remains available if targeted lookup fails.
     }
   }
   // Successive exposes services and offerings as ordinary posts/pages. Do not
@@ -364,15 +456,70 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
+  const collectionDocuments = /\b(?:industry|industries)\b/.test(
+    normalizedQuery,
+  )
+    ? index.filter((document) => document.type === "industries")
+    : /\b(?:career|careers|job|jobs)\b/.test(normalizedQuery)
+      ? index.filter(
+          (document) =>
+            document.type === "careers" || document.slug === "careers",
+        )
+      : [];
+  if (collectionDocuments.length) {
+    const matches = collectionDocuments
+      .map((document) => ({
+        document,
+        score: 100,
+        matchedFields: ["collection-intent"],
+        selectedPassages: document.chunks[0]?.text
+          ? [document.chunks[0].text]
+          : [],
+      }))
+      .filter((match) => match.selectedPassages.length > 0)
+      .sort((a, b) => b.document.contentQuality - a.document.contentQuality)
+      .slice(0, 5);
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0,
+      matches,
+      isProductList,
+    };
+  }
   const categoryIndex = index.filter((document) => {
+    if (!matchesRequestedServiceType(query, document.service_type))
+      return false;
     if (intent === "about") {
       return (
         document.type === "page" &&
         ["about-us", "about"].includes(document.slug)
       );
     }
+    if (/\bprivacy\b/.test(normalizedQuery)) {
+      return document.type === "page" && document.slug === "privacy-policy";
+    }
+    if (/\bfull stack\b/.test(normalizedQuery)) {
+      return (
+        document.type === "page" &&
+        document.slug === "full-stack-development-company"
+      );
+    }
+    if (/\bsuccessive add\b/.test(normalizeSearchText(query))) {
+      return (
+        document.type === "post" &&
+        document.slug ===
+          "achieve-modernisation-through-agentic-driven-delivery-for-legacy-systems"
+      );
+    }
+    if (intent === "events") {
+      return (
+        document.type === "page" &&
+        (/webinar|event/.test(document.slug) ||
+          /webinar|event/.test(document.normalizedTitle))
+      );
+    }
     if (
-      intent === "page" &&
       /\b(?:career|careers|job|jobs)\b/.test(normalizedQuery)
     ) {
       return (
@@ -381,7 +528,6 @@ export async function retrieveFromIndex(
       );
     }
     if (
-      intent === "page" &&
       /\b(?:industry|industries)\b/.test(normalizedQuery)
     ) {
       return (
@@ -394,7 +540,8 @@ export async function retrieveFromIndex(
       // not a custom `product` post type. Keep both collections eligible and
       // let full-text relevance select AI, engineering, cloud, data, etc.
       return (
-        document.type === "page" ||
+        (document.type === "page" &&
+          !["terms-of-services", "privacy-policy"].includes(document.slug)) ||
         document.type === "product" ||
         (document.type === "post" &&
           (document.normalizedTitle === normalizeSearchText(query) ||
@@ -416,7 +563,19 @@ export async function retrieveFromIndex(
     return true;
   });
   const idf = buildInverseDocumentFrequency(categoryIndex);
-  const scoringQuery = intent === "about" ? "about us" : query;
+  const topicalQuery =
+    intent === "case_studies"
+      ? normalizeSearchText(query)
+          .replace(
+            /\b(?:find|show|tell|case|study|studies|success|story|stories|about)\b/g,
+            " ",
+          )
+          .replace(/\s+/g, " ")
+          .trim()
+      : requestedServiceTypes.length
+        ? withoutServiceTypeTerms(query)
+        : query;
+  const scoringQuery = intent === "about" ? "about us" : topicalQuery || query;
   const rankedMatches = categoryIndex
     .map((document) => rankSearchDocument(document, scoringQuery, idf))
     .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)

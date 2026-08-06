@@ -37,5 +37,6 @@ export interface NormalizedContent {
   modified?: string;
   acfText: string;
   extractedUrls: string[];
+  service_type?: string;
   score?: number;
 }

@@ -27,6 +27,7 @@ export function buildProductComparison(
       url: item.url,
       image: item.image,
       badge: "product",
+      service_type: item.service_type,
     })),
     suggestions: [
       "Explain Successive PRISM",
@@ -64,6 +65,7 @@ export function buildContentDetail(
       url: item.url,
       image: item.image,
       badge: item.type,
+      service_type: item.service_type,
     })),
     suggestions:
       context === "about"

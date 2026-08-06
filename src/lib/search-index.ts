@@ -6,6 +6,7 @@ import {
 import { getEnv } from "./env";
 import { htmlToParagraphs, htmlToText, safeHttpUrl } from "./html-utils";
 import type { WordPressItem } from "@/types/wordpress";
+import { extractServiceType } from "./content-normalizer";
 
 export interface SuccessiveSearchChunk {
   id: string;
@@ -32,6 +33,7 @@ export interface SuccessiveSearchDocument {
   modified?: string;
   contentQuality: number;
   productLike: boolean;
+  service_type?: string;
 }
 
 const rendered = (value: WordPressItem["title"] | WordPressItem["content"]) =>
@@ -268,6 +270,7 @@ export function buildSearchDocument(
     modified: item.modified ?? item.date,
     contentQuality,
     productLike,
+    service_type: extractServiceType(item.acf),
   };
 }
 
