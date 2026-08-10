@@ -43,6 +43,11 @@ describe("public direct-DOM widget loader", () => {
     launcher.click();
     expect(dom.window.document.querySelector("iframe")).toBeNull();
     expect(
+      dom.window.document.querySelector(
+        ".successive-chat-widget-wrap > #successive-chat-widget-root",
+      ),
+    ).not.toBeNull();
+    expect(
       dom.window.document.querySelector(".successive-chat-ui .conversation"),
     ).not.toBeNull();
     expect(
@@ -63,6 +68,25 @@ describe("public direct-DOM widget loader", () => {
     expect(launcher.querySelector("svg path")?.getAttribute("d")).toContain(
       "18 6 6 18",
     );
+  });
+
+  it("scopes every widget UI selector under the wrapper class", () => {
+    const dom = createWidget();
+    const styles =
+      dom.window.document.querySelector("#successive-chat-widget-styles")
+        ?.textContent ?? "";
+    expect(styles).toContain(
+      ".successive-chat-widget-wrap .successive-chat-launcher",
+    );
+    expect(styles).toContain(
+      ".successive-chat-widget-wrap #successive-chat-widget-root",
+    );
+    expect(styles).toContain(
+      ".successive-chat-widget-wrap .chat-actions button",
+    );
+    expect(styles).toContain(".successive-chat-widget-wrap .conversation");
+    expect(styles).not.toMatch(/(^|})\.conversation\{/);
+    expect(styles).not.toMatch(/(^|})\.bubble\{/);
   });
 
   it("supports safe named primary colors passed by the script", () => {
