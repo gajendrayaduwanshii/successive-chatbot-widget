@@ -16,11 +16,19 @@ import {
   buildSearchDocument,
   type SuccessiveSearchDocument,
 } from "@/lib/search-index";
-import { retrieveFromIndex } from "@/lib/search-retriever";
+import {
+  isBroadAiServicesQuery,
+  retrieveFromIndex,
+} from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
 import {
+  asksForAnotherResult,
   buildConversationRetrievalQuery,
+  buildRelatedServiceRetrievalQuery,
+  contentIdentitiesFromAssistantHistory,
+  contentIdentity,
   isVagueBusinessDiscovery,
+  shouldDeduplicateDiscoveryResults,
 } from "@/lib/conversation-context";
 
 export const runtime = "nodejs";
@@ -42,6 +50,16 @@ const requestSchema = z.object({
     .optional()
     .default([]),
   sessionId: z.string().max(100).optional(),
+  seenContent: z
+    .array(
+      z.object({
+        title: z.string().trim().max(300),
+        url: z.string().url().max(2000),
+      }),
+    )
+    .max(500)
+    .optional()
+    .default([]),
 });
 const error = (
   status: number,
@@ -142,10 +160,19 @@ export async function POST(request: NextRequest) {
   }
   const effectiveMessage = preparedQuery.englishQuery;
   const intent = detectIntent(effectiveMessage);
-  const contextualQuery = buildConversationRetrievalQuery(
+  const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
     effectiveMessage,
-    parsed.data.history,
+    intent,
   );
+  const seenContentKeys = new Set([
+    ...parsed.data.seenContent.flatMap(({ title, url }) =>
+      contentIdentity(title, url),
+    ),
+    ...contentIdentitiesFromAssistantHistory(parsed.data.history),
+  ]);
+  const contextualQuery =
+    buildRelatedServiceRetrievalQuery(effectiveMessage, parsed.data.history) ??
+    buildConversationRetrievalQuery(effectiveMessage, parsed.data.history);
   const retrievalMessage = isVagueBusinessDiscovery(contextualQuery)
     ? "digital transformation digital engineering cloud data artificial intelligence experience design services"
     : contextualQuery;
@@ -223,7 +250,7 @@ export async function POST(request: NextRequest) {
   const caseStudyTopic = effectiveMessage
     .toLowerCase()
     .replace(
-      /\b(?:show|give|tell|me|your|the|latest|recent|new|case|study|studies|success|stories|story|about|on|regarding|find|please)\b/g,
+      /\b(?:show|give|tell|me|your|the|latest|recent|new|more|another|other|others|different|next|case|study|studies|success|stories|story|about|on|regarding|find|please)\b/g,
       " ",
     )
     .replace(/[^a-z0-9]+/g, " ")
@@ -242,16 +269,31 @@ export async function POST(request: NextRequest) {
       const listing = listingItems[0]
         ? buildSearchDocument(listingItems[0])
         : undefined;
-      const caseStudies = caseStudyItems
+      let caseStudies = caseStudyItems
         .filter((item) => item.type?.includes("case"))
         .map(buildSearchDocument)
         .sort(
           (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
         )
-        .slice(0, 5);
-      if (!listing || !caseStudies.length) {
+        .filter(
+          (document) =>
+            !shouldDeduplicate ||
+            !contentIdentity(document.title, document.url).some((key) =>
+              seenContentKeys.has(key),
+            ),
+        );
+      if (shouldRandomizeDiscovery(effectiveMessage, intent))
+        caseStudies = shuffled(caseStudies);
+      caseStudies = caseStudies.slice(0, 5);
+      if (!listing) {
         throw new Error("Case-study collection is unavailable");
       }
+      if (!caseStudies.length)
+        return exhaustedCollectionResponse(
+          "case studies",
+          listing,
+          cors.headers,
+        );
       const documents = [listing, ...caseStudies];
       return NextResponse.json(
         {
@@ -307,7 +349,7 @@ export async function POST(request: NextRequest) {
   const blogTopic = effectiveMessage
     .toLowerCase()
     .replace(
-      /\b(?:show|give|tell|me|your|the|latest|recent|new|blogs?|articles?|insights?|about|on|regarding|please)\b/g,
+      /\b(?:show|give|tell|me|your|the|latest|recent|new|more|another|other|others|different|next|blogs?|articles?|insights?|about|on|regarding|please)\b/g,
       " ",
     )
     .replace(/[^a-z0-9]+/g, " ")
@@ -326,14 +368,33 @@ export async function POST(request: NextRequest) {
       const listing = listingItems[0]
         ? buildSearchDocument(listingItems[0])
         : undefined;
-      const posts = postItems
+      let posts = postItems
         .filter((item) => item.type === "post")
         .map(buildSearchDocument)
         .sort(
           (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
         )
-        .slice(0, 5);
-      if (!posts.length) throw new Error("Blog collection is unavailable");
+        .filter(
+          (document) =>
+            !shouldDeduplicate ||
+            !contentIdentity(document.title, document.url).some((key) =>
+              seenContentKeys.has(key),
+            ),
+        );
+      if (shouldRandomizeDiscovery(effectiveMessage, intent))
+        posts = shuffled(posts);
+      posts = posts.slice(0, 5);
+      if (!posts.length) {
+        const fallbackListing = listing ?? {
+          title: "Blogs",
+          url: `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/blogs-and-insights/`,
+        };
+        return exhaustedCollectionResponse(
+          "blogs",
+          fallbackListing,
+          cors.headers,
+        );
+      }
       const listingCard = listing
         ? {
             type: "page" as const,
@@ -410,8 +471,18 @@ export async function POST(request: NextRequest) {
       retrievalMessage,
       intent,
       effectiveMessage,
+      shouldDeduplicate ? seenContentKeys : new Set<string>(),
     );
     if (!retrieval.reliableMatchFound) {
+      if (shouldDeduplicate && seenContentKeys.size) {
+        return NextResponse.json(
+          {
+            success: true,
+            data: exhaustedResultsData(),
+          },
+          { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+        );
+      }
       return NextResponse.json(
         {
           success: true,
@@ -429,21 +500,20 @@ export async function POST(request: NextRequest) {
     }
     // Retrieval already returns the globally ranked Top 5. Do not narrow that
     // set again here: every selected chunk must reach the grounded LLM prompt.
-    const asksForUnseenResults =
-      /\b(?:more|another|other|others|different|next)\b/i.test(
-        effectiveMessage,
-      );
+    const asksForUnseenResults = asksForAnotherResult(effectiveMessage);
     const previouslyPresented = parsed.data.history
       .filter((item) => item.role === "assistant")
       .map((item) => item.content.toLowerCase())
       .join("\n");
-    const selectedMatches = asksForUnseenResults
+    let selectedMatches = asksForUnseenResults
       ? retrieval.matches.filter(
           ({ document }) =>
             !previouslyPresented.includes(document.url.toLowerCase()) &&
             !previouslyPresented.includes(document.title.toLowerCase()),
         )
       : retrieval.matches;
+    if (shouldRandomizeDiscovery(effectiveMessage, intent))
+      selectedMatches = shuffled(selectedMatches);
     if (asksForUnseenResults && !selectedMatches.length) {
       return NextResponse.json(
         {
@@ -466,9 +536,10 @@ export async function POST(request: NextRequest) {
       );
     }
     const topScore = selectedMatches[0]?.score ?? 0;
-    const isWhitepaperQuery = /\b(?:white ?papers?|whitepepers?|whtieperpers?)\b/i.test(
-      effectiveMessage,
-    );
+    const isWhitepaperQuery =
+      /\b(?:white ?papers?|whitepepers?|whtieperpers?)\b/i.test(
+        effectiveMessage,
+      );
     const isWhitepaperCollectionQuery =
       isWhitepaperQuery &&
       /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
@@ -545,6 +616,11 @@ export async function POST(request: NextRequest) {
     }
     let generatedAnswer =
       generatedData?.answer ?? buildGroundedRetrievalAnswer(selectedMatches);
+    if (
+      shouldDeduplicate &&
+      answerReferencesSeenContent(generatedAnswer, seenContentKeys)
+    )
+      generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
     if (isWhitepaperCollectionQuery) {
       generatedAnswer = buildWhitepaperCollectionAnswer(selectedMatches);
     }
@@ -577,6 +653,10 @@ export async function POST(request: NextRequest) {
       generatedAnswer,
       selectedMatches,
     );
+    const categoryAnswer = isBroadAiServicesQuery(effectiveMessage)
+      ? ensureCategoryHeading(groundedAnswer, "Successive AI Services")
+      : groundedAnswer;
+    const finalAnswer = categoryAnswer;
     const presentedMatches =
       isWhitepaperQuery && selectedMatches.length <= 15
         ? selectedMatches
@@ -590,7 +670,7 @@ export async function POST(request: NextRequest) {
         confidence: "medium" as const,
         insufficientContext: false,
       }),
-      answer: groundedAnswer,
+      answer: finalAnswer,
       cards: presentedMatches.map(({ document, selectedPassages }) => ({
         type: cardType(document.type),
         title: document.title,
@@ -611,7 +691,10 @@ export async function POST(request: NextRequest) {
           )
         : generatedData?.suggestions?.length
           ? generatedData.suggestions
-          : buildRelatedSuggestions(intent, presentedMatches[0]?.document.title),
+          : buildRelatedSuggestions(
+              intent,
+              presentedMatches[0]?.document.title,
+            ),
       confidence: topScore >= 100 ? "high" : "medium",
       insufficientContext: false,
     };
@@ -637,6 +720,96 @@ function cardType(
   if (type === "post") return "blog";
   if (type === "event") return "event";
   return "page";
+}
+
+function answerReferencesSeenContent(
+  answer: string,
+  seenContentKeys: Set<string>,
+): boolean {
+  for (const match of answer.matchAll(/https?:\/\/[^\s)]+/g)) {
+    if (contentIdentity("", match[0]).some((key) => seenContentKeys.has(key)))
+      return true;
+  }
+  return false;
+}
+
+function ensureCategoryHeading(answer: string, heading: string): string {
+  const withoutLeadingHeading = answer
+    .trim()
+    .replace(/^#{1,3}\s+[^\n]+\n+/, "")
+    .replace(/^\*\*[^*]+\*\*\s*/, "")
+    .trim();
+  return `## ${heading}\n\n${withoutLeadingHeading}`;
+}
+
+function shouldRandomizeDiscovery(
+  message: string,
+  intent: ReturnType<typeof detectIntent>,
+): boolean {
+  if (["contact", "about"].includes(intent)) return false;
+  if (/\b(?:latest|newest|most recent)\b/i.test(message)) return false;
+  if (/^(?:tell me more about|tell me about|explain)\b/i.test(message.trim()))
+    return false;
+  return (
+    ["products", "case_studies", "blogs", "events", "resources"].includes(
+      intent,
+    ) ||
+    /\b(?:services?|serivces?|industr(?:y|ies)|white ?papers?|blogs?|articles?|case studies|webinars?|events?|accelerators?|awards?|partners?|press releases?|media coverage|thought leadership|employee perspectives?|expertise|pillars?)\b/i.test(
+      message,
+    )
+  );
+}
+
+function shuffled<T>(items: T[]): T[] {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index--) {
+    const swapWith = Math.floor(Math.random() * (index + 1));
+    [copy[index], copy[swapWith]] = [copy[swapWith]!, copy[index]!];
+  }
+  return copy;
+}
+
+function exhaustedResultsData() {
+  return {
+    answer:
+      "I’ve already shown the available matching items for this topic. Ask about a specific item for more detail, or try a different topic.",
+    cards: [],
+    sources: [],
+    suggestions: [
+      "Explore a different topic",
+      "Show me Successive services",
+      "Show me a related case study",
+    ],
+    confidence: "medium" as const,
+    insufficientContext: false,
+  };
+}
+
+function exhaustedCollectionResponse(
+  label: string,
+  listing: { title: string; url: string },
+  headers: Record<string, string>,
+) {
+  return NextResponse.json(
+    {
+      success: true,
+      data: {
+        ...exhaustedResultsData(),
+        answer: `I’ve already shown the available ${label} in this conversation. You can revisit the [${listing.title.replace(/[\[\]]/g, "")}](${listing.url}) page or ask about a specific item.`,
+        cards: [
+          {
+            type: "page" as const,
+            title: listing.title,
+            description: `Open the Successive ${label} listing page.`,
+            url: listing.url,
+            badge: label,
+          },
+        ],
+        sources: [{ title: listing.title, url: listing.url }],
+      },
+    },
+    { headers: { ...headers, "Cache-Control": "no-store" } },
+  );
 }
 
 function buildHelpfulFallback(localizedFallback: string): string {

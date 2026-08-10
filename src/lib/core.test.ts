@@ -34,9 +34,11 @@ import {
 } from "./search-index";
 import {
   detectRequestedServiceTypes,
+  isBroadAiServicesQuery,
   matchesRequestedServiceType,
   normalizeQuery,
   rankSearchDocument,
+  requestedCollection,
   retrieveFromIndex,
 } from "./search-retriever";
 import { fetchAllPublishedContent } from "./successive-api";
@@ -46,8 +48,13 @@ import {
 } from "./query-language";
 import { greetingResponse, isGreeting } from "./conversation";
 import {
+  asksForAnotherResult,
   buildConversationRetrievalQuery,
+  buildRelatedServiceRetrievalQuery,
+  contentIdentitiesFromAssistantHistory,
+  contentIdentity,
   isVagueBusinessDiscovery,
+  shouldDeduplicateDiscoveryResults,
 } from "./conversation-context";
 
 afterEach(() => {
@@ -63,6 +70,7 @@ describe("intent detection", () => {
     expect(detectIntent("any example")).toBe("case_studies");
     expect(detectIntent("show me another example")).toBe("case_studies");
     expect(detectIntent("what servies you provid")).toBe("products");
+    expect(detectIntent("more serivces")).toBe("products");
     expect(detectIntent("any webniar for cloud")).toBe("events");
     expect(detectIntent("show case stduy")).toBe("case_studies");
     expect(detectIntent("we need app devlopment")).toBe("products");
@@ -79,10 +87,55 @@ describe("intent detection", () => {
       ),
     ).toBe("general");
     expect(detectIntent("industers")).toBe("page");
+    expect(
+      detectIntent(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+      ),
+    ).toBe("general");
   });
 });
 
 describe("multi-turn conversation context", () => {
+  it("grounds related-service follow-ups in the latest assistant sources", () => {
+    const history = [
+      { role: "user" as const, content: "more blogs" },
+      {
+        role: "assistant" as const,
+        content:
+          "Read [AI in Supply Chain](https://successive.tech/ai-supply-chain/) and [Retail AI](https://successive.tech/retail-ai/).",
+      },
+    ];
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me related Successive services",
+        history,
+      ),
+    ).toBe("AI in Supply Chain. Retail AI. related Successive services");
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me relevant Successive services",
+        history,
+      ),
+    ).toBe("AI in Supply Chain. Retail AI. related Successive services");
+  });
+
+  it("turns a related-service suggestion after fallback into broad discovery", () => {
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me relevant Successive services",
+        [
+          { role: "user", content: "gajedran" },
+          {
+            role: "assistant",
+            content:
+              "I could not find reliable information in the available Successive website content.",
+          },
+        ],
+      ),
+    ).toBe(
+      "digital transformation cloud data artificial intelligence experience design services",
+    );
+  });
   it("carries recent business context into referential content transitions", () => {
     const query = buildConversationRetrievalQuery("Any case studies?", [
       { role: "user", content: "I work in healthcare." },
@@ -96,11 +149,25 @@ describe("multi-turn conversation context", () => {
     expect(query).toContain("Any case studies?");
   });
 
+  it("carries AI context into a misspelled request for more services", () => {
+    expect(
+      buildConversationRetrievalQuery("more serivces", [
+        { role: "user", content: "ai service" },
+        { role: "assistant", content: "Generative AI and AI strategy" },
+      ]),
+    ).toBe("ai service. more serivces");
+    expect(asksForAnotherResult("more serivces")).toBe(true);
+    expect(shouldDeduplicateDiscoveryResults("more serivces", "products")).toBe(
+      true,
+    );
+  });
+
   it("resets retrieval context when the visitor explicitly changes topic", () => {
     expect(
-      buildConversationRetrievalQuery("Actually I am more interested in cloud", [
-        { role: "user", content: "Show me AI services" },
-      ]),
+      buildConversationRetrievalQuery(
+        "Actually I am more interested in cloud",
+        [{ role: "user", content: "Show me AI services" }],
+      ),
     ).toBe("Actually I am more interested in cloud");
   });
 
@@ -120,6 +187,81 @@ describe("multi-turn conversation context", () => {
         { role: "user", content: "Show me AI services" },
       ]),
     ).toBe("whitepeper");
+  });
+
+  it("does not contaminate explicit suggestion titles with old About context", () => {
+    const history = [
+      { role: "user" as const, content: "About Successive" },
+      { role: "assistant" as const, content: "Successive company overview" },
+    ];
+    expect(buildConversationRetrievalQuery("Innovation", history)).toBe(
+      "Innovation",
+    );
+    expect(buildConversationRetrievalQuery("Successive Digital", history)).toBe(
+      "Successive Digital",
+    );
+    expect(
+      buildConversationRetrievalQuery("Digital Transformation", history),
+    ).toBe("Digital Transformation");
+    expect(
+      buildConversationRetrievalQuery(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+        history,
+      ),
+    ).toBe(
+      "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+    );
+  });
+
+  it("distinguishes detail requests from requests for unseen results", () => {
+    expect(
+      asksForAnotherResult(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+      ),
+    ).toBe(false);
+    expect(asksForAnotherResult("show me another service")).toBe(true);
+    expect(asksForAnotherResult("more")).toBe(true);
+  });
+
+  it("deduplicates discovery categories but keeps navigation and detail repeatable", () => {
+    expect(shouldDeduplicateDiscoveryResults("show blogs", "blogs")).toBe(true);
+    expect(
+      shouldDeduplicateDiscoveryResults("Digital Transformation", "general"),
+    ).toBe(false);
+    expect(
+      shouldDeduplicateDiscoveryResults(
+        "Tell me more about Digital Transformation",
+        "general",
+      ),
+    ).toBe(false);
+    expect(shouldDeduplicateDiscoveryResults("About Successive", "about")).toBe(
+      false,
+    );
+    expect(shouldDeduplicateDiscoveryResults("Contact Us", "contact")).toBe(
+      false,
+    );
+  });
+
+  it("matches previously shown content by canonical URL or normalized title", () => {
+    expect(
+      contentIdentity("AI Strategy", "https://successive.ai/ai-strategy/"),
+    ).toEqual(["url:https://successive.ai/ai-strategy", "title:ai strategy"]);
+  });
+
+  it("recovers seen content from older clients that only send answer history", () => {
+    expect(
+      contentIdentitiesFromAssistantHistory([
+        { role: "user", content: "ai services" },
+        {
+          role: "assistant",
+          content:
+            "See [Generative AI Consulting](https://successive.ai/gen-ai/).",
+        },
+      ]),
+    ).toEqual([
+      "url:https://successive.ai/gen-ai",
+      "title:generative ai consulting",
+    ]);
   });
 
   it("does not let an old collection override a new all-services request", () => {
@@ -147,6 +289,14 @@ describe("multi-turn conversation context", () => {
 });
 
 describe("service type query filtering", () => {
+  it("treats generic AI services as a complete portfolio query", () => {
+    expect(isBroadAiServicesQuery("ai services")).toBe(true);
+    expect(isBroadAiServicesQuery("Show me Successive AI services")).toBe(true);
+    expect(isBroadAiServicesQuery("generative ai services")).toBe(false);
+    expect(isBroadAiServicesQuery("AI strategy consulting services")).toBe(
+      false,
+    );
+  });
   it("maps dropdown wording and common misspellings to strict ACF values", () => {
     expect(detectRequestedServiceTypes("show cloud pillar services")).toEqual([
       "service",
@@ -168,9 +318,9 @@ describe("service type query filtering", () => {
     expect(
       matchesRequestedServiceType("cloud pillar services", "Expertise"),
     ).toBe(false);
-    expect(
-      matchesRequestedServiceType("cloud service", "Sub-service"),
-    ).toBe(true);
+    expect(matchesRequestedServiceType("cloud service", "Sub-service")).toBe(
+      true,
+    );
     expect(matchesRequestedServiceType("service pillar", "Piller")).toBe(true);
     expect(matchesRequestedServiceType("service pillar", "Sub-service")).toBe(
       true,
@@ -178,7 +328,35 @@ describe("service type query filtering", () => {
     expect(matchesRequestedServiceType("service pillar", "Expertise")).toBe(
       false,
     );
-    expect(matchesRequestedServiceType("cloud services", undefined)).toBe(false);
+    expect(matchesRequestedServiceType("cloud services", undefined)).toBe(
+      false,
+    );
+  });
+});
+describe("collection pagination requests", () => {
+  it("routes more/another requests through every repeatable collection", () => {
+    const expected = new Map([
+      ["more blogs", "blogs and insights"],
+      ["another case study", "case studies"],
+      ["more industries", "industries"],
+      ["next webinar", "webinars and events"],
+      ["more accelerators", "accelerators"],
+      ["other awards", "awards and recognitions"],
+      ["more partners", "partners and alliances"],
+      ["more careers", "career pages"],
+      ["more press releases", "PR and media coverage"],
+      ["more thought leadership", "thought leadership"],
+      ["more employee perspectives", "employee perspectives"],
+      ["more expertise", "expertise pages"],
+      ["more pillars", "service pillars"],
+    ]);
+    for (const [query, label] of expected)
+      expect(requestedCollection(query)?.label).toBe(label);
+  });
+
+  it("keeps more services available for topic-aware semantic retrieval", () => {
+    expect(requestedCollection("more services")).toBeUndefined();
+    expect(requestedCollection("list all services")?.label).toBe("services");
   });
 });
 describe("short topic query normalization", () => {
@@ -188,6 +366,7 @@ describe("short topic query normalization", () => {
     expect(normalizeQuery("careers")).toBe("careers jobs");
     expect(normalizeQuery("industers")).toBe("industries industry");
     expect(normalizeQuery("ai servies fhfghf")).toBe("ai services");
+    expect(normalizeQuery("ai serivces")).toBe("ai services");
   });
 });
 describe("query language preparation", () => {
@@ -787,6 +966,15 @@ describe("widget configuration", () => {
     ).toBe("https://successive.ai");
     vi.unstubAllEnvs();
   });
+  it("allows file-origin widget demos only outside production", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    expect(corsHeaders("null")).toMatchObject({
+      isAllowed: true,
+      headers: { "Access-Control-Allow-Origin": "null" },
+    });
+    vi.stubEnv("NODE_ENV", "production");
+    expect(corsHeaders("null").isAllowed).toBe(false);
+  });
   it("protects duplicate initialization and exposes only the public API", () => {
     const script = readFileSync("public/successive-chat-widget.js", "utf8");
     expect(script).toContain(
@@ -794,8 +982,9 @@ describe("widget configuration", () => {
     );
     for (const method of ["open", "close", "toggle", "destroy", "isOpen"])
       expect(script).toContain(`${method}:`);
-    expect(script).toContain("event.origin !== widgetOrigin");
-    expect(script).toContain("event.source !== frame.contentWindow");
+    expect(script).not.toContain('document.createElement("iframe")');
+    expect(script).toContain("fetch(config.apiUrl");
+    expect(script).toContain("safeUrl(value");
   });
 });
 describe("complete ACF search indexing", () => {

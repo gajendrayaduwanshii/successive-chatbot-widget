@@ -3,6 +3,7 @@ import {
   fetchRelevantRenderedPages,
 } from "./successive-api";
 import { detectIntent, type Intent } from "./intent-detector";
+import { contentIdentity } from "./conversation-context";
 import {
   buildSearchIndex,
   normalizeSearchText,
@@ -57,6 +58,7 @@ const STOPWORDS = new Set([
   "offer",
   "offers",
   "find",
+  "more",
 ]);
 
 // Lightweight synonym expansion gives paraphrases semantic-style recall
@@ -95,11 +97,18 @@ export interface RetrievalResult {
   collectionLabel?: string;
 }
 
-function requestedCollection(query: string):
+export function requestedCollection(
+  query: string,
+):
   | { label: string; matches: (document: SuccessiveSearchDocument) => boolean }
   | undefined {
   const q = normalizeSearchText(query);
-  if (!/\b(?:total|all|list|count|how many)\b/.test(q)) return undefined;
+  const requestsFullCollection = /\b(?:total|all|list|count|how many)\b/.test(
+    q,
+  );
+  const requestsNextPage =
+    /\b(?:more|another|other|others|different|next)\b/.test(q);
+  if (!requestsFullCollection && !requestsNextPage) return undefined;
   if (/\b(?:webinar|webinars|event|events)\b/.test(q))
     return {
       label: "webinars and events",
@@ -114,38 +123,77 @@ function requestedCollection(query: string):
       matches: (document) => document.type.includes("case"),
     };
   if (/\b(?:blog|blogs|articles|insights)\b/.test(q))
-    return { label: "blogs and insights", matches: (document) => document.type === "post" };
+    return {
+      label: "blogs and insights",
+      matches: (document) => document.type === "post",
+    };
   if (/\b(?:industry|industries)\b/.test(q))
-    return { label: "industries", matches: (document) => document.type === "industries" };
+    return {
+      label: "industries",
+      matches: (document) => document.type === "industries",
+    };
   if (/\baccelerators?\b/.test(q))
-    return { label: "accelerators", matches: (document) => document.type === "accelerators" };
+    return {
+      label: "accelerators",
+      matches: (document) => document.type === "accelerators",
+    };
   if (/\b(?:press releases?|media coverage|newsroom)\b/.test(q))
     return {
       label: "PR and media coverage",
-      matches: (document) => ["press-release", "media-coverage"].includes(document.type),
+      matches: (document) =>
+        ["press-release", "media-coverage"].includes(document.type),
     };
   if (/\b(?:career|careers|jobs)\b/.test(q))
-    return { label: "career pages", matches: (document) => document.type === "careers" };
+    return {
+      label: "career pages",
+      matches: (document) => document.type === "careers",
+    };
   if (/\b(?:partners|alliances)\b/.test(q))
-    return { label: "partners and alliances", matches: (document) => document.type === "partners" };
+    return {
+      label: "partners and alliances",
+      matches: (document) => document.type === "partners",
+    };
   if (/\b(?:awards|recognitions)\b/.test(q))
-    return { label: "awards and recognitions", matches: (document) => document.type === "award" };
+    return {
+      label: "awards and recognitions",
+      matches: (document) => document.type === "award",
+    };
   if (/\b(?:thought leadership|thought-leadership)\b/.test(q))
-    return { label: "thought leadership", matches: (document) => document.type === "thought-leadership" };
+    return {
+      label: "thought leadership",
+      matches: (document) => document.type === "thought-leadership",
+    };
+  if (/\b(?:employee perspective|employee perspectives)\b/.test(q))
+    return {
+      label: "employee perspectives",
+      matches: (document) => document.type === "employee-perspective",
+    };
   if (/\b(?:expert|experts|expertise)\b/.test(q))
-    return { label: "expertise pages", matches: (document) => normalizedServiceType(document.service_type) === "expertise" };
+    return {
+      label: "expertise pages",
+      matches: (document) =>
+        normalizedServiceType(document.service_type) === "expertise",
+    };
   if (/\b(?:pillar|pillars|piller|pillers)\b/.test(q))
-    return { label: "service pillars", matches: (document) => normalizedServiceType(document.service_type) === "pillar" };
-  if (/\bservices?\b/.test(q))
-    return { label: "services", matches: (document) => normalizedServiceType(document.service_type) === "service" };
+    return {
+      label: "service pillars",
+      matches: (document) =>
+        normalizedServiceType(document.service_type) === "pillar",
+    };
+  // A paginated service request can carry a topic from prior turns (for
+  // example, "AI services" -> "more services"), so keep it in semantic
+  // retrieval. Explicit all/list/count requests still enumerate all services.
+  if (requestsFullCollection && /\bservices?\b/.test(q))
+    return {
+      label: "services",
+      matches: (document) =>
+        normalizedServiceType(document.service_type) === "service",
+    };
   return undefined;
 }
 
 function isWhitepaperDocument(document: SuccessiveSearchDocument): boolean {
-  if (
-    document.type !== "page" ||
-    document.slug === "whitepaper-listing"
-  )
+  if (document.type !== "page" || document.slug === "whitepaper-listing")
     return false;
   return (
     document.combinedText.includes("download this whitepaper") ||
@@ -191,6 +239,8 @@ export function normalizeQuery(query: string): string {
     induster: "industry",
     industers: "industries",
     servies: "services",
+    serivce: "service",
+    serivces: "services",
     whitepeper: "whitepaper",
     whitepepers: "whitepapers",
     whtieperper: "whitepaper",
@@ -207,7 +257,11 @@ export function detectRequestedServiceTypes(
 ): RequestedServiceType[] {
   const normalized = normalizeSearchText(query);
   const requested: RequestedServiceType[] = [];
-  if (/\b(?:service|services|servire|servires)\b/.test(normalized))
+  if (
+    /\b(?:service|services|servire|servires|serivce|serivces)\b/.test(
+      normalized,
+    )
+  )
     requested.push("service");
   if (/\b(?:pillar|pillars|piller|pillers)\b/.test(normalized))
     requested.push("pillar");
@@ -225,6 +279,34 @@ function normalizedServiceType(value: string | undefined): string {
   return normalized;
 }
 
+export function isBroadAiServicesQuery(query: string): boolean {
+  const normalized = normalizeSearchText(query)
+    .replace(
+      /\b(?:show|give|tell|list|explore|find|me|about|successive|all|the|your|please)\b/g,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+  return /^(?:ai|artificial intelligence) (?:services?|solutions?|offerings?)$/.test(
+    normalized,
+  );
+}
+
+function isAiPortfolioDocument(document: SuccessiveSearchDocument): boolean {
+  const serviceType = normalizedServiceType(document.service_type);
+  if (!["service", "expertise", "pillar"].includes(serviceType)) return false;
+  const identityText = normalizeSearchText(
+    [
+      document.title,
+      document.slug.replace(/-/g, " "),
+      ...document.headings.slice(0, 8),
+    ].join(" "),
+  );
+  return /\b(?:ai|artificial intelligence|machine learning|generative ai|genai)\b/.test(
+    identityText,
+  );
+}
+
 export function matchesRequestedServiceType(
   query: string,
   serviceType: string | undefined,
@@ -232,14 +314,16 @@ export function matchesRequestedServiceType(
   const requested = detectRequestedServiceTypes(query);
   return (
     requested.length === 0 ||
-    requested.includes(normalizedServiceType(serviceType) as RequestedServiceType)
+    requested.includes(
+      normalizedServiceType(serviceType) as RequestedServiceType,
+    )
   );
 }
 
 function withoutServiceTypeTerms(query: string): string {
   return normalizeSearchText(query)
     .replace(
-      /\b(?:services?|servires?|expertise|experts?|exper|pillars?|pillers?)\b/g,
+      /\b(?:services?|servires?|serivces?|expertise|experts?|exper|pillars?|pillers?)\b/g,
       " ",
     )
     .replace(/\s+/g, " ")
@@ -375,7 +459,10 @@ export function rankSearchDocument(
   query: string,
   idf = new Map<string, number>(),
 ): SearchMatch {
-  const phraseQuery = normalizeSearchText(query);
+  const phraseQuery = normalizeSearchText(query).replace(
+    /^(?:tell me more about|tell me about|explain|show me)\s+/,
+    "",
+  );
   const normalizedQuery = normalizeQuery(query);
   const matchedFields: string[] = [];
   let documentBonus = 0;
@@ -428,8 +515,8 @@ export function rankSearchDocument(
   if (queryTerms.length >= 4) {
     const documentTerms = new Set(document.combinedText.split(" ").map(stem));
     const documentCoverage =
-      [...new Set(queryTerms)].filter((term) => documentTerms.has(term)).length /
-      new Set(queryTerms).size;
+      [...new Set(queryTerms)].filter((term) => documentTerms.has(term))
+        .length / new Set(queryTerms).size;
     if (
       documentCoverage < 0.6 &&
       !best?.fields.includes("semantic-expansion")
@@ -460,6 +547,7 @@ export async function retrieveFromIndex(
   query: string,
   currentIntent?: Intent,
   currentMessage = query,
+  excludedContent = new Set<string>(),
 ): Promise<RetrievalResult> {
   const baseIndex = await loadSearchIndex();
   const normalizedQuery = normalizeQuery(query);
@@ -531,20 +619,70 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
+  if (isBroadAiServicesQuery(currentMessage)) {
+    const aiPortfolio = index
+      .filter(isAiPortfolioDocument)
+      .filter(
+        (document) =>
+          !contentIdentity(document.title, document.url).some((key) =>
+            excludedContent.has(key),
+          ),
+      );
+    const aiIdf = buildInverseDocumentFrequency(aiPortfolio);
+    const matches = aiPortfolio
+      .map((document) =>
+        rankSearchDocument(document, "artificial intelligence", aiIdf),
+      )
+      .filter((match) => match.selectedPassages.length > 0)
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          b.document.contentQuality - a.document.contentQuality,
+      )
+      .slice(0, 5)
+      .map((match) => ({
+        ...match,
+        score: Math.max(100, match.score),
+        matchedFields: [...match.matchedFields, "ai-service-portfolio"],
+      }));
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0,
+      matches,
+      isProductList,
+      collectionTotal: aiPortfolio.length,
+      collectionLabel: "AI services",
+    };
+  }
   if (/\bwhite ?papers?\b/.test(normalizeQuery(currentMessage))) {
     const requestedLatest = /\b(?:latest|newest|most recent)\b/.test(
       normalizeSearchText(query),
     );
-    const requestedFullCollection = /\b(?:total|all|list|count|how many)\b/.test(
-      normalizeSearchText(currentMessage),
+    const requestedFullCollection =
+      /\b(?:total|all|list|count|how many)\b/.test(
+        normalizeSearchText(currentMessage),
+      );
+    const requestedMore =
+      /\b(?:more|another|other|others|different|next)\b/.test(
+        normalizeSearchText(currentMessage),
+      );
+    const allWhitepapers = index
+      .filter(isWhitepaperDocument)
+      .sort(
+        (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
+      );
+    let eligibleWhitepapers = allWhitepapers.filter(
+      (document) =>
+        !contentIdentity(document.title, document.url).some((key) =>
+          excludedContent.has(key),
+        ),
     );
-    const requestedMore = /\b(?:more|another|other|others|different|next)\b/.test(
-      normalizeSearchText(currentMessage),
-    );
-    const allWhitepapers = index.filter(isWhitepaperDocument).sort(
-      (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
-    );
-    const whitepapers = allWhitepapers
+    if (!requestedLatest)
+      eligibleWhitepapers = [...eligibleWhitepapers].sort(
+        () => Math.random() - 0.5,
+      );
+    const whitepapers = eligibleWhitepapers
       .slice(
         0,
         requestedLatest ? 1 : requestedFullCollection || requestedMore ? 15 : 3,
@@ -576,6 +714,12 @@ export async function retrieveFromIndex(
         (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
       );
     const matches = collection
+      .filter(
+        (document) =>
+          !contentIdentity(document.title, document.url).some((key) =>
+            excludedContent.has(key),
+          ),
+      )
       .slice(0, 15)
       .map((document, position) => ({
         document,
@@ -600,16 +744,22 @@ export async function retrieveFromIndex(
   const collectionDocuments =
     intent === "page" &&
     /\b(?:industry|industries)\b/.test(normalizedCurrentMessage)
-    ? index.filter((document) => document.type === "industries")
-    : intent === "page" &&
-        /\b(?:career|careers|job|jobs)\b/.test(normalizedCurrentMessage)
-      ? index.filter(
-          (document) =>
-            document.type === "careers" || document.slug === "careers",
-        )
-      : [];
+      ? index.filter((document) => document.type === "industries")
+      : intent === "page" &&
+          /\b(?:career|careers|job|jobs)\b/.test(normalizedCurrentMessage)
+        ? index.filter(
+            (document) =>
+              document.type === "careers" || document.slug === "careers",
+          )
+        : [];
   if (collectionDocuments.length) {
     const matches = collectionDocuments
+      .filter(
+        (document) =>
+          !contentIdentity(document.title, document.url).some((key) =>
+            excludedContent.has(key),
+          ),
+      )
       .map((document) => ({
         document,
         score: 100,
@@ -742,7 +892,14 @@ export async function retrieveFromIndex(
           }
         : match,
     )
-    .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)
+    .filter(
+      (match) =>
+        match.score >= 48 &&
+        match.selectedPassages.length > 0 &&
+        !contentIdentity(match.document.title, match.document.url).some((key) =>
+          excludedContent.has(key),
+        ),
+    )
     .sort(
       (a, b) =>
         b.score - a.score ||

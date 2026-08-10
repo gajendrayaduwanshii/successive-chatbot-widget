@@ -2,7 +2,7 @@
 import { RotateCcw, Sparkles, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AssistantResponse } from "@/lib/llm/schemas";
-import type { ChatMessage, HistoryMessage } from "@/types/chat";
+import type { ChatMessage, HistoryMessage, SeenContent } from "@/types/chat";
 import { ChatInput } from "./chat-input";
 import { ChatMessage as Message } from "./chat-message";
 import { TypingIndicator } from "./typing-indicator";
@@ -104,6 +104,19 @@ export function ChatWindow({
           role: m.role,
           content: m.response?.answer ?? m.content,
         }));
+      const seenContent: SeenContent[] = [
+        ...new Map(
+          messages
+            .flatMap((m) => [
+              ...(m.response?.sources ?? []),
+              ...(m.response?.cards ?? []).map(({ title, url }) => ({
+                title,
+                url,
+              })),
+            ])
+            .map((item) => [item.url.replace(/\/$/, "").toLowerCase(), item]),
+        ).values(),
+      ].slice(-500);
       setMessages((current) => [...current, user]);
       setLoading(true);
       emit("message-submitted", {
@@ -120,6 +133,7 @@ export function ChatWindow({
             body: JSON.stringify({
               message: text,
               history,
+              seenContent,
               sessionId: sessionId.current,
             }),
           },

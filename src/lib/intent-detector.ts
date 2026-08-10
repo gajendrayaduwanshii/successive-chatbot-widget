@@ -16,6 +16,7 @@ export function detectIntent(query: string): Intent {
   const q = query
     .toLowerCase()
     .replace(/\bservies\b/g, "services")
+    .replace(/\bserivces?\b/g, "services")
     .replace(/\bsulutions?\b/g, "solutions")
     .replace(/\bhelthcare\b/g, "healthcare")
     .replace(/\bwebniars?\b/g, "webinars")
@@ -91,7 +92,6 @@ export function detectIntent(query: string): Intent {
     return "product_detail";
   if (
     includes(q, [
-      "company",
       "who is successive",
       "what does successive",
       "successive ai",
