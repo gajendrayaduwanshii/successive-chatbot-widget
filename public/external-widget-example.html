@@ -187,7 +187,7 @@
       Paste only this script on the external website. Do not manually add
       successive-chat-widget-root; the widget creates it automatically.
     -->
-    <script
+    <!-- <script
       src="http://localhost:3000/successive-chat-widget.js?v=12"
       data-api-url="http://localhost:3000/api/chat"
       data-title="Ask Successive AI"
@@ -201,6 +201,21 @@
       data-prompt-input-id="ai-search-gajendra"
       data-prompt-button-id="ai-search-button-gajendra"
       defer
-    ></script>
+    ></script> -->
+    <script
+    src="https://successive-chatbot-widget.vercel.app/successive-chat-widget.js"
+    data-api-url="https://successive-chatbot-widget.vercel.app/api/chat"
+    data-title="Ask Successive AI"
+    data-welcome-message="Hi! How can I help you explore Successive?"
+    data-primary-color="#0063ce"
+    data-position="bottom-right"
+    data-button-label="Chat with Successive"
+    data-width="400"
+    data-height="650"
+    data-open-by-default="false"
+    data-prompt-input-id="ai-search"
+    data-prompt-button-id="ai-search-button"
+    defer
+  ></script>
   </body>
 </html>
