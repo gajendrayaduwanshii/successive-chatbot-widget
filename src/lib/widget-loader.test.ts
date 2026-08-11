@@ -84,9 +84,7 @@ describe("public direct-DOM widget loader", () => {
     expect(stylesheet).toContain(
       ".successive-chat-widget-wrap .chat-actions button",
     );
-    expect(stylesheet).toContain(
-      ".successive-chat-widget-wrap .conversation",
-    );
+    expect(stylesheet).toContain(".successive-chat-widget-wrap .conversation");
     expect(stylesheet).not.toMatch(/(^|})\.conversation\{/);
     expect(stylesheet).not.toMatch(/(^|})\.bubble\{/);
   });
@@ -158,6 +156,61 @@ describe("public direct-DOM widget loader", () => {
         ),
       ).not.toBeNull(),
     );
+  });
+
+  it("renders structured headings, bold labels, and use-case bullets", async () => {
+    const dom = createWidget();
+    const fetchMock = vi.mocked(dom.window.fetch);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          answer:
+            "## AI Use Cases\n\nPractical applications supported by Successive content.\n\n### Customer Experience\n\n- **Conversational AI:** Helps customers self-serve.\n- **Personalization:** Tailors relevant experiences.",
+          cards: [],
+          sources: [],
+          suggestions: [],
+        },
+      }),
+    } as Response);
+    const api = (
+      dom.window as unknown as {
+        SuccessiveChat: { sendMessage(value: string): boolean };
+      }
+    ).SuccessiveChat;
+    api.sendMessage("show AI use cases");
+    await vi.waitFor(() => {
+      const bubbles = dom.window.document.querySelectorAll(".bubble");
+      const bubble = bubbles[bubbles.length - 1];
+      expect(bubble?.querySelectorAll("h3")).toHaveLength(2);
+      expect(bubble?.querySelectorAll("li")).toHaveLength(2);
+      expect(bubble?.querySelector("li strong")?.textContent).toBe(
+        "Conversational AI:",
+      );
+    });
+  });
+
+  it("changes the loading message from analysis to response preparation", () => {
+    const dom = createWidget();
+    vi.mocked(dom.window.fetch).mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    const timeout = vi
+      .spyOn(dom.window, "setTimeout")
+      .mockImplementation((callback, delay) => {
+        if (delay === 2200 && typeof callback === "function") callback();
+        return 1;
+      });
+    const api = (
+      dom.window as unknown as {
+        SuccessiveChat: { sendMessage(value: string): boolean };
+      }
+    ).SuccessiveChat;
+    api.sendMessage("show cloud use cases");
+    expect(timeout).toHaveBeenCalledWith(expect.any(Function), 2200);
+    expect(
+      dom.window.document.querySelector(".typing-status")?.textContent,
+    ).toBe("Preparing your response…");
   });
 
   it("replaces copied stale widget markup", () => {

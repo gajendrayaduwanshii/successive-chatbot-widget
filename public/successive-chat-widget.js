@@ -141,6 +141,7 @@
   var messages = [];
   var sessionId = "";
   var unbindPromptInput = null;
+  var loadingStatusTimer = null;
   var previousOverflow = "";
   var mobileQuery = window.matchMedia("(max-width: 640px)");
   var icon = function (path, size) {
@@ -394,8 +395,10 @@
       row.appendChild(avatar);
       var typing = create("div", "typing");
       typing.setAttribute("role", "status");
-      typing.setAttribute("aria-label", "Assistant is thinking");
-      typing.innerHTML = "<span></span><span></span><span></span>";
+      typing.setAttribute("aria-live", "polite");
+      typing.appendChild(
+        create("span", "typing-status", "Analyzing your request…"),
+      );
       row.appendChild(typing);
       conversation.appendChild(row);
     }
@@ -437,10 +440,17 @@
   };
   var setLoading = function (value) {
     loading = value;
+    if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
+    loadingStatusTimer = null;
     if (input) input.disabled = value;
     if (sendButton)
       sendButton.disabled = value || !input || input.value.trim().length < 2;
     renderConversation();
+    if (value)
+      loadingStatusTimer = window.setTimeout(function () {
+        var status = wrapper?.querySelector(".typing-status");
+        if (status) status.textContent = "Preparing your response…";
+      }, 2200);
   };
   var sendMessage = function (value) {
     var message = typeof value === "string" ? value.trim() : "";
@@ -597,6 +607,7 @@
   var destroy = function () {
     setPageLock(false);
     if (unbindPromptInput) unbindPromptInput();
+    if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
     if (wrapper) wrapper.remove();
     else if (root) root.remove();
     if (stylesheet) stylesheet.remove();

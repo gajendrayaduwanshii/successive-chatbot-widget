@@ -292,6 +292,55 @@ export function isBroadAiServicesQuery(query: string): boolean {
   );
 }
 
+export function isUseCaseQuery(query: string): boolean {
+  const normalized = normalizeSearchText(query);
+  return /\b(?:use cases?|applications?)\b/.test(normalized);
+}
+
+function extractUseCaseTopic(query: string): string {
+  return normalizeSearchText(query)
+    .replace(/\b(?:use cases?|applications?)\b/g, " ")
+    .replace(
+      /\b(?:i|we|want|need|show|give|tell|find|some|me|us|the|a|an|of|for|in|about|please|business)\b/g,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildUseCaseScoringQuery(query: string): string {
+  const topic = extractUseCaseTopic(query);
+  return `${topic || "business"} use cases applications`;
+}
+
+function matchesUseCaseTopic(
+  document: SuccessiveSearchDocument,
+  topic: string,
+): boolean {
+  if (!topic) return true;
+  const documentText = ` ${document.combinedText} `;
+  if (/^(?:ai|artificial intelligence)$/.test(topic))
+    return /\b(?:ai|artificial intelligence|machine learning|generative ai|genai|agentic ai)\b/.test(
+      documentText,
+    );
+  return topic
+    .split(" ")
+    .filter(Boolean)
+    .every((term) => documentText.includes(` ${term} `));
+}
+
+function isLegalDocument(document: SuccessiveSearchDocument): boolean {
+  return /^(?:terms-of-services?|privacy-policy|cookie-policy|cookies?|sitemap|thank-you)/.test(
+    document.slug,
+  );
+}
+
+function explicitlyRequestsLegalContent(query: string): boolean {
+  return /\b(?:terms? (?:of )?(?:service|use)|privacy(?: policy)?|cookie(?: policy)?|sitemap)\b/.test(
+    normalizeSearchText(query),
+  );
+}
+
 function isAiPortfolioDocument(document: SuccessiveSearchDocument): boolean {
   const serviceType = normalizedServiceType(document.service_type);
   if (!["service", "expertise", "pillar"].includes(serviceType)) return false;
@@ -527,7 +576,7 @@ export function rankSearchDocument(
   }
   if (document.contentQuality < 25) score -= 30;
   if (
-    /privacy|sitemap|thank-you|thank you/i.test(
+    /privacy|terms-of-services?|cookie-policy|cookies?|sitemap|thank-you|thank you/i.test(
       `${document.slug} ${document.title}`,
     )
   )
@@ -653,6 +702,57 @@ export async function retrieveFromIndex(
       isProductList,
       collectionTotal: aiPortfolio.length,
       collectionLabel: "AI services",
+    };
+  }
+  if (isUseCaseQuery(currentMessage)) {
+    const topic = extractUseCaseTopic(currentMessage);
+    const useCaseIndex = index.filter(
+      (document) =>
+        !isLegalDocument(document) && matchesUseCaseTopic(document, topic),
+    );
+    const useCaseIdf = buildInverseDocumentFrequency(useCaseIndex);
+    const scoringQuery = buildUseCaseScoringQuery(currentMessage);
+    const rankedUseCases = useCaseIndex
+      .map((document) => {
+        const match = rankSearchDocument(document, scoringQuery, useCaseIdf);
+        const contentTypeBonus = document.type.includes("case")
+          ? 40
+          : document.type === "post"
+            ? 20
+            : 0;
+        return {
+          ...match,
+          score: match.score + contentTypeBonus,
+          matchedFields: [...match.matchedFields, "topic-use-case"],
+        };
+      })
+      .filter(
+        (match) =>
+          (topic ? true : match.score >= 48) &&
+          match.selectedPassages.length > 0 &&
+          !contentIdentity(match.document.title, match.document.url).some(
+            (key) => excludedContent.has(key),
+          ),
+      )
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          b.document.contentQuality - a.document.contentQuality,
+      );
+    const relativeCutoff = topic
+      ? (rankedUseCases[0]?.score ?? 0) * 0.65
+      : Math.max(48, (rankedUseCases[0]?.score ?? 0) * 0.65);
+    const matches = rankedUseCases
+      .filter((match) => match.score >= relativeCutoff)
+      .slice(0, 5);
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0,
+      matches,
+      isProductList,
+      collectionTotal: rankedUseCases.length,
+      collectionLabel: "use cases",
     };
   }
   if (/\bwhite ?papers?\b/.test(normalizeQuery(currentMessage))) {
@@ -782,14 +882,20 @@ export async function retrieveFromIndex(
   const categoryIndex = index.filter((document) => {
     if (!matchesRequestedServiceType(currentMessage, document.service_type))
       return false;
+    if (isLegalDocument(document)) {
+      if (!explicitlyRequestsLegalContent(currentMessage)) return false;
+      const requested = normalizeSearchText(currentMessage);
+      if (/\bprivacy\b/.test(requested))
+        return document.slug === "privacy-policy";
+      if (/\bcookie\b/.test(requested)) return /cookie/.test(document.slug);
+      if (/\bsitemap\b/.test(requested)) return /sitemap/.test(document.slug);
+      return /^terms-of-services?/.test(document.slug);
+    }
     if (intent === "about") {
       return (
         document.type === "page" &&
         ["about-us", "about"].includes(document.slug)
       );
-    }
-    if (/\bprivacy\b/.test(normalizedQuery)) {
-      return document.type === "page" && document.slug === "privacy-policy";
     }
     if (intent !== "case_studies" && /\bfull stack\b/.test(normalizedQuery)) {
       return (
@@ -845,8 +951,7 @@ export async function retrieveFromIndex(
       // not a custom `product` post type. Keep both collections eligible and
       // let full-text relevance select AI, engineering, cloud, data, etc.
       return (
-        (document.type === "page" &&
-          !["terms-of-services", "privacy-policy"].includes(document.slug)) ||
+        document.type === "page" ||
         document.type === "product" ||
         (document.type === "post" &&
           (document.normalizedTitle === normalizeSearchText(query) ||

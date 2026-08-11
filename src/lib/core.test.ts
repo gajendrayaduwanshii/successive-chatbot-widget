@@ -35,6 +35,7 @@ import {
 import {
   detectRequestedServiceTypes,
   isBroadAiServicesQuery,
+  isUseCaseQuery,
   matchesRequestedServiceType,
   normalizeQuery,
   rankSearchDocument,
@@ -289,6 +290,13 @@ describe("multi-turn conversation context", () => {
 });
 
 describe("service type query filtering", () => {
+  it("recognizes use-case requests for any topic", () => {
+    expect(isUseCaseQuery("i want use case of ai")).toBe(true);
+    expect(isUseCaseQuery("Show cloud applications for business")).toBe(true);
+    expect(isUseCaseQuery("Give me healthcare use cases")).toBe(true);
+    expect(isUseCaseQuery("AI services")).toBe(false);
+  });
+
   it("treats generic AI services as a complete portfolio query", () => {
     expect(isBroadAiServicesQuery("ai services")).toBe(true);
     expect(isBroadAiServicesQuery("Show me Successive AI services")).toBe(true);
@@ -1189,6 +1197,95 @@ describe("complete ACF search indexing", () => {
     const result = await retrieveFromIndex("Successive UNKNOWN");
     expect(result.reliableMatchFound).toBe(false);
     expect(result.matches).toEqual([]);
+  });
+  it("keeps legal pages out of AI use-case results", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                id: 1,
+                type: "page",
+                slug: "terms-of-services",
+                link: "https://successive.tech/terms-of-services/",
+                title: { rendered: "Terms of Services" },
+                content: {
+                  rendered:
+                    "<p>AI applications and use cases are mentioned in shared website content. This privacy policy explains how user information is handled.</p>",
+                },
+              },
+              {
+                id: 2,
+                type: "post",
+                slug: "enterprise-ai-applications-benefits-challenges",
+                link: "https://successive.tech/blog/enterprise-ai-applications-benefits-challenges/",
+                title: {
+                  rendered:
+                    "Enterprise AI Applications, Benefits and Challenges",
+                },
+                content: {
+                  rendered:
+                    "<h2>Enterprise AI use cases</h2><p>Businesses use conversational AI for customer self-service, marketing support, finance workflows, and enterprise operations.</p>",
+                },
+              },
+              {
+                id: 3,
+                type: "post",
+                slug: "generative-ai-in-customer-experience",
+                link: "https://successive.tech/blog/generative-ai-in-customer-experience/",
+                title: { rendered: "Generative AI in Customer Experience" },
+                content: {
+                  rendered:
+                    "<p>Generative AI helps customers self-assist through conversational experiences and personalized support.</p>",
+                },
+              },
+              {
+                id: 4,
+                type: "post",
+                slug: "cloud-computing-use-cases",
+                link: "https://successive.tech/blog/cloud-computing-use-cases/",
+                title: { rendered: "Cloud Computing Use Cases" },
+                content: {
+                  rendered:
+                    "<p>Cloud applications support scalable infrastructure, modernization, disaster recovery, and data analytics workloads.</p>",
+                },
+              },
+            ]),
+            {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-WP-TotalPages": "1",
+              },
+            },
+          ),
+      ),
+    );
+    const result = await retrieveFromIndex("i want use case of ai");
+    expect(result.reliableMatchFound).toBe(true);
+    expect(result.collectionLabel).toBe("use cases");
+    expect(result.matches.map(({ document }) => document.slug)).toContain(
+      "enterprise-ai-applications-benefits-challenges",
+    );
+    expect(result.matches.map(({ document }) => document.slug)).not.toContain(
+      "terms-of-services",
+    );
+    expect(
+      result.matches.every((match) =>
+        match.matchedFields.includes("topic-use-case"),
+      ),
+    ).toBe(true);
+
+    const cloudResult = await retrieveFromIndex("show cloud use cases");
+    expect(cloudResult.reliableMatchFound).toBe(true);
+    expect(cloudResult.matches[0]?.document.slug).toBe(
+      "cloud-computing-use-cases",
+    );
+    expect(
+      cloudResult.matches.map(({ document }) => document.slug),
+    ).not.toContain("terms-of-services");
   });
   it("retrieves an article from an exact sentence in the middle of its body", async () => {
     vi.stubGlobal(

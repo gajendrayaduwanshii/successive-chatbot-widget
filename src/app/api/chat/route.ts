@@ -18,6 +18,7 @@ import {
 } from "@/lib/search-index";
 import {
   isBroadAiServicesQuery,
+  isUseCaseQuery,
   retrieveFromIndex,
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
@@ -653,9 +654,14 @@ export async function POST(request: NextRequest) {
       generatedAnswer,
       selectedMatches,
     );
-    const categoryAnswer = isBroadAiServicesQuery(effectiveMessage)
-      ? ensureCategoryHeading(groundedAnswer, "Successive AI Services")
-      : groundedAnswer;
+    const categoryAnswer = isUseCaseQuery(effectiveMessage)
+      ? ensureCategoryHeading(
+          groundedAnswer,
+          buildUseCaseHeading(effectiveMessage),
+        )
+      : isBroadAiServicesQuery(effectiveMessage)
+        ? ensureCategoryHeading(groundedAnswer, "Successive AI Services")
+        : groundedAnswer;
     const finalAnswer = categoryAnswer;
     const presentedMatches =
       isWhitepaperQuery && selectedMatches.length <= 15
@@ -740,6 +746,26 @@ function ensureCategoryHeading(answer: string, heading: string): string {
     .replace(/^\*\*[^*]+\*\*\s*/, "")
     .trim();
   return `## ${heading}\n\n${withoutLeadingHeading}`;
+}
+
+function buildUseCaseHeading(message: string): string {
+  const topic = message
+    .toLowerCase()
+    .replace(/\b(?:use cases?|applications?)\b/g, " ")
+    .replace(
+      /\b(?:i|we|want|need|show|give|tell|find|some|me|us|the|a|an|of|for|in|about|please|business)\b/g,
+      " ",
+    )
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const label = (topic || "Business")
+    .split(" ")
+    .map((word) =>
+      word === "ai" ? "AI" : word[0]!.toUpperCase() + word.slice(1),
+    )
+    .join(" ");
+  return `${label} Use Cases`;
 }
 
 function shouldRandomizeDiscovery(
