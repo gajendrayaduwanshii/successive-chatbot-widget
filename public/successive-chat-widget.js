@@ -135,7 +135,7 @@
     input,
     sendButton,
     unread,
-    style;
+    stylesheet;
   var open = false;
   var loading = false;
   var messages = [];
@@ -599,70 +599,8 @@
     if (unbindPromptInput) unbindPromptInput();
     if (wrapper) wrapper.remove();
     else if (root) root.remove();
-    if (style) style.remove();
+    if (stylesheet) stylesheet.remove();
     delete window.SuccessiveChat;
-  };
-  var scopeWidgetCss = function (cssText) {
-    var scope = ".successive-chat-widget-wrap";
-    return cssText.replace(
-      /(^|})(\s*)([^@}{][^{}]*){/g,
-      function (whole, boundary, whitespace, selectorList) {
-        var trimmed = selectorList.trim();
-        if (/^(?:from|to|\d+(?:\.\d+)?%)$/.test(trimmed)) return whole;
-        var scoped = selectorList
-          .split(",")
-          .map(function (selector) {
-            var clean = selector.trim();
-            if (clean.startsWith("#successive-chat-widget-root"))
-              return clean.replace(
-                "#successive-chat-widget-root",
-                scope + " #successive-chat-widget-root",
-              );
-            if (clean.startsWith(scope)) return clean;
-            return scope + " " + clean;
-          })
-          .join(",");
-        return boundary + whitespace + scoped + "{";
-      },
-    );
-  };
-  var css = function () {
-    var side = config.position === "bottom-left" ? "left:20px" : "right:20px";
-    var panelSide = config.position === "bottom-left" ? "left:0" : "right:0";
-    var origin = config.position === "bottom-left" ? "left" : "right";
-    return scopeWidgetCss(
-      "#successive-chat-widget-root{--kc-primary:" +
-        config.primaryColor +
-        ";--kc-dark:#0050a8;--kc-ink:#080b14;--kc-muted:#4a5565;--kc-line:#d9dee5;--kc-soft:#f7f8fa;position:fixed;bottom:max(20px,env(safe-area-inset-bottom));" +
-        side +
-        ";z-index:" +
-        config.zIndex +
-        ';font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--kc-ink);line-height:1.4}' +
-        "#successive-chat-widget-root *{box-sizing:border-box}#successive-chat-widget-root button,#successive-chat-widget-root textarea{font:inherit}#successive-chat-widget-root svg{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}" +
-        ".successive-chat-launcher{margin-left:auto;display:flex;align-items:center;gap:9px;min-width:56px;height:56px;padding:0 18px;border:0;border-radius:999px;background:var(--kc-primary);color:#fff;box-shadow:0 12px 34px rgba(15,23,42,.28);font-weight:700;font-size:14px;cursor:pointer;transition:.18s}.successive-chat-launcher:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(15,23,42,.35)}" +
-        ".successive-chat-panel{position:absolute;bottom:70px;" +
-        panelSide +
-        ";width:" +
-        config.width +
-        "px;height:" +
-        config.height +
-        "px;max-width:calc(100vw - 24px);max-height:calc(100vh - 104px);overflow:hidden;border-radius:18px;background:#fff;box-shadow:0 24px 80px rgba(2,6,23,.3);transform-origin:bottom " +
-        origin +
-        ";animation:successive-chat-in .2s ease-out}.successive-chat-panel[hidden],.successive-chat-unread[hidden]{display:none}" +
-        ".successive-chat-ui{width:100%;height:100%;min-height:0;background:#fff;display:flex;flex-direction:column;text-align:left;overflow:hidden}.successive-chat-ui .chat-header{min-height:58px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;border:0;background:var(--kc-primary);color:" +
-        foreground(config.primaryColor) +
-        ";font-size:14px;font-weight:700}.chat-title,.chat-actions{display:flex;align-items:center;gap:9px}.online{width:8px;height:8px;border-radius:50%;background:#21b573;box-shadow:0 0 0 4px #ddf8eb}.chat-logo{max-width:28px;max-height:28px}.chat-actions button{min-height:34px;border:0;background:none;color:inherit;display:inline-flex;gap:6px;align-items:center;justify-content:center;vertical-align:middle;line-height:1;cursor:pointer;padding:8px;border-radius:8px}.chat-actions button svg{display:block;flex:0 0 auto}.chat-actions button span{display:block;line-height:1}.chat-actions button:hover{background:#ffffff20}" +
-        ".conversation{flex:1;overflow:auto;padding:18px 15px;scrollbar-width:thin}.chat-disclaimer{margin:0 0 18px;color:var(--kc-muted);font-size:11px;line-height:1.5}.message-row{display:flex;width:100%;min-width:0;gap:11px;margin-bottom:24px;align-items:flex-start}.message-row.user{flex-direction:row-reverse}.avatar{width:32px;height:32px;flex:0 0 auto;border-radius:10px;display:grid;place-items:center;background:#eef0f5;color:#657086}.assistant .avatar{background:#e4f2ff;color:var(--kc-primary)}.message-wrap{min-width:0;max-width:90%}.message-author{margin:0 0 5px 2px;color:#344054;font-size:12px;font-weight:700}.user .message-wrap{display:flex;flex-direction:column;align-items:flex-end}.bubble{max-width:100%;overflow-wrap:anywhere;padding:12px 15px;border-radius:5px 16px 16px 16px;background:var(--kc-soft);line-height:1.6;font-size:15px}.user .bubble{background:var(--kc-primary);color:#fff;border-radius:16px 5px 16px 16px}.bubble p{margin:0 0 9px}.bubble p:last-child,.bubble ul:last-child{margin-bottom:0}.bubble h3{margin:14px 0 6px;color:#172033;font-size:14px}.bubble h3:first-child{margin-top:0}.bubble ul{padding-left:20px}.bubble a,.sources a{color:var(--kc-primary)}" +
-        ".retry{display:block;margin-top:10px;border:1px solid #d6d9e2;border-radius:8px;background:white;padding:7px 11px;cursor:pointer;color:var(--kc-primary)}.card-grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:13px;width:100%}.result-card{border:1px solid var(--kc-line);border-radius:14px;overflow:hidden;background:#fff;display:flex;flex-direction:column;min-width:0}.result-card>img{width:100%;height:128px;object-fit:cover;background:#edeff5}.result-content{padding:14px;display:flex;flex-direction:column;align-items:flex-start;flex:1}.badge{font-size:10px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--kc-primary);background:#f0edff;padding:4px 7px;border-radius:5px}.result-content h3{font-size:15px;line-height:1.35;margin:9px 0 6px}.result-content p{font-size:12.5px;color:var(--kc-muted);line-height:1.5;margin:0 0 13px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.result-content>a{display:flex;gap:5px;align-items:center;color:var(--kc-primary);text-decoration:none;font-size:12px;font-weight:700;margin-top:auto}" +
-        ".sources{margin-top:12px;font-size:12px;color:var(--kc-muted)}.sources summary{cursor:pointer}.sources div{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.sources a{display:flex;align-items:center;gap:4px;text-decoration:none}.suggestions{display:flex;flex-direction:column;margin-top:12px;overflow:hidden;border:1px solid var(--kc-line);border-radius:12px;background:#fff}.suggestions button{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:0;border-bottom:1px solid var(--kc-line);color:#344054;background:transparent;font-size:13px;font-weight:600;text-align:left;cursor:pointer}.suggestions button:last-child{border-bottom:0}.suggestions button:hover{color:var(--kc-dark);background:#f6faff}" +
-        ".input-area{width:100%;border-top:1px solid var(--kc-line);padding:15px 18px;display:flex;align-items:flex-end;gap:10px;background:#fff}.input-area textarea{min-width:0;border:1px solid #d9dce6;border-radius:12px;padding:11px 13px;resize:none;flex:1;min-height:44px;max-height:120px;outline:none}.input-area textarea:focus{border-color:var(--kc-primary);box-shadow:0 0 0 3px #d8ecff}.send{width:44px;height:44px;border:0;border-radius:12px;background:var(--kc-primary);color:#fff;display:grid;place-items:center;cursor:pointer}.send:disabled{opacity:.4;cursor:not-allowed}.typing{height:42px;padding:0 16px;display:flex;align-items:center;gap:4px;background:var(--kc-soft);border-radius:5px 16px 16px 16px}.typing span{width:6px;height:6px;border-radius:50%;background:#8b93a3;animation:successive-bounce 1.2s infinite}.typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}" +
-        ".successive-chat-unread{position:absolute;top:-4px;right:-4px;min-width:20px;height:20px;padding:0 5px;border:2px solid #fff;border-radius:999px;background:#ef4444;color:#fff;font:700 11px/16px sans-serif;text-align:center}@keyframes successive-chat-in{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:none}}@keyframes successive-bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}" +
-        "@media(max-width:640px){.successive-chat-label,.chat-actions button span{display:none}.successive-chat-launcher{width:56px;padding:0;justify-content:center}" +
-        (config.mobileFullscreen
-          ? ".successive-chat-panel{position:fixed;inset:0;width:100vw;height:100dvh;max-width:none;max-height:none;border-radius:0}"
-          : "") +
-        "}@media(prefers-reduced-motion:reduce){.successive-chat-panel,.successive-chat-launcher,.typing span{animation:none;transition:none}}",
-    );
   };
   var init = function () {
     var staleRoot = document.getElementById("successive-chat-widget-root");
@@ -680,13 +618,32 @@
     }
     if (!messages.length)
       messages = [{ role: "assistant", content: config.welcomeMessage }];
-    style = create("style");
-    style.id = "successive-chat-widget-styles";
-    style.textContent = css();
-    document.head.appendChild(style);
+    stylesheet = document.getElementById("successive-chat-widget-styles");
+    if (!stylesheet) {
+      stylesheet = create("link");
+      stylesheet.id = "successive-chat-widget-styles";
+      stylesheet.rel = "stylesheet";
+      stylesheet.href = safeUrl(
+        data.stylesUrl,
+        new URL("successive-chat-widget.css", scriptUrl).href,
+      );
+      document.head.appendChild(stylesheet);
+    }
     wrapper = create("div", "successive-chat-widget-wrap");
     root = create("div");
     root.id = "successive-chat-widget-root";
+    root.classList.add(
+      config.position === "bottom-left" ? "position-left" : "position-right",
+    );
+    if (config.mobileFullscreen) root.classList.add("mobile-fullscreen");
+    root.style.setProperty("--kc-primary", config.primaryColor);
+    root.style.setProperty(
+      "--kc-primary-foreground",
+      foreground(config.primaryColor),
+    );
+    root.style.setProperty("--kc-z-index", String(config.zIndex));
+    root.style.setProperty("--kc-width", config.width + "px");
+    root.style.setProperty("--kc-height", config.height + "px");
     panel = create("div", "successive-chat-panel");
     panel.hidden = true;
     var chat = create("section", "successive-chat-ui");
@@ -754,7 +711,6 @@
     panel.appendChild(chat);
     launcher = create("button", "successive-chat-launcher");
     launcher.type = "button";
-    launcher.style.color = foreground(config.primaryColor);
     launcher.addEventListener("click", toggleWidget);
     unread = create("span", "successive-chat-unread");
     unread.hidden = true;

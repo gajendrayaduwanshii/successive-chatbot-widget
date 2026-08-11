@@ -3,6 +3,7 @@ import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
 
 const source = readFileSync("public/successive-chat-widget.js", "utf8");
+const stylesheet = readFileSync("public/successive-chat-widget.css", "utf8");
 
 function createWidget(markup = "", scriptAttributes = "") {
   const dom = new JSDOM(
@@ -60,10 +61,13 @@ describe("public direct-DOM widget loader", () => {
         'button[aria-label="Clear conversation"] svg',
       ),
     ).not.toBeNull();
-    expect(
-      dom.window.document.querySelector("#successive-chat-widget-styles")
-        ?.textContent,
-    ).toContain("background:var(--kc-primary)");
+    const styleLink = dom.window.document.querySelector<HTMLLinkElement>(
+      "#successive-chat-widget-styles",
+    );
+    expect(styleLink?.rel).toBe("stylesheet");
+    expect(styleLink?.href).toBe(
+      "https://widget.example/successive-chat-widget.css",
+    );
     expect(launcher.getAttribute("aria-expanded")).toBe("true");
     expect(launcher.querySelector("svg path")?.getAttribute("d")).toContain(
       "18 6 6 18",
@@ -71,31 +75,34 @@ describe("public direct-DOM widget loader", () => {
   });
 
   it("scopes every widget UI selector under the wrapper class", () => {
-    const dom = createWidget();
-    const styles =
-      dom.window.document.querySelector("#successive-chat-widget-styles")
-        ?.textContent ?? "";
-    expect(styles).toContain(
+    expect(stylesheet).toContain(
       ".successive-chat-widget-wrap .successive-chat-launcher",
     );
-    expect(styles).toContain(
+    expect(stylesheet).toContain(
       ".successive-chat-widget-wrap #successive-chat-widget-root",
     );
-    expect(styles).toContain(
+    expect(stylesheet).toContain(
       ".successive-chat-widget-wrap .chat-actions button",
     );
-    expect(styles).toContain(".successive-chat-widget-wrap .conversation");
-    expect(styles).not.toMatch(/(^|})\.conversation\{/);
-    expect(styles).not.toMatch(/(^|})\.bubble\{/);
+    expect(stylesheet).toContain(
+      ".successive-chat-widget-wrap .conversation",
+    );
+    expect(stylesheet).not.toMatch(/(^|})\.conversation\{/);
+    expect(stylesheet).not.toMatch(/(^|})\.bubble\{/);
+  });
+
+  it("inherits the host website font without pixel-based font sizes", () => {
+    expect(stylesheet).toContain("font-family: inherit");
+    expect(stylesheet).not.toMatch(/font(?:-size)?\s*:[^;]*\d+(?:\.\d+)?px/);
   });
 
   it("supports safe named primary colors passed by the script", () => {
     const dom = createWidget("", 'data-primary-color="red"');
-    const styles = dom.window.document.querySelector(
-      "#successive-chat-widget-styles",
-    )?.textContent;
-    expect(styles).toContain("--kc-primary:rgb(255, 0, 0)");
-    expect(styles).toContain("background:var(--kc-primary)");
+    const root = dom.window.document.querySelector<HTMLElement>(
+      "#successive-chat-widget-root",
+    );
+    expect(root?.style.getPropertyValue("--kc-primary")).toBe("rgb(255, 0, 0)");
+    expect(stylesheet).toContain("background: var(--kc-primary)");
   });
 
   it("sends an external form prompt directly to the chat API", async () => {
