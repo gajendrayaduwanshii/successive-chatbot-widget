@@ -582,29 +582,6 @@ button[aria-label="Thumbs down"] {
   opacity: 0.4;
   cursor: not-allowed;
 }
-.successive-chat-ui .typing {
-  height: 42px;
-  padding: 0 16px;
-  display: flex;
-  align-items: center;
-  background: var(--soft);
-  border-radius: 5px 16px 16px 16px;
-}
-.successive-chat-ui .typing-status {
-  color: var(--muted);
-  font-size: 0.8125rem;
-  font-weight: 600;
-  animation: status-pulse 1.4s ease-in-out infinite;
-}
-@keyframes status-pulse {
-  0%,
-  100% {
-    opacity: 0.55;
-  }
-  50% {
-    opacity: 1;
-  }
-}
 .footer {
   text-align: center;
   font-size: 12px;
@@ -842,9 +819,6 @@ summary:focus-visible {
   * {
     scroll-behavior: auto !important;
     transition: none !important;
-  }
-  .typing-status {
-    animation: none;
   }
 }
 .preview-builder {

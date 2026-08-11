@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 const source = readFileSync("public/successive-chat-widget.js", "utf8");
 const stylesheet = readFileSync("public/successive-chat-widget.css", "utf8");
+const applicationStyles = readFileSync("src/app/globals.css", "utf8");
 
 function createWidget(markup = "", scriptAttributes = "") {
   const dom = new JSDOM(
@@ -94,6 +95,18 @@ describe("public direct-DOM widget loader", () => {
     expect(stylesheet).not.toMatch(/font(?:-size)?\s*:[^;]*\d+(?:\.\d+)?px/);
   });
 
+  it("keeps loading animation CSS only inside the widget wrapper stylesheet", () => {
+    expect(stylesheet).toContain(".successive-chat-widget-wrap .typing-status");
+    expect(stylesheet).toContain(
+      ".successive-chat-widget-wrap .typing::before",
+    );
+    expect(stylesheet).not.toMatch(
+      /(^|})\s*\.typing(?:-status|::before|\s*\{)/,
+    );
+    expect(applicationStyles).not.toContain("typing-status");
+    expect(applicationStyles).not.toContain("status-shimmer");
+  });
+
   it("supports safe named primary colors passed by the script", () => {
     const dom = createWidget("", 'data-primary-color="red"');
     const root = dom.window.document.querySelector<HTMLElement>(
@@ -101,6 +114,9 @@ describe("public direct-DOM widget loader", () => {
     );
     expect(root?.style.getPropertyValue("--kc-primary")).toBe("rgb(255, 0, 0)");
     expect(stylesheet).toContain("background: var(--kc-primary)");
+    expect(stylesheet).toContain(
+      "color-mix(in srgb, var(--kc-primary) 48%, var(--kc-muted))",
+    );
   });
 
   it("sends an external form prompt directly to the chat API", async () => {

@@ -386,18 +386,38 @@
   cursor: not-allowed;
 }
 .successive-chat-widget-wrap .typing {
-  height: 42px;
-  padding: 0 16px;
+  min-height: 32px;
   display: flex;
   align-items: center;
-  background: var(--kc-soft);
-  border-radius: 5px 16px 16px 16px;
+  gap: 8px;
+  background: transparent;
+}
+.successive-chat-widget-wrap .typing::before {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--kc-primary);
+  content: "";
+  animation: successive-status-dot 1.6s ease-in-out infinite;
 }
 .successive-chat-widget-wrap .typing-status {
-  color: var(--kc-muted);
+  background: var(--kc-primary);
+  background: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--kc-primary) 48%, var(--kc-muted)) 20%,
+    var(--kc-primary) 48%,
+    color-mix(in srgb, var(--kc-primary) 48%, var(--kc-muted)) 76%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  color: transparent;
   font-size: 0.8125rem;
   font-weight: 600;
-  animation: successive-status-pulse 1.4s ease-in-out infinite;
+  letter-spacing: 0.01em;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: successive-status-shimmer 2s linear infinite;
 }
 .successive-chat-widget-wrap .successive-chat-unread {
   position: absolute;
@@ -426,13 +446,25 @@
     transform: none;
   }
 }
-@keyframes successive-status-pulse {
+@keyframes successive-status-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+@keyframes successive-status-dot {
   0%,
   100% {
-    opacity: 0.55;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--kc-primary) 28%, transparent);
+    opacity: 0.6;
+    transform: scale(0.78);
   }
   50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--kc-primary) 0%, transparent);
     opacity: 1;
+    transform: scale(1);
   }
 }
 @media (max-width: 640px) {
@@ -462,7 +494,11 @@
   .successive-chat-widget-wrap .successive-chat-launcher,
   .successive-chat-widget-wrap .typing-status {
     animation: none;
+    background-position: 50% 0;
     transition: none;
+  }
+  .successive-chat-widget-wrap .typing::before {
+    animation: none;
   }
 }
 .successive-chat-widget-wrap #successive-chat-widget-root.position-right {
