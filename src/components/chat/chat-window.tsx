@@ -41,6 +41,7 @@ export function ChatWindow({
   };
   const [messages, setMessages] = useState<ChatMessage[]>([welcome]);
   const [loading, setLoading] = useState(false);
+  const [animatingMessageId, setAnimatingMessageId] = useState<string>();
   const end = useRef<HTMLDivElement>(null);
   const sessionId = useRef("");
   const receivedExternalPrompts = useRef(new Set<string>());
@@ -152,10 +153,12 @@ export function ChatWindow({
           throw new Error(msg || "I couldn’t complete that request.");
         }
         const data = (json as { data: AssistantResponse }).data;
+        const assistantMessageId = crypto.randomUUID();
+        setAnimatingMessageId(assistantMessageId);
         setMessages((current) => [
           ...current,
           {
-            id: crypto.randomUUID(),
+            id: assistantMessageId,
             role: "assistant",
             content: data.answer,
             response: data,
@@ -168,10 +171,12 @@ export function ChatWindow({
           hasCards: data.cards.length > 0,
         });
       } catch (error) {
+        const assistantMessageId = crypto.randomUUID();
+        setAnimatingMessageId(assistantMessageId);
         setMessages((current) => [
           ...current,
           {
-            id: crypto.randomUUID(),
+            id: assistantMessageId,
             role: "assistant",
             content:
               error instanceof Error
@@ -301,6 +306,22 @@ export function ChatWindow({
             message={message}
             onSuggestion={send}
             onRetry={send}
+            animate={message.id === animatingMessageId}
+            onAnimationProgress={() =>
+              window.requestAnimationFrame(() =>
+                end.current?.scrollIntoView({ behavior: "auto" }),
+              )
+            }
+            onAnimationComplete={() => {
+              setAnimatingMessageId((current) =>
+                current === message.id ? undefined : current,
+              );
+              window.requestAnimationFrame(() =>
+                window.requestAnimationFrame(() =>
+                  end.current?.scrollIntoView({ behavior: "smooth" }),
+                ),
+              );
+            }}
           />
         ))}
         {loading && (

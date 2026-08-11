@@ -139,6 +139,7 @@
   var open = false;
   var loading = false;
   var messages = [];
+  var typewritingMessage = null;
   var sessionId = "";
   var unbindPromptInput = null;
   var loadingStatusTimer = null;
@@ -355,7 +356,62 @@
     if (assistant)
       wrap.appendChild(create("div", "message-author", "Successive Assistant"));
     var bubble = create("div", "bubble");
-    if (assistant)
+    if (assistant && message === typewritingMessage) {
+      var answer = message.response?.answer || message.content;
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        renderAnswer(bubble, answer);
+        typewritingMessage = null;
+      } else {
+        renderAnswer(bubble, answer);
+        bubble.setAttribute("aria-label", answer);
+        var walker = document.createTreeWalker(
+          bubble,
+          window.NodeFilter.SHOW_TEXT,
+        );
+        var textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        var characters = [];
+        textNodes.forEach(function (textNode) {
+          var fragment = document.createDocumentFragment();
+          Array.from(textNode.nodeValue || "").forEach(function (character) {
+            var characterNode = document.createElement("span");
+            characterNode.textContent = character;
+            characterNode.style.display = "none";
+            fragment.appendChild(characterNode);
+            characters.push(characterNode);
+          });
+          textNode.parentNode.replaceChild(fragment, textNode);
+        });
+        var index = 0;
+        var charactersPerTick = Math.max(
+          1,
+          Math.ceil(characters.length / 140),
+        );
+        var timer = window.setInterval(function () {
+          var nextIndex = Math.min(index + charactersPerTick, characters.length);
+          for (; index < nextIndex; index += 1)
+            characters[index].style.display = "inline";
+          if (conversation) conversation.scrollTop = conversation.scrollHeight;
+          if (index === characters.length) {
+            window.clearInterval(timer);
+            typewritingMessage = null;
+            if (message.response) {
+              renderCards(wrap, message.response.cards);
+              renderSources(wrap, message.response.sources);
+              renderSuggestions(wrap, message.response.suggestions);
+            }
+            if (conversation) {
+              var scrollToBottom = function () {
+                conversation.scrollTop = conversation.scrollHeight;
+              };
+              if (typeof window.requestAnimationFrame === "function")
+                window.requestAnimationFrame(scrollToBottom);
+              else window.setTimeout(scrollToBottom, 0);
+            }
+          }
+        }, 22);
+      }
+    } else if (assistant)
       renderAnswer(bubble, message.response?.answer || message.content);
     else bubble.textContent = message.content;
     if (message.failedPrompt) {
@@ -367,7 +423,7 @@
       bubble.appendChild(retry);
     }
     wrap.appendChild(bubble);
-    if (assistant && message.response) {
+    if (assistant && message.response && message !== typewritingMessage) {
       renderCards(wrap, message.response.cards);
       renderSources(wrap, message.response.sources);
       renderSuggestions(wrap, message.response.suggestions);
@@ -490,11 +546,13 @@
         });
       })
       .then(function (response) {
-        messages.push({
+        var assistantMessage = {
           role: "assistant",
           content: response.answer,
           response: response,
-        });
+        };
+        typewritingMessage = assistantMessage;
+        messages.push(assistantMessage);
         save();
         if (!open) {
           unread.textContent = "1";
@@ -509,7 +567,7 @@
       .catch(function (error) {
         var networkFailure =
           error instanceof Error && /failed to fetch/i.test(error.message);
-        messages.push({
+        var assistantMessage = {
           role: "assistant",
           content: networkFailure
             ? "The chat service could not be reached. If this is a local HTML test, make sure the chatbot server is running and refresh the page."
@@ -517,7 +575,9 @@
               ? error.message
               : "Something went wrong. Please try again.",
           failedPrompt: message,
-        });
+        };
+        typewritingMessage = assistantMessage;
+        messages.push(assistantMessage);
         save();
         dispatch("error", { code: "API_ERROR" });
       })
