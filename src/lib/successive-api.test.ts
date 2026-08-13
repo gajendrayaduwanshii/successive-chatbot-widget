@@ -72,6 +72,26 @@ describe("Successive custom v1 adapter", () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain("type=post");
   });
 
+  it("bounds paginated WordPress concurrency and uses compact pages", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        requestedUrls.push(String(input));
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return response([], 9);
+      }),
+    );
+    await fetchSuccessive("/posts");
+    expect(maximumActive).toBeLessThanOrEqual(4);
+    expect(requestedUrls[0]).toContain("per_page=10");
+  });
+
   it("uses the v1 page-detail route for exact slug lookup", async () => {
     const requestedUrls: string[] = [];
     vi.stubGlobal(

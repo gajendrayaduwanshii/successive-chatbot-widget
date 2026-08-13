@@ -47,7 +47,12 @@ import {
   canUseEnglishQueryDirectly,
   prepareEnglishQuery,
 } from "./query-language";
-import { greetingResponse, isGreeting } from "./conversation";
+import {
+  greetingResponse,
+  isGenericHelpRequest,
+  isGreeting,
+} from "./conversation";
+import { sanitizeGroundedAnswerOpening } from "./response-format";
 import {
   asksForAnotherResult,
   buildConversationRetrievalQuery,
@@ -67,6 +72,8 @@ describe("intent detection", () => {
   it("detects Successive website intents", () => {
     expect(detectIntent("Tell me about Successive services")).toBe("products");
     expect(detectIntent("who is Successive")).toBe("about");
+    expect(detectIntent("can you explain your successive")).toBe("about");
+    expect(detectIntent("Tell me about your company")).toBe("about");
     expect(detectIntent("Show customer stories")).toBe("case_studies");
     expect(detectIntent("any example")).toBe("case_studies");
     expect(detectIntent("show me another example")).toBe("case_studies");
@@ -93,6 +100,47 @@ describe("intent detection", () => {
         "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
       ),
     ).toBe("general");
+  });
+});
+
+describe("generic help requests", () => {
+  it("catches vague and fragmented help prompts before retrieval", () => {
+    expect(isGenericHelpRequest("I need help")).toBe(true);
+    expect(isGenericHelpRequest("i wan thelp")).toBe(true);
+    expect(isGenericHelpRequest("help")).toBe(true);
+    expect(isGenericHelpRequest("I need help with AI services")).toBe(false);
+    expect(isGenericHelpRequest("Help me find a cloud case study")).toBe(false);
+  });
+});
+
+describe("answer opening formatting", () => {
+  const title = "Crafting An Effective AI Strategy to Drive Business Growth";
+  const url = "https://successive.tech/blog/ai-strategy/";
+
+  it("removes a retrieved page title from the start in common markdown forms", () => {
+    for (const opening of [
+      title,
+      `## ${title}`,
+      `**${title}**`,
+      `[${title}](${url})`,
+      `**[${title}](${url})**`,
+    ]) {
+      expect(
+        sanitizeGroundedAnswerOpening(
+          `${opening}\n\nSuccessive offers relevant AI services.`,
+          [title],
+        ),
+      ).toBe("Successive offers relevant AI services.");
+    }
+  });
+
+  it("merges adjacent same-URL word links into one natural title link", () => {
+    expect(
+      sanitizeGroundedAnswerOpening(
+        `A summary first.\n\n[Crafting](${url}) [An](${url}) [Effective](${url}) [AI](${url}) provides context.`,
+        [title],
+      ),
+    ).toContain(`[Crafting An Effective AI](${url}) provides context.`);
   });
 });
 

@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { corsHeaders } from "@/lib/cors";
-import { greetingResponse, isGreeting } from "@/lib/conversation";
+import {
+  greetingResponse,
+  isGenericHelpRequest,
+  isGreeting,
+} from "@/lib/conversation";
 import { detectIntent } from "@/lib/intent-detector";
 import { getEnv } from "@/lib/env";
 import { fetchSuccessive } from "@/lib/successive-api";
+import { getContentLoadDiagnostics } from "@/lib/successive-api";
 import { getLLMProvider } from "@/lib/llm";
 import { assistantResponseSchema } from "@/lib/llm/schemas";
 import { rateLimit } from "@/lib/rate-limit";
@@ -19,9 +24,12 @@ import {
 import {
   isBroadAiServicesQuery,
   isUseCaseQuery,
+  getIndexDiagnostics,
   retrieveFromIndex,
+  cardEligibility,
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
+import { sanitizeGroundedAnswerOpening } from "@/lib/response-format";
 import {
   asksForAnotherResult,
   buildConversationRetrievalQuery,
@@ -31,6 +39,14 @@ import {
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
 } from "@/lib/conversation-context";
+import {
+  buildDeterministicUnderstanding,
+  resolveConversationUnderstanding,
+  isDeterministicallyOffTopic,
+  applyStructuralBroadQueryRules,
+  shouldUseSemanticUnderstanding,
+  type QueryUnderstanding,
+} from "@/lib/query-understanding";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -87,6 +103,11 @@ export async function OPTIONS(request: NextRequest) {
   return new NextResponse(null, { status: 204, headers: cors.headers });
 }
 export async function POST(request: NextRequest) {
+  const requestStartedAt = performance.now();
+  let understandingDurationMs = 0;
+  let retrievalDurationMs = 0;
+  let finalLlmDurationMs = 0;
+  let contextConstructionDurationMs = 0;
   const origin = request.headers.get("origin");
   const cors = corsHeaders(origin);
   const isSameOrigin = origin === new URL(request.url).origin;
@@ -160,6 +181,67 @@ export async function POST(request: NextRequest) {
     }
   }
   const effectiveMessage = preparedQuery.englishQuery;
+  // Do not let a vague help request inherit an old topic and surface an
+  // unrelated document title. Ask for the missing need before retrieval.
+  if (isGenericHelpRequest(effectiveMessage)) {
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          answer:
+            "Of course—what would you like help with? You can tell me about a business challenge, a Successive service, an industry, or the type of resource you need.",
+          cards: [],
+          sources: [],
+          suggestions: [
+            "Explore Successive services",
+            "Show me Successive case studies",
+            "Help me choose an AI service",
+          ],
+          confidence: "high",
+          insufficientContext: true,
+        },
+      },
+      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+    );
+  }
+  const deterministicUnderstanding =
+    buildDeterministicUnderstanding(effectiveMessage);
+  let understanding: QueryUnderstanding = deterministicUnderstanding;
+  if (
+    getEnv().AI_API_KEY &&
+    shouldUseSemanticUnderstanding(
+      deterministicUnderstanding,
+      parsed.data.history,
+    )
+  ) {
+    const understandingStartedAt = performance.now();
+    try {
+      understanding = await getLLMProvider().understandQuery(
+        effectiveMessage,
+        parsed.data.history.slice(-8),
+      );
+    } catch {
+      // Deterministic interpretation still supports lexical retrieval if the
+      // semantic planning call is unavailable or returns invalid JSON.
+    }
+    understandingDurationMs = performance.now() - understandingStartedAt;
+  }
+  // Content type is a hard eligibility constraint only when the visitor
+  // explicitly asks for one. The semantic interpreter may infer answer style,
+  // but it must not turn an ordinary topic/detail query into a whitepaper,
+  // thought-leadership, service, or case-study-only search.
+  understanding = {
+    ...understanding,
+    intent: ["solve_problem", "recommendation"].includes(deterministicUnderstanding.intent)
+      ? deterministicUnderstanding.intent
+      : understanding.intent,
+    businessProblem: deterministicUnderstanding.businessProblem ?? understanding.businessProblem,
+    requestedContentType: deterministicUnderstanding.requestedContentType,
+  };
+  understanding = applyStructuralBroadQueryRules(resolveConversationUnderstanding(
+    understanding,
+    parsed.data.history.slice(-8),
+  ).understanding, effectiveMessage);
   const intent = detectIntent(effectiveMessage);
   const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
     effectiveMessage,
@@ -177,6 +259,51 @@ export async function POST(request: NextRequest) {
   const retrievalMessage = isVagueBusinessDiscovery(contextualQuery)
     ? "digital transformation digital engineering cloud data artificial intelligence experience design services"
     : contextualQuery;
+  if (
+    isDeterministicallyOffTopic(effectiveMessage) ||
+    understanding.isOffTopic ||
+    understanding.intent === "off_topic"
+  ) {
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          answer:
+            "I'm here to help with Successive Digital's services, capabilities, industries, case studies, resources, and related business technology questions. Tell me what you're trying to achieve, and I can find the most relevant Successive information.",
+          cards: [],
+          sources: [],
+          suggestions: [
+            "Explore Successive capabilities",
+            "Show me Successive case studies",
+            "How can Successive help my business?",
+          ],
+          confidence: "high",
+          insufficientContext: true,
+        },
+      },
+      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+    );
+  }
+  if (
+    understanding.needsClarification &&
+    understanding.clarificationQuestion &&
+    !parsed.data.history.length
+  ) {
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          answer: understanding.clarificationQuestion,
+          cards: [],
+          sources: [],
+          suggestions: [],
+          confidence: "low",
+          insufficientContext: true,
+        },
+      },
+      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+    );
+  }
   // Contact is a deterministic navigation intent. Fetch only the published
   // Contact Us page and return one API-backed card; never run broad retrieval
   // that can mix in unrelated posts, case studies, or privacy content.
@@ -244,6 +371,47 @@ export async function POST(request: NextRequest) {
       );
     }
   }
+  // Pure company-level questions use the canonical published About page.
+  // Subject-bearing phrasing (for example, "what does Successive do with
+  // geospatial data?") is not classified as About and continues to normal
+  // topic retrieval.
+  if (intent === "about") {
+    try {
+      const item = (await fetchSuccessive("/pages/about-us"))[0];
+      if (!item) throw new Error("About page is unavailable");
+      const document = buildSearchDocument(item);
+      const passages = document.descriptions.length
+        ? document.descriptions.slice(0, 3)
+        : document.textSegments.slice(0, 3);
+      const description = cleanStoryDescription(
+        passages[0] ?? "Open the official Successive About page.",
+      );
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: `${passages.map(cleanStoryDescription).filter(Boolean).join("\n\n")}\n\n## About Successive Digital\n\n[About Us](${document.url})`,
+            cards: [{
+              type: "page",
+              title: document.title,
+              description,
+              url: document.url,
+              image: document.image,
+              badge: "company",
+            }],
+            sources: [{ title: document.title, url: document.url }],
+            suggestions: buildRelatedSuggestions("about", document.title),
+            confidence: "high",
+            insufficientContext: false,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    } catch {
+      // If the canonical page is temporarily unavailable, the shared partial
+      // index can still attempt a company-role response below.
+    }
+  }
   // Case-study collection requests must never fall through to keyword-based
   // global retrieval, where blog posts mentioning "case studies" can outrank
   // the actual collection. Return the listing page followed by the five most
@@ -272,7 +440,7 @@ export async function POST(request: NextRequest) {
         : undefined;
       let caseStudies = caseStudyItems
         .filter((item) => item.type?.includes("case"))
-        .map(buildSearchDocument)
+        .map((item) => buildSearchDocument(item))
         .sort(
           (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
         )
@@ -283,8 +451,6 @@ export async function POST(request: NextRequest) {
               seenContentKeys.has(key),
             ),
         );
-      if (shouldRandomizeDiscovery(effectiveMessage, intent))
-        caseStudies = shuffled(caseStudies);
       caseStudies = caseStudies.slice(0, 5);
       if (!listing) {
         throw new Error("Case-study collection is unavailable");
@@ -371,7 +537,7 @@ export async function POST(request: NextRequest) {
         : undefined;
       let posts = postItems
         .filter((item) => item.type === "post")
-        .map(buildSearchDocument)
+        .map((item) => buildSearchDocument(item))
         .sort(
           (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
         )
@@ -382,8 +548,6 @@ export async function POST(request: NextRequest) {
               seenContentKeys.has(key),
             ),
         );
-      if (shouldRandomizeDiscovery(effectiveMessage, intent))
-        posts = shuffled(posts);
       posts = posts.slice(0, 5);
       if (!posts.length) {
         const fallbackListing = listing ?? {
@@ -468,12 +632,15 @@ export async function POST(request: NextRequest) {
     }
   }
   try {
+    const retrievalStartedAt = performance.now();
     const retrieval = await retrieveFromIndex(
       retrievalMessage,
       intent,
       effectiveMessage,
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
+      understanding,
     );
+    retrievalDurationMs = performance.now() - retrievalStartedAt;
     if (!retrieval.reliableMatchFound) {
       if (shouldDeduplicate && seenContentKeys.size) {
         return NextResponse.json(
@@ -484,11 +651,15 @@ export async function POST(request: NextRequest) {
           { headers: { ...cors.headers, "Cache-Control": "no-store" } },
         );
       }
+      const requestedType = understanding.requestedContentType;
+      const requestedTypeLabel = requestedType?.replace("-", " ");
       return NextResponse.json(
         {
           success: true,
           data: {
-            answer: buildHelpfulFallback(preparedQuery.fallbackAnswer),
+            answer: requestedTypeLabel
+              ? `I couldn't find a strongly matching Successive ${requestedTypeLabel} for this topic. I don't want to present a generic or weakly related item as direct evidence. You can broaden the content type or ask for related Successive services and resources.`
+              : buildHelpfulFallback(preparedQuery.fallbackAnswer),
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
@@ -506,15 +677,15 @@ export async function POST(request: NextRequest) {
       .filter((item) => item.role === "assistant")
       .map((item) => item.content.toLowerCase())
       .join("\n");
-    let selectedMatches = asksForUnseenResults
+    const selectedMatches = asksForUnseenResults
       ? retrieval.matches.filter(
           ({ document }) =>
             !previouslyPresented.includes(document.url.toLowerCase()) &&
             !previouslyPresented.includes(document.title.toLowerCase()),
         )
       : retrieval.matches;
-    if (shouldRandomizeDiscovery(effectiveMessage, intent))
-      selectedMatches = shuffled(selectedMatches);
+    // Preserve relevance order for semantic/problem discovery. Collection
+    // branches above may still intentionally vary already-qualified items.
     if (asksForUnseenResults && !selectedMatches.length) {
       return NextResponse.json(
         {
@@ -577,6 +748,7 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    const contextStartedAt = performance.now();
     const context: NormalizedContent[] = selectedMatches.map(
       ({ document, selectedPassages }) => ({
         id: document.id,
@@ -593,6 +765,7 @@ export async function POST(request: NextRequest) {
         service_type: document.service_type,
       }),
     );
+    contextConstructionDurationMs = performance.now() - contextStartedAt;
     let generatedData;
     if (!getEnv().AI_API_KEY) {
       return error(
@@ -603,15 +776,18 @@ export async function POST(request: NextRequest) {
       );
     }
     try {
+      const finalLlmStartedAt = performance.now();
       const generated = await getLLMProvider().generateStructuredResponse({
         message: effectiveMessage,
         responseLanguage: preparedQuery.responseLanguage,
         fallbackAnswer: preparedQuery.fallbackAnswer,
         history: parsed.data.history.slice(-10),
         context,
+        understanding,
       });
       const validated = assistantResponseSchema.safeParse(generated);
       if (validated.success) generatedData = validated.data;
+      finalLlmDurationMs = performance.now() - finalLlmStartedAt;
     } catch {
       // Continue with a deterministic source-backed story below.
     }
@@ -663,10 +839,13 @@ export async function POST(request: NextRequest) {
         ? ensureCategoryHeading(groundedAnswer, "Successive AI Services")
         : groundedAnswer;
     const finalAnswer = categoryAnswer;
+    const cardMatches = selectedMatches.filter(
+      (match) => cardEligibility(match, understanding, topScore).accepted,
+    );
     const presentedMatches =
-      isWhitepaperQuery && selectedMatches.length <= 15
+      isWhitepaperCollectionQuery && selectedMatches.length <= 15
         ? selectedMatches
-        : selectedMatches.slice(0, 3);
+        : cardMatches.slice(0, 3);
     const response = {
       ...(generatedData ?? {
         answer: groundedAnswer,
@@ -704,6 +883,20 @@ export async function POST(request: NextRequest) {
       confidence: topScore >= 100 ? "high" : "medium",
       insufficientContext: false,
     };
+    if (process.env.NODE_ENV !== "production") {
+      console.info("chat_request_metrics", {
+        totalDurationMs: Math.round(performance.now() - requestStartedAt),
+        understandingDurationMs: Math.round(understandingDurationMs),
+        retrievalDurationMs: Math.round(retrievalDurationMs),
+        relationshipScoringDurationMs: retrieval.timings?.relationshipScoringMs ?? 0,
+        rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
+        contextConstructionDurationMs: Math.round(contextConstructionDurationMs),
+        finalLlmDurationMs: Math.round(finalLlmDurationMs),
+        wordpress: getContentLoadDiagnostics(),
+        index: getIndexDiagnostics(),
+        selectedDocuments: selectedMatches.length,
+      });
+    }
     return NextResponse.json(
       { success: true, data: response },
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
@@ -740,12 +933,27 @@ function answerReferencesSeenContent(
 }
 
 function ensureCategoryHeading(answer: string, heading: string): string {
-  const withoutLeadingHeading = answer
-    .trim()
-    .replace(/^#{1,3}\s+[^\n]+\n+/, "")
-    .replace(/^\*\*[^*]+\*\*\s*/, "")
-    .trim();
-  return `## ${heading}\n\n${withoutLeadingHeading}`;
+  const trimmed = answer.trim();
+  const leadingHeading = trimmed.match(/^#{1,3}\s+[^\n]+\n+/);
+  // A generated answer that already starts with prose follows the required
+  // direct-summary-first format; do not move a category title above it.
+  if (!leadingHeading) return trimmed;
+
+  const blocks = trimmed
+    .slice(leadingHeading[0].length)
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  const introductionIndex = blocks.findIndex(
+    (block) =>
+      !/^#{1,3}\s/.test(block) &&
+      !/^(?:[-*]|\d+\.)\s/.test(block) &&
+      !/^\*\*\[[^\]]+\]/.test(block),
+  );
+  if (introductionIndex < 0) return trimmed;
+
+  const [introduction] = blocks.splice(introductionIndex, 1);
+  return `${introduction}\n\n## ${heading}\n\n${blocks.join("\n\n")}`;
 }
 
 function buildUseCaseHeading(message: string): string {
@@ -766,33 +974,6 @@ function buildUseCaseHeading(message: string): string {
     )
     .join(" ");
   return `${label} Use Cases`;
-}
-
-function shouldRandomizeDiscovery(
-  message: string,
-  intent: ReturnType<typeof detectIntent>,
-): boolean {
-  if (["contact", "about"].includes(intent)) return false;
-  if (/\b(?:latest|newest|most recent)\b/i.test(message)) return false;
-  if (/^(?:tell me more about|tell me about|explain)\b/i.test(message.trim()))
-    return false;
-  return (
-    ["products", "case_studies", "blogs", "events", "resources"].includes(
-      intent,
-    ) ||
-    /\b(?:services?|serivces?|industr(?:y|ies)|white ?papers?|blogs?|articles?|case studies|webinars?|events?|accelerators?|awards?|partners?|press releases?|media coverage|thought leadership|employee perspectives?|expertise|pillars?)\b/i.test(
-      message,
-    )
-  );
-}
-
-function shuffled<T>(items: T[]): T[] {
-  const copy = [...items];
-  for (let index = copy.length - 1; index > 0; index--) {
-    const swapWith = Math.floor(Math.random() * (index + 1));
-    [copy[index], copy[swapWith]] = [copy[swapWith]!, copy[index]!];
-  }
-  return copy;
 }
 
 function exhaustedResultsData() {
@@ -1074,13 +1255,19 @@ function ensureDescriptiveGroundedAnswer(
   }>,
 ): string {
   const primary = matches[0]?.document;
-  const simpleNavigation = primary
-    ? ["careers", "contact"].includes(primary.slug)
-    : false;
-  const hasHeading = /^#{1,3}\s+\S/m.test(answer);
+  answer = sanitizeGroundedAnswerOpening(
+    answer,
+    matches.map(({ document }) => document.title),
+  );
+  const sourceTitles = new Set(
+    matches.map(({ document }) => normalizeHeading(document.title)),
+  );
+  const leadingHeading = answer.trim().match(/^#{1,3}\s+([^\n]+)\n+/);
+  // A retrieved page title is evidence, not the answer's topic. Do not force
+  // an SEO/article title into the assistant response heading.
   const withHeading =
-    primary && !simpleNavigation && !hasHeading
-      ? `## ${primary.title}\n\n${answer.trim()}`
+    leadingHeading && sourceTitles.has(normalizeHeading(leadingHeading[1]!))
+      ? answer.trim().slice(leadingHeading[0].length).trim()
       : answer.trim();
   const sentences = withHeading.match(/[^.!?]+[.!?]+/g)?.length ?? 0;
   const hasInlinePageLink = matches.some(({ document }) =>

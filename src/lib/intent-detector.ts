@@ -93,10 +93,16 @@ export function detectIntent(query: string): Intent {
   if (
     includes(q, [
       "who is successive",
-      "what does successive",
       "successive ai",
     ]) ||
     /^(?:tell me )?about (?:successive|the company)$/.test(q)
+  )
+    return "about";
+  if (/^(?:tell me about|who is|what is) successive(?: digital)?[?.!]*$/.test(q))
+    return "about";
+  if (
+    /^(?:can you )?explain(?: about)? (?:your )?successive(?: digital)?[?.!]*$/.test(q) ||
+    /^(?:tell me about|explain|what is) (?:your|the) company[?.!]*$/.test(q)
   )
     return "about";
   if (

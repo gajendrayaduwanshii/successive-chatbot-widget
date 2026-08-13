@@ -1,4 +1,3 @@
-import { unstable_cache } from "next/cache";
 import { getEnv } from "./env";
 import type { WordPressItem } from "@/types/wordpress";
 
@@ -27,6 +26,59 @@ const CONTENT_COLLECTIONS = [
 ] as const;
 
 type Collection = (typeof CONTENT_COLLECTIONS)[number];
+// The API supports 100 items per page. A size of 10 multiplies cold-start
+// network requests and makes the first chat request appear to hang.
+const PAGE_SIZE = 100;
+const WORDPRESS_CONCURRENCY = 4;
+const CORPUS_TTL_MS = 5 * 60 * 1000;
+const CORPUS_STALE_MS = 30 * 60 * 1000;
+
+export interface ContentLoadDiagnostics {
+  cache: "hit" | "miss" | "stale";
+  durationMs: number;
+  failedCollections: string[];
+  partial: boolean;
+  itemCount: number;
+}
+
+let corpusCache:
+  | { items: WordPressItem[]; loadedAt: number; diagnostics: ContentLoadDiagnostics }
+  | undefined;
+let corpusBuildPromise: Promise<WordPressItem[]> | undefined;
+let lastDiagnostics: ContentLoadDiagnostics = {
+  cache: "miss",
+  durationMs: 0,
+  failedCollections: [],
+  partial: false,
+  itemCount: 0,
+};
+
+export function getContentLoadDiagnostics(): ContentLoadDiagnostics {
+  return { ...lastDiagnostics, failedCollections: [...lastDiagnostics.failedCollections] };
+}
+
+async function mapBounded<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(values.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < values.length) {
+      const index = cursor++;
+      try {
+        results[index] = { status: "fulfilled", value: await operation(values[index]!) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, worker),
+  );
+  return results;
+}
 
 const customContentType = (collection: Collection): string => {
   if (collection === "posts") return "post";
@@ -43,7 +95,7 @@ function endpoint(collection: Collection, params?: URLSearchParams): string {
   }
   query.delete("slug");
   query.set("type", customContentType(collection));
-  query.set("per_page", query.get("per_page") ?? "100");
+  query.set("per_page", query.get("per_page") ?? String(PAGE_SIZE));
   return `${base}/content?${query}`;
 }
 
@@ -111,17 +163,24 @@ async function fetchCollection(
 ): Promise<WordPressItem[]> {
   const first = await fetchPage(collection, 1, params);
   if (first.totalPages <= 1) return first.items;
-  const rest = await Promise.all(
-    Array.from({ length: first.totalPages - 1 }, (_, index) =>
-      fetchPage(collection, index + 2, params),
-    ),
+  const pages = Array.from({ length: first.totalPages - 1 }, (_, index) => index + 2);
+  const rest = await mapBounded(pages, WORDPRESS_CONCURRENCY, (page) =>
+    fetchPage(collection, page, params),
   );
-  return [...first.items, ...rest.flatMap(({ items }) => items)];
+  return [
+    ...first.items,
+    ...rest.flatMap((result) =>
+      result.status === "fulfilled" ? result.value.items : [],
+    ),
+  ];
 }
 
 async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
-  const settled = await Promise.allSettled(
-    CONTENT_COLLECTIONS.map((collection) => fetchCollection(collection)),
+  const startedAt = Date.now();
+  const settled = await mapBounded(
+    CONTENT_COLLECTIONS,
+    WORDPRESS_CONCURRENCY,
+    (collection) => fetchCollection(collection),
   );
   const items = settled.flatMap((result) =>
     result.status === "fulfilled" ? result.value : [],
@@ -131,21 +190,49 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
     if (failure?.status === "rejected") throw failure.reason;
     return [];
   }
+  const failedCollections = CONTENT_COLLECTIONS.filter(
+    (_, index) => settled[index]?.status === "rejected",
+  );
+  lastDiagnostics = {
+    cache: "miss",
+    durationMs: Date.now() - startedAt,
+    failedCollections: [...failedCollections],
+    partial: failedCollections.length > 0,
+    itemCount: items.length,
+  };
   return items;
 }
 
-const fetchCachedPublishedContent = unstable_cache(
-  fetchAllPublishedContentUncached,
-  ["successive-complete-content-v1"],
-  { revalidate: 300 },
-);
-
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
-  // Tests use deterministic fetch mocks; production uses Vercel's shared data
-  // cache so the complete corpus is reused across function instances.
-  return process.env.NODE_ENV === "test"
-    ? fetchAllPublishedContentUncached()
-    : fetchCachedPublishedContent();
+  if (process.env.NODE_ENV === "test") return fetchAllPublishedContentUncached();
+  const now = Date.now();
+  if (corpusCache && now - corpusCache.loadedAt < CORPUS_TTL_MS) {
+    lastDiagnostics = { ...corpusCache.diagnostics, cache: "hit", durationMs: 0 };
+    return corpusCache.items;
+  }
+  if (corpusBuildPromise) {
+    if (corpusCache && now - corpusCache.loadedAt < CORPUS_STALE_MS) {
+      lastDiagnostics = { ...corpusCache.diagnostics, cache: "stale", durationMs: 0 };
+      return corpusCache.items;
+    }
+    return corpusBuildPromise;
+  }
+  corpusBuildPromise = fetchAllPublishedContentUncached()
+    .then((items) => {
+      corpusCache = { items, loadedAt: Date.now(), diagnostics: lastDiagnostics };
+      return items;
+    })
+    .catch((failure) => {
+      if (corpusCache && Date.now() - corpusCache.loadedAt < CORPUS_STALE_MS) {
+        lastDiagnostics = { ...corpusCache.diagnostics, cache: "stale", durationMs: 0 };
+        return corpusCache.items;
+      }
+      throw failure;
+    })
+    .finally(() => {
+      corpusBuildPromise = undefined;
+    });
+  return corpusBuildPromise;
 }
 
 export async function fetchRelevantRenderedPages(

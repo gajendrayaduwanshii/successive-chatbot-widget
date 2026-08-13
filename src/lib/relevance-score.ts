@@ -1,6 +1,9 @@
 import type { Intent } from "./intent-detector";
 import type { NormalizedContent } from "@/types/wordpress";
 
+/** @deprecated Legacy compatibility scorer. Active chat ranking lives in
+ * `search-retriever.ts`. */
+
 const terms = (query: string) =>
   [...new Set(query.toLowerCase().match(/[a-z0-9]+/g) ?? [])].filter(
     (t) => t.length > 2,

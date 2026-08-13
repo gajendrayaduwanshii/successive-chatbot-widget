@@ -1,6 +1,5 @@
 import {
   fetchAllPublishedContent,
-  fetchRelevantRenderedPages,
 } from "./successive-api";
 import { detectIntent, type Intent } from "./intent-detector";
 import { contentIdentity } from "./conversation-context";
@@ -10,6 +9,8 @@ import {
   type SuccessiveSearchChunk,
   type SuccessiveSearchDocument,
 } from "./search-index";
+import type { QueryUnderstanding } from "./query-understanding";
+import { buildRetrievalQuery } from "./query-understanding";
 
 const STOPWORDS = new Set([
   "do",
@@ -79,12 +80,38 @@ const SYNONYM_GROUPS = [
 const INDEX_CACHE_MS = 5 * 60 * 1000;
 let cachedIndex:
   { expiresAt: number; documents: SuccessiveSearchDocument[] } | undefined;
+let indexBuildPromise: Promise<SuccessiveSearchDocument[]> | undefined;
+let lastIndexDiagnostics = { cache: "miss" as "hit" | "miss" | "shared", durationMs: 0, documents: 0 };
+
+export function getIndexDiagnostics() {
+  return { ...lastIndexDiagnostics };
+}
 
 export interface SearchMatch {
   document: SuccessiveSearchDocument;
   score: number;
   matchedFields: string[];
   selectedPassages: string[];
+  scoreBreakdown?: {
+    title: number;
+    headings: number;
+    metadata: number;
+    body: number;
+    contentType: number;
+    penalties: number;
+    authorityCoverage: number;
+    topic?: number;
+    problem?: number;
+    outcome?: number;
+    industry?: number;
+    entity?: number;
+    bridge?: number;
+    constraintsSatisfied?: number;
+    constraintsTotal?: number;
+    contradictions?: number;
+  };
+  rejectionReason?: string;
+  confidence?: "high" | "medium" | "low";
 }
 
 export interface RetrievalResult {
@@ -95,6 +122,8 @@ export interface RetrievalResult {
   isProductList: boolean;
   collectionTotal?: number;
   collectionLabel?: string;
+  candidates?: SearchMatch[];
+  timings?: { indexLoadMs: number; relationshipScoringMs: number; rankingMs: number };
 }
 
 export function requestedCollection(
@@ -204,6 +233,55 @@ function isWhitepaperDocument(document: SuccessiveSearchDocument): boolean {
   );
 }
 
+function extractDirectLookupSubject(query: string): string {
+  return normalizeSearchText(query)
+    .replace(/^(?:tell me (?:more )?about|do you have information about|show me (?:the )?(?:customer story|case study)|what business needs does)\s+/, "")
+    .replace(/\s+(?:address|addresses)$/, "")
+    .trim();
+}
+
+function directIdentityStrength(document: SuccessiveSearchDocument, subject: string): number {
+  if (!subject || subject.split(" ").length < 2) return 0;
+  const meaningfulSubject = subject
+    .replace(/\b(?:successive|digital|company|about us)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Brand-only phrasing is company discovery, not an exact resource alias.
+  // Many editorial titles contain the brand and must not hijack About.
+  if (!meaningfulSubject) return 0;
+  const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
+  if (document.normalizedTitle === subject) return 1;
+  if (slug === subject) return 0.99;
+  if (document.aliases.includes(subject)) return 0.98;
+  const subjectTerms = new Set(subject.split(" "));
+  const titleTerms = new Set(document.normalizedTitle.split(" "));
+  const overlap = [...subjectTerms].filter((term) => titleTerms.has(term)).length;
+  const coverage = overlap / Math.max(subjectTerms.size, titleTerms.size, 1);
+  if ((document.normalizedTitle.includes(subject) || subject.includes(document.normalizedTitle)) && coverage >= 0.72)
+    return 0.9 + coverage * 0.08;
+  return coverage >= 0.88 ? coverage : 0;
+}
+
+export function isRequestedContentTypeCompatible(
+  document: SuccessiveSearchDocument,
+  requested: QueryUnderstanding["requestedContentType"],
+): boolean {
+  if (!requested) return true;
+  const identity = `${document.type} ${document.slug} ${document.normalizedTitle}`;
+  if (requested === "case-study") return document.type.includes("case");
+  if (requested === "blog") return document.type === "post";
+  if (requested === "event") return /event|webinar/.test(identity);
+  if (requested === "whitepaper") return isWhitepaperDocument(document);
+  if (requested === "thought-leadership")
+    return ["thought-leadership", "employee-perspective"].includes(document.type);
+  if (requested === "partner") return document.type === "partners";
+  if (requested === "industry") return document.type === "industries";
+  if (requested === "career") return document.type === "careers" || document.slug === "careers";
+  if (requested === "service")
+    return ["service", "expertise", "pillar"].includes(normalizedServiceType(document.service_type));
+  return document.type === "page";
+}
+
 export function normalizeQuery(query: string): string {
   const normalized = normalizeSearchText(query);
   // Recover a known high-level topic even when visitors add misspellings or
@@ -282,19 +360,24 @@ function normalizedServiceType(value: string | undefined): string {
 export function isBroadAiServicesQuery(query: string): boolean {
   const normalized = normalizeSearchText(query)
     .replace(
-      /\b(?:show|give|tell|list|explore|find|me|about|successive|all|the|your|please)\b/g,
+      /\b(?:show|give|tell|list|explore|find|what|me|about|successive|all|the|your|please)\b/g,
       " ",
     )
     .replace(/\s+/g, " ")
     .trim();
-  return /^(?:ai|artificial intelligence) (?:services?|solutions?|offerings?)$/.test(
+  return /^(?:ai|artificial intelligence)(?: (?:services?|solutions?|offerings?))?$/.test(
     normalized,
   );
 }
 
 export function isUseCaseQuery(query: string): boolean {
   const normalized = normalizeSearchText(query);
-  return /\b(?:use cases?|applications?)\b/.test(normalized);
+  return (
+    /\buse cases?\b/.test(normalized) ||
+    /\b(?:show|give|find|list|examples? of|what are)\b.*\bapplications\b/.test(
+      normalized,
+    )
+  );
 }
 
 function extractUseCaseTopic(query: string): string {
@@ -400,6 +483,89 @@ function expandedTerms(normalizedQuery: string): Set<string> {
   return terms;
 }
 
+function termCoverage(query: string, profileTerms: string[]): number {
+  const queryTerms = [...new Set(normalizeQuery(query).split(" ").map(stem).filter((term) => term.length > 2))];
+  if (!queryTerms.length) return 0;
+  const profile = new Set(profileTerms.map(stem));
+  return queryTerms.filter((term) => profile.has(term)).length / queryTerms.length;
+}
+
+function businessDimensions(
+  document: SuccessiveSearchDocument,
+  understanding: QueryUnderstanding | undefined,
+) {
+  const topicQuery = [...(understanding?.topics ?? []), ...(understanding?.domains ?? []), ...(understanding?.technicalSignals ?? [])].join(" ");
+  const problemQuery = understanding?.businessProblem ?? "";
+  const outcomeQuery = (understanding?.desiredOutcomes ?? []).join(" ");
+  const industryQuery = understanding?.industry ?? "";
+  const entityQuery = [...(understanding?.entities ?? []), understanding?.existingPlatform ?? ""].join(" ");
+  return {
+    topic: termCoverage(topicQuery, document.capabilityProfile.identityTerms),
+    problem: termCoverage(problemQuery, document.capabilityProfile.problemTerms),
+    outcome: termCoverage(outcomeQuery, document.capabilityProfile.outcomeTerms),
+    industry: termCoverage(industryQuery, document.capabilityProfile.industryTerms),
+    entity: termCoverage(entityQuery, [
+      ...document.aliases.flatMap((alias) => alias.split(" ")),
+      ...document.capabilityProfile.technologyTerms,
+    ]),
+  };
+}
+
+function constraintAssessment(
+  document: SuccessiveSearchDocument,
+  understanding: QueryUnderstanding | undefined,
+  dimensions = businessDimensions(document, understanding),
+) {
+  if (!understanding) return { total: 0, satisfied: 0, contradictions: 0 };
+  const checks: boolean[] = [];
+  if ([...understanding.topics, ...understanding.domains, ...understanding.technicalSignals].length)
+    checks.push(dimensions.topic >= 0.2);
+  if (understanding.businessProblem) checks.push(dimensions.problem >= 0.12 || dimensions.topic >= 0.34);
+  if (understanding.desiredOutcomes.length) checks.push(dimensions.outcome >= 0.2);
+  if (understanding.industry) checks.push(dimensions.industry >= 0.5 || document.role === "industry");
+  if (understanding.entities.length || understanding.existingPlatform) checks.push(dimensions.entity >= 0.5);
+  if (understanding.requestedContentType)
+    checks.push(isRequestedContentTypeCompatible(document, understanding.requestedContentType));
+  return {
+    total: checks.length,
+    satisfied: checks.filter(Boolean).length,
+    contradictions: checks.filter((value) => !value).length,
+  };
+}
+
+export function cardEligibility(
+  match: SearchMatch,
+  understanding: QueryUnderstanding,
+  topScore: number,
+): { accepted: boolean; reason?: string } {
+  const breakdown = match.scoreBreakdown;
+  if (understanding.requestedContentType &&
+      !isRequestedContentTypeCompatible(match.document, understanding.requestedContentType))
+    return { accepted: false, reason: "requested content type mismatch" };
+  if (match.matchedFields.includes("incidental-body-only"))
+    return { accepted: false, reason: "topic appears only incidentally in body text" };
+  if (match.score < Math.max(80, topScore * 0.82))
+    return { accepted: false, reason: "below independent card relevance threshold" };
+  if ((breakdown?.contradictions ?? 0) > 0)
+    return { accepted: false, reason: "one or more explicit constraints are not satisfied" };
+  if ((breakdown?.constraintsTotal ?? 0) >= 2 &&
+      (breakdown?.constraintsSatisfied ?? 0) < (breakdown?.constraintsTotal ?? 0))
+    return { accepted: false, reason: "incomplete multi-constraint match" };
+  const businessNeed = ["solve_problem", "recommendation"].includes(understanding.intent);
+  if (businessNeed) {
+    if (match.document.role !== "service")
+      return { accepted: false, reason: "supporting evidence is not a primary capability card" };
+    const problemCompatible = (breakdown?.problem ?? 0) >= 0.16 ||
+      (breakdown?.topic ?? 0) >= 0.34 || (breakdown?.outcome ?? 0) >= 0.34;
+    if (!problemCompatible)
+      return { accepted: false, reason: "weak business-problem compatibility" };
+  }
+  const authoritative = match.confidence === "high" ||
+    (match.confidence === "medium" && (breakdown?.authorityCoverage ?? 0) >= 0.45);
+  if (!authoritative) return { accepted: false, reason: "insufficient topic authority" };
+  return { accepted: true };
+}
+
 function chunkTerms(chunk: SuccessiveSearchChunk): Set<string> {
   const terms = chunk.normalizedText.split(" ").filter(Boolean);
   return new Set(terms.flatMap((token) => [token, stem(token)]));
@@ -439,16 +605,32 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
   // WordPress content is already revalidated every five minutes. Reusing the
   // derived index avoids repeated recursive ACF traversal and chunk generation
   // on every chat request while preserving the same freshness window.
-  if (
-    process.env.NODE_ENV !== "test" &&
-    cachedIndex &&
-    cachedIndex.expiresAt > Date.now()
-  )
+  if (process.env.NODE_ENV === "test")
+    return buildSearchIndex(await fetchAllPublishedContent());
+  if (cachedIndex && cachedIndex.expiresAt > Date.now()) {
+    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: cachedIndex.documents.length };
     return cachedIndex.documents;
-  const documents = buildSearchIndex(await fetchAllPublishedContent());
-  if (process.env.NODE_ENV !== "test")
-    cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
-  return documents;
+  }
+  if (indexBuildPromise) {
+    lastIndexDiagnostics = { ...lastIndexDiagnostics, cache: "shared" };
+    return indexBuildPromise;
+  }
+  const startedAt = Date.now();
+  indexBuildPromise = fetchAllPublishedContent()
+    .then(buildSearchIndex)
+    .then((documents) => {
+      cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
+      lastIndexDiagnostics = {
+        cache: "miss",
+        durationMs: Date.now() - startedAt,
+        documents: documents.length,
+      };
+      return documents;
+    })
+    .finally(() => {
+      indexBuildPromise = undefined;
+    });
+  return indexBuildPromise;
 }
 
 function scoreChunk(
@@ -507,6 +689,7 @@ export function rankSearchDocument(
   document: SuccessiveSearchDocument,
   query: string,
   idf = new Map<string, number>(),
+  understanding?: QueryUnderstanding,
 ): SearchMatch {
   const phraseQuery = normalizeSearchText(query).replace(
     /^(?:tell me more about|tell me about|explain|show me)\s+/,
@@ -514,15 +697,19 @@ export function rankSearchDocument(
   );
   const normalizedQuery = normalizeQuery(query);
   const matchedFields: string[] = [];
-  let documentBonus = 0;
+  let titleScore = 0;
+  let headingScore = 0;
+  let metadataScore = 0;
+  let contentTypeScore = 0;
+  let penalties = 0;
   if (document.normalizedTitle === phraseQuery) {
-    documentBonus += 120;
+    titleScore += 120;
     matchedFields.push("exact-title");
   } else if (
     phraseQuery.length >= 3 &&
     document.normalizedTitle.includes(phraseQuery)
   ) {
-    documentBonus += 90;
+    titleScore += 90;
     matchedFields.push("title-phrase");
   }
   const matchedAlias = document.aliases.some(
@@ -536,7 +723,7 @@ export function rankSearchDocument(
           alias.startsWith("successive "))),
   );
   if (matchedAlias) {
-    documentBonus += 100;
+    metadataScore += 100;
     matchedFields.push("alias");
   }
   const titleTerms = new Set(document.normalizedTitle.split(" ").map(stem));
@@ -545,11 +732,11 @@ export function rankSearchDocument(
     titleTerms.has(term),
   ).length;
   if (titleOverlap) {
-    documentBonus += Math.min(60, titleOverlap * 20);
+    titleScore += Math.min(60, titleOverlap * 20);
     matchedFields.push("title-token-overlap");
   }
   if (queryTerms.length && queryTerms.every((term) => titleTerms.has(term))) {
-    documentBonus += 50;
+    titleScore += 50;
     matchedFields.push("all-tokens-title");
   }
 
@@ -560,7 +747,84 @@ export function rankSearchDocument(
     }))
     .sort((a, b) => b.score - a.score || a.chunk.position - b.chunk.position);
   const best = rankedChunks[0];
-  let score = documentBonus + (best?.score ?? 0);
+  const headingText = normalizeSearchText(document.headings.slice(0, 12).join(" "));
+  const metadataText = normalizeSearchText(
+    `${document.slug.replace(/-/g, " ")} ${document.aliases.join(" ")} ${document.service_type ?? ""}`,
+  );
+  const distinctQueryTerms = [...new Set(queryTerms)];
+  const headingMatches = distinctQueryTerms.filter((term) =>
+    new Set(headingText.split(" ").map(stem)).has(term),
+  ).length;
+  const metadataMatches = distinctQueryTerms.filter((term) =>
+    new Set(metadataText.split(" ").map(stem)).has(term),
+  ).length;
+  headingScore += Math.min(72, headingMatches * 18);
+  metadataScore += Math.min(48, metadataMatches * 12);
+  if (phraseQuery.length >= 3 && headingText.includes(phraseQuery)) headingScore += 70;
+  if (phraseQuery.length >= 3 && metadataText.includes(phraseQuery)) metadataScore += 55;
+
+  const identityTerms = new Set([
+    ...document.topicProfile.titleTerms,
+    ...document.topicProfile.headingTerms,
+    ...document.topicProfile.metadataTerms,
+  ].map(stem));
+  const identityMatches = distinctQueryTerms.filter((term) => identityTerms.has(term));
+  const authorityCoverage = identityMatches.length / Math.max(1, distinctQueryTerms.length);
+  for (const entity of understanding?.entities ?? []) {
+    const normalizedEntity = normalizeSearchText(entity);
+    if (!normalizedEntity) continue;
+    const identityText = ` ${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.aliases.join(" ")} `;
+    if (identityText.includes(` ${normalizedEntity} `)) {
+      metadataScore += 150;
+      matchedFields.push("exact-entity-authority");
+    } else {
+      penalties -= 90;
+      matchedFields.push("entity-mismatch");
+    }
+  }
+  if (understanding?.requestedContentType) {
+    const requested = understanding.requestedContentType;
+    const compatible = isRequestedContentTypeCompatible(document, requested);
+    contentTypeScore += compatible ? 45 : -70;
+  }
+  if (understanding?.intent === "solve_problem" || understanding?.intent === "recommendation") {
+    const profileTerms = new Set([
+      ...document.capabilityProfile.problemTerms,
+      ...document.capabilityProfile.outcomeTerms,
+    ].map(stem));
+    const profileMatches = distinctQueryTerms.filter((term) => profileTerms.has(term)).length;
+    const profileCoverage = profileMatches / Math.max(1, distinctQueryTerms.length);
+    if (document.role === "service") contentTypeScore += 45;
+    else if (["editorial", "case-study"].includes(document.role)) penalties -= 35;
+    if (profileCoverage >= 0.34) {
+      metadataScore += Math.round(profileCoverage * 90);
+      matchedFields.push("capability-profile");
+    }
+  }
+  if (
+    distinctQueryTerms.length <= 2 &&
+    document.role === "service" &&
+    titleOverlap === distinctQueryTerms.length &&
+    titleOverlap > 0
+  ) {
+    contentTypeScore += 150;
+    matchedFields.push("primary-service-authority");
+  }
+  if (understanding?.intent === "informational" && document.role === "company" &&
+      understanding.topics.every((topic) => /^(?:successive|digital|company|about us)$/i.test(topic))) {
+    metadataScore += 200;
+    matchedFields.push("canonical-company-authority");
+  }
+  let score = titleScore + headingScore + metadataScore + contentTypeScore + (best?.score ?? 0);
+  // Generic short topics demand evidence that the document identifies itself
+  // with the topic. A lone body sentence is supporting evidence, not authority.
+  if (distinctQueryTerms.length <= 2 && authorityCoverage === 0) {
+    penalties -= 75;
+    matchedFields.push("incidental-body-only");
+  } else if (distinctQueryTerms.length <= 3 && authorityCoverage < 0.34) {
+    penalties -= 35;
+    matchedFields.push("weak-topic-authority");
+  }
   if (queryTerms.length >= 4) {
     const documentTerms = new Set(document.combinedText.split(" ").map(stem));
     const documentCoverage =
@@ -570,18 +834,25 @@ export function rankSearchDocument(
       documentCoverage < 0.6 &&
       !best?.fields.includes("semantic-expansion")
     ) {
-      score -= 100;
+      penalties -= 100;
       matchedFields.push("low-query-coverage");
     }
   }
-  if (document.contentQuality < 25) score -= 30;
+  if (document.contentQuality < 25) penalties -= 30;
   if (
     /privacy|terms-of-services?|cookie-policy|cookies?|sitemap|thank-you|thank you/i.test(
       `${document.slug} ${document.title}`,
     )
   )
-    score -= 60;
+    penalties -= 60;
+  score += penalties;
   if (best) matchedFields.push(...best.fields);
+  const confidence: SearchMatch["confidence"] =
+    matchedFields.some((field) => ["exact-title", "alias", "exact-entity-authority", "canonical-company-authority"].includes(field))
+      ? "high"
+      : authorityCoverage >= 0.5 && score >= 90
+        ? "medium"
+        : "low";
   return {
     document,
     score: Math.round(score * 100) / 100,
@@ -589,6 +860,16 @@ export function rankSearchDocument(
     // One substantial overlapping chunk per result yields a bounded Top 5
     // context set while retaining the surrounding paragraphs needed to answer.
     selectedPassages: best?.chunk.text ? [best.chunk.text] : [],
+    scoreBreakdown: {
+      title: titleScore,
+      headings: headingScore,
+      metadata: metadataScore,
+      body: Math.round((best?.score ?? 0) * 100) / 100,
+      contentType: contentTypeScore,
+      penalties,
+      authorityCoverage: Math.round(authorityCoverage * 100) / 100,
+    },
+    confidence,
   };
 }
 
@@ -597,37 +878,68 @@ export async function retrieveFromIndex(
   currentIntent?: Intent,
   currentMessage = query,
   excludedContent = new Set<string>(),
+  understanding?: QueryUnderstanding,
 ): Promise<RetrievalResult> {
+  const retrievalStartedAt = performance.now();
   const baseIndex = await loadSearchIndex();
+  const indexLoadedAt = performance.now();
   const normalizedQuery = normalizeQuery(query);
-  const intent =
-    currentIntent && currentIntent !== "general"
+  const interpretedIntent: Intent | undefined =
+    understanding?.requestedContentType === "case-study" || understanding?.intent === "evidence"
+      ? "case_studies"
+      : understanding?.requestedContentType === "blog"
+        ? "blogs"
+        : understanding?.requestedContentType === "event"
+          ? "events"
+          : understanding?.requestedContentType === "whitepaper"
+            ? "resources"
+            : understanding?.requestedContentType === "service"
+              ? "products"
+              : undefined;
+  let intent =
+    interpretedIntent ??
+    (currentIntent && currentIntent !== "general"
       ? currentIntent
-      : detectIntent(query);
+      : detectIntent(query));
+  if (
+    intent === "about" &&
+    understanding &&
+    understanding.topics.some((topic) => !/^(?:successive|digital|company|about us)$/.test(normalizeSearchText(topic)))
+  ) intent = "general";
   const requestedServiceTypes =
     intent === "products" || intent === "product_detail"
       ? detectRequestedServiceTypes(currentMessage)
       : [];
-  let index = baseIndex;
-  if (!["blogs", "case_studies", "events"].includes(intent)) {
-    try {
-      const relevantPages = buildSearchIndex(
-        await fetchRelevantRenderedPages(normalizedQuery || query),
-      );
-      const merged = new Map(
-        baseIndex.map((document) => [
-          `${document.type}:${document.id}`,
-          document,
-        ]),
-      );
-      relevantPages.forEach((document) =>
-        merged.set(`${document.type}:${document.id}`, document),
-      );
-      index = [...merged.values()];
-    } catch {
-      // The complete cached corpus remains available if targeted lookup fails.
-    }
+  // The complete corpus already contains rendered pages. Per-query WordPress
+  // searches caused request bursts and made a healthy warm index depend on a
+  // second upstream round trip.
+  const index = baseIndex;
+  const isBusinessNeed = understanding?.intent === "solve_problem" || understanding?.intent === "recommendation";
+  const bridgeBoosts = new Map<number, number>();
+  if (isBusinessNeed) {
+    const bridgeQuery = [
+      understanding.businessProblem,
+      ...understanding.desiredOutcomes,
+      ...understanding.domains,
+      ...understanding.technicalSignals,
+      understanding.industry,
+    ].filter(Boolean).join(" ");
+    const bridgeIdf = buildInverseDocumentFrequency(index);
+    index
+      .filter((document) => ["case-study", "editorial", "resource"].includes(document.role))
+      .map((document) => rankSearchDocument(document, bridgeQuery || query, bridgeIdf, understanding))
+      .filter((match) => match.score >= 90)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8)
+      .forEach((match) => {
+        match.document.relatedCapabilities.forEach((relation) => {
+          if (relation.score < 0.55 || relation.evidence.length < 2) return;
+          const boost = Math.min(28, relation.score * Math.min(100, match.score) * 0.35);
+          bridgeBoosts.set(relation.documentId, Math.max(bridgeBoosts.get(relation.documentId) ?? 0, boost));
+        });
+      });
   }
+  const relationshipsScoredAt = performance.now();
   // Successive exposes services and offerings as ordinary posts/pages. Do not
   // apply the legacy custom-product post-type shortcut.
   const isProductList = false;
@@ -668,6 +980,71 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
+  const directSubject = extractDirectLookupSubject(currentMessage);
+  const explicitlyTypedLookup =
+    /^(?:show me (?:the )?(?:customer story|case study)|(?:find|show|do you have) (?:me )?(?:a |an |the )?(?:white ?paper|e-?book|webinar|event|blog|article|thought leadership|case stud(?:y|ies)))\b/i.test(
+      currentMessage.trim(),
+    );
+  const directMatches = index
+    .map((document) => ({ document, strength: directIdentityStrength(document, directSubject) }))
+    .filter(({ document, strength }) =>
+      strength >= 0.9 &&
+      (strength >= 0.99 ||
+        !explicitlyTypedLookup ||
+        isRequestedContentTypeCompatible(document, understanding?.requestedContentType ?? null)) &&
+      !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)),
+    )
+    .sort((a, b) => b.strength - a.strength || b.document.contentQuality - a.document.contentQuality);
+  if (directMatches.length) {
+    const matches: SearchMatch[] = directMatches.slice(0, 3).map(({ document, strength }, position) => ({
+      document,
+      score: Math.round((500 + strength * 100 - position) * 100) / 100,
+      matchedFields: [strength >= 0.99 ? "normalized-exact-title" : "near-exact-title"],
+      selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
+      confidence: "high",
+      scoreBreakdown: { title: 500, headings: 0, metadata: 0, body: 0, contentType: 0, penalties: 0, authorityCoverage: strength },
+    }));
+    return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches, isProductList };
+  }
+  const broadServiceRequest = understanding?.requestedContentType === "service" &&
+    understanding.topics.length === 0 && !understanding.businessProblem &&
+    understanding.entities.length === 0;
+  if (broadServiceRequest) {
+    const portfolio = index
+      .filter((document) => isRequestedContentTypeCompatible(document, "service"))
+      .filter((document) => !isLegalDocument(document))
+      .filter((document) => !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)))
+      .sort((a, b) => {
+        const aType = normalizedServiceType(a.service_type) === "pillar" ? 1 : 0;
+        const bType = normalizedServiceType(b.service_type) === "pillar" ? 1 : 0;
+        return bType - aType || b.contentQuality - a.contentQuality;
+      });
+    const matches = portfolio.slice(0, 5).map((document, position) => ({
+      document,
+      score: 180 - position,
+      matchedFields: ["authoritative-service-portfolio"],
+      selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
+      confidence: "high" as const,
+      scoreBreakdown: {
+        title: 0,
+        headings: 0,
+        metadata: 180 - position,
+        body: 0,
+        contentType: 0,
+        penalties: 0,
+        authorityCoverage: 1,
+      },
+    }));
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0,
+      matches,
+      isProductList,
+      collectionTotal: portfolio.length,
+      collectionLabel: "services",
+    };
+  }
   if (isBroadAiServicesQuery(currentMessage)) {
     const aiPortfolio = index
       .filter(isAiPortfolioDocument)
@@ -772,29 +1149,27 @@ export async function retrieveFromIndex(
       .sort(
         (a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""),
       );
-    let eligibleWhitepapers = allWhitepapers.filter(
+    const topicalQuery = normalizeSearchText(query)
+      .replace(/\b(?:white ?papers?|ebooks?|resources?|do you have|show me|any|about)\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const eligibleWhitepapers = allWhitepapers.filter(
       (document) =>
         !contentIdentity(document.title, document.url).some((key) =>
           excludedContent.has(key),
         ),
     );
-    if (!requestedLatest)
-      eligibleWhitepapers = [...eligibleWhitepapers].sort(
-        () => Math.random() - 0.5,
-      );
+    const whitepaperIdf = buildInverseDocumentFrequency(eligibleWhitepapers);
     const whitepapers = eligibleWhitepapers
+      .map((document) => rankSearchDocument(document, topicalQuery || "whitepaper", whitepaperIdf, understanding))
+      .sort((a, b) => requestedLatest
+        ? Date.parse(b.document.modified ?? "") - Date.parse(a.document.modified ?? "")
+        : b.score - a.score)
       .slice(
         0,
         requestedLatest ? 1 : requestedFullCollection || requestedMore ? 15 : 3,
       )
-      .map((document, position) => ({
-        document,
-        score: 200 - position,
-        matchedFields: ["whitepaper-resource", "modified-date-order"],
-        selectedPassages: document.chunks[0]?.text
-          ? [document.chunks[0].text]
-          : [],
-      }))
+      .map((match) => ({ ...match, matchedFields: [...match.matchedFields, "whitepaper-resource"] }))
       .filter((match) => match.selectedPassages.length > 0);
     return {
       normalizedQuery,
@@ -867,6 +1242,11 @@ export async function retrieveFromIndex(
         selectedPassages: document.chunks[0]?.text
           ? [document.chunks[0].text]
           : [],
+        confidence: "high" as const,
+        scoreBreakdown: {
+          title: 0, headings: 0, metadata: 100, body: 0,
+          contentType: 0, penalties: 0, authorityCoverage: 1,
+        },
       }))
       .filter((match) => match.selectedPassages.length > 0)
       .sort((a, b) => b.document.contentQuality - a.document.contentQuality)
@@ -880,6 +1260,9 @@ export async function retrieveFromIndex(
     };
   }
   const categoryIndex = index.filter((document) => {
+    if (understanding?.requestedContentType &&
+        !isRequestedContentTypeCompatible(document, understanding.requestedContentType))
+      return false;
     if (!matchesRequestedServiceType(currentMessage, document.service_type))
       return false;
     if (isLegalDocument(document)) {
@@ -985,9 +1368,73 @@ export async function retrieveFromIndex(
       : requestedServiceTypes.length
         ? withoutServiceTypeTerms(query)
         : query;
-  const scoringQuery = intent === "about" ? "about us" : topicalQuery || query;
-  const rankedMatches = categoryIndex
-    .map((document) => rankSearchDocument(document, scoringQuery, idf))
+  const semanticQuery = understanding ? buildRetrievalQuery(understanding) : "";
+  const scoringQuery = intent === "about" ? "about us" : semanticQuery || topicalQuery || query;
+  const scoringPlans = understanding
+    ? [
+        topicalQuery || query,
+        ...understanding.topics,
+        ...understanding.retrievalConcepts,
+        ...(understanding.businessProblem ? [understanding.businessProblem] : []),
+      ]
+        .map((plan) => plan.trim())
+        .filter(Boolean)
+        .filter((plan, index, all) => all.indexOf(plan) === index)
+        .slice(0, 10)
+    : [];
+  if (!scoringPlans.length) scoringPlans.push(scoringQuery);
+  const evaluatedCandidates = categoryIndex
+    .map((document) => {
+      const alternatives = scoringPlans.map((plan, planIndex) => ({
+        ...rankSearchDocument(document, plan, idf, understanding),
+        planIndex,
+      })).map((match) => ({
+        ...match,
+        score: match.score - (match.planIndex === 0 ? 0 : 55),
+        matchedFields: match.planIndex === 0
+          ? match.matchedFields
+          : [...match.matchedFields, "expanded-query-plan"],
+      }));
+      const strongest = alternatives.sort((a, b) => b.score - a.score)[0]!;
+      const dimensions = businessDimensions(document, understanding);
+      const constraints = constraintAssessment(document, understanding, dimensions);
+      const bridge = bridgeBoosts.get(document.id) ?? 0;
+      const dimensionScore = isBusinessNeed
+        ? dimensions.topic * 55 + dimensions.problem * 100 + dimensions.outcome * 70 +
+          dimensions.industry * 80 + dimensions.entity * 90 + bridge - constraints.contradictions * 75
+        : dimensions.industry * 55 + dimensions.entity * 65;
+      const roleAdjustment = isBusinessNeed
+        ? document.role === "service"
+          ? 90
+          : ["case-study", "editorial", "resource"].includes(document.role)
+            ? -80
+            : -25
+        : 0;
+      return {
+        ...strongest,
+        score: strongest.score + dimensionScore + roleAdjustment,
+        matchedFields: [
+          ...strongest.matchedFields,
+          `query-plan:${strongest.planIndex + 1}`,
+          ...(bridge > 0 ? ["case-study-capability-bridge"] : []),
+          ...(isBusinessNeed && document.role === "service" ? ["capability-first"] : []),
+        ],
+        scoreBreakdown: strongest.scoreBreakdown
+          ? {
+              ...strongest.scoreBreakdown,
+              topic: dimensions.topic,
+              problem: dimensions.problem,
+              outcome: dimensions.outcome,
+              industry: dimensions.industry,
+              entity: dimensions.entity,
+              bridge: Math.round(bridge * 100) / 100,
+              constraintsSatisfied: constraints.satisfied,
+              constraintsTotal: constraints.total,
+              contradictions: constraints.contradictions,
+            }
+          : undefined,
+      };
+    })
     .map((match) =>
       intent === "events" && match.document.slug === "webinars"
         ? {
@@ -997,9 +1444,14 @@ export async function retrieveFromIndex(
           }
         : match,
     )
+  const rankedMatches = evaluatedCandidates
     .filter(
       (match) =>
         match.score >= 48 &&
+        (!understanding?.requestedContentType ||
+          (match.scoreBreakdown?.authorityCoverage ?? 0) >= 0.25 ||
+          match.matchedFields.includes("normalized-exact-title") ||
+          match.matchedFields.includes("exact-entity-authority")) &&
         match.selectedPassages.length > 0 &&
         !contentIdentity(match.document.title, match.document.url).some((key) =>
           excludedContent.has(key),
@@ -1020,5 +1472,25 @@ export async function retrieveFromIndex(
     reliableMatchFound: matches.length > 0,
     matches,
     isProductList,
+    candidates: evaluatedCandidates.map((match) => ({
+      ...match,
+      rejectionReason:
+        !match.selectedPassages.length
+          ? "no searchable passage"
+          : contentIdentity(match.document.title, match.document.url).some(
+                (key) => excludedContent.has(key),
+              )
+            ? "already shown in this conversation"
+            : match.score < 48
+              ? "below minimum evidence threshold"
+              : match.score < relativeCutoff
+                ? "below relative relevance threshold"
+                : undefined,
+    })),
+    timings: {
+      indexLoadMs: Math.round((indexLoadedAt - retrievalStartedAt) * 100) / 100,
+      relationshipScoringMs: Math.round((relationshipsScoredAt - indexLoadedAt) * 100) / 100,
+      rankingMs: Math.round((performance.now() - relationshipsScoredAt) * 100) / 100,
+    },
   };
 }

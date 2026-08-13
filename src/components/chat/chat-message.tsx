@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as Message } from "@/types/chat";
+import { ResultCard } from "./result-card";
 export function ChatMessage({
   message,
   onSuggestion,
@@ -82,6 +83,13 @@ export function ChatMessage({
             </button>
           )}
         </div>
+        {!animate && message.response?.cards.length ? (
+          <div className="card-grid">
+            {message.response.cards.map((card) => (
+              <ResultCard key={`${card.type}:${card.url}`} card={card} />
+            ))}
+          </div>
+        ) : null}
         {!animate && message.response?.sources.length ? (
           <details className="sources">
             <summary>Sources ({message.response.sources.length})</summary>
