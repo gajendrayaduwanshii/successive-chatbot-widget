@@ -237,12 +237,17 @@ function extractDirectLookupSubject(query: string): string {
   return normalizeSearchText(query)
     .replace(/^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)\s+/, "")
     .replace(/^(?:tell me (?:more )?about|do you have information about|show me (?:the )?(?:customer story|case study)|what business needs does)\s+/, "")
+    .replace(/^(?:what|who)\s+(?:is|are)\s+(?:the\s+)?/, "")
     .replace(/\s+(?:address|addresses)$/, "")
     .trim();
 }
 
 function directIdentityStrength(document: SuccessiveSearchDocument, subject: string): number {
-  if (!subject || subject.split(" ").length < 2) return 0;
+  if (!subject) return 0;
+  const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
+  if (document.normalizedTitle === subject) return 1;
+  if (slug === subject) return 0.99;
+  if (subject.split(" ").length < 2) return 0;
   const meaningfulSubject = subject
     .replace(/\b(?:successive|digital|company|about us)\b/g, " ")
     .replace(/\s+/g, " ")
@@ -250,9 +255,6 @@ function directIdentityStrength(document: SuccessiveSearchDocument, subject: str
   // Brand-only phrasing is company discovery, not an exact resource alias.
   // Many editorial titles contain the brand and must not hijack About.
   if (!meaningfulSubject) return 0;
-  const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
-  if (document.normalizedTitle === subject) return 1;
-  if (slug === subject) return 0.99;
   if (document.aliases.includes(subject)) return 0.98;
   const subjectTerms = new Set(subject.split(" "));
   const titleTerms = new Set(document.normalizedTitle.split(" "));
@@ -261,6 +263,35 @@ function directIdentityStrength(document: SuccessiveSearchDocument, subject: str
   if ((document.normalizedTitle.includes(subject) || subject.includes(document.normalizedTitle)) && coverage >= 0.72)
     return 0.9 + coverage * 0.08;
   return coverage >= 0.88 ? coverage : 0;
+}
+
+function canonicalPageMatch(
+  document: SuccessiveSearchDocument,
+  message: string,
+): boolean {
+  if (document.type !== "page") return false;
+  const query = normalizeSearchText(message)
+    .replace(/\b(?:what|which|who|where|when|why|how|is|are|was|were|do|does|did|have|has|tell|show|give|list|find|explain|define|me|us|our|your|the|a|an|any|some|available|current|about|successive|digital|please)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!query) return false;
+  const identities = [
+    document.normalizedTitle,
+    normalizeSearchText(document.slug.replace(/-/g, " ")),
+    ...document.headings.map(normalizeSearchText),
+  ].filter((identity) => identity.length >= 4);
+  const canonicalTerm = (term: string) => term
+    .replace(/ships?$/i, "")
+    .replace(/(?:ies|s)$/i, (suffix) => suffix === "ies" ? "y" : "")
+    .trim();
+  const queryTerms = [...new Set(query.split(" ").map(canonicalTerm).filter(Boolean))];
+  return identities.some((identity) => {
+    const identityTerms = new Set(identity.split(" ").map(canonicalTerm).filter(Boolean));
+    return identity === query ||
+      ` ${query} `.includes(` ${identity} `) ||
+      ` ${identity} `.includes(` ${query} `) ||
+      (queryTerms.length > 0 && queryTerms.every((term) => identityTerms.has(term)));
+  });
 }
 
 export function isRequestedContentTypeCompatible(
@@ -467,6 +498,36 @@ function stem(token: string): string {
     .replace(/(ization|ational|fulness|ousness|iveness)$/i, "")
     .replace(/(ments|ment|ingly|edly|ing|ers|ies|ied|ed|es|s)$/i, "")
     .slice(0, 20);
+}
+
+function tokenEditDistance(left: string, right: string): number {
+  const row = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i++) {
+    let diagonal = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= right.length; j++) {
+      const above = row[j]!;
+      row[j] = Math.min(
+        row[j]! + 1,
+        row[j - 1]! + 1,
+        diagonal + (left[i - 1] === right[j - 1] ? 0 : 1),
+      );
+      diagonal = above;
+    }
+  }
+  return row[right.length]!;
+}
+
+function fuzzyPersonEntityInText(entity: string, text: string): boolean {
+  const entityTokens = normalizeSearchText(entity).split(" ").filter(Boolean);
+  if (entityTokens.length < 2) return false;
+  const first = entityTokens[0]!;
+  const last = entityTokens[entityTokens.length - 1]!;
+  const textTokens = normalizeSearchText(text).split(" ").filter(Boolean);
+  return textTokens.includes(first) && textTokens.some((token) =>
+    token === last ||
+    (token.length >= 4 && last.length >= 4 && tokenEditDistance(token, last) <= 1),
+  );
 }
 
 function expandedTerms(normalizedQuery: string): Set<string> {
@@ -691,7 +752,7 @@ export function rankSearchDocument(
   understanding?: QueryUnderstanding,
 ): SearchMatch {
   const phraseQuery = normalizeSearchText(query).replace(
-    /^(?:tell me more about|tell me about|explain|show me)\s+/,
+    /^(?:tell me more about|tell me about|explain|show me|what is|what are|define)\s+(?:the\s+)?/,
     "",
   );
   const normalizedQuery = normalizeQuery(query);
@@ -725,6 +786,10 @@ export function rankSearchDocument(
     metadataScore += 100;
     matchedFields.push("alias");
   }
+  if (canonicalPageMatch(document, query)) {
+    metadataScore += 160;
+    matchedFields.push("canonical-page-identity");
+  }
   const titleTerms = new Set(document.normalizedTitle.split(" ").map(stem));
   const queryTerms = normalizedQuery.split(" ").map(stem).filter(Boolean);
   const titleOverlap = [...new Set(queryTerms)].filter((term) =>
@@ -747,6 +812,9 @@ export function rankSearchDocument(
     .sort((a, b) => b.score - a.score || a.chunk.position - b.chunk.position);
   const best = rankedChunks[0];
   const headingText = normalizeSearchText(document.headings.slice(0, 12).join(" "));
+  const ownedPhraseQuery = phraseQuery
+    .replace(/^(?:our|your|successive(?: digital)? s)\s+/, "")
+    .trim();
   const metadataText = normalizeSearchText(
     `${document.slug.replace(/-/g, " ")} ${document.aliases.join(" ")} ${document.service_type ?? ""}`,
   );
@@ -760,6 +828,15 @@ export function rankSearchDocument(
   headingScore += Math.min(72, headingMatches * 18);
   metadataScore += Math.min(48, metadataMatches * 12);
   if (phraseQuery.length >= 3 && headingText.includes(phraseQuery)) headingScore += 70;
+  if (
+    ownedPhraseQuery.length >= 4 &&
+    document.headings.some((heading) =>
+      normalizeSearchText(heading) === ownedPhraseQuery,
+    )
+  ) {
+    headingScore += 140;
+    matchedFields.push("exact-section-heading");
+  }
   if (phraseQuery.length >= 3 && metadataText.includes(phraseQuery)) metadataScore += 55;
 
   const identityTerms = new Set([
@@ -772,10 +849,23 @@ export function rankSearchDocument(
   for (const entity of understanding?.entities ?? []) {
     const normalizedEntity = normalizeSearchText(entity);
     if (!normalizedEntity) continue;
+    const entityTokens = normalizedEntity.split(" ").filter(Boolean);
+    const entityVariants = [...new Set([
+      normalizedEntity,
+      entityTokens.join(" "),
+      entityTokens.length > 2
+        ? `${entityTokens[0]} ${entityTokens[entityTokens.length - 1]}`
+        : "",
+    ].filter(Boolean))];
     const identityText = ` ${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.aliases.join(" ")} `;
-    if (identityText.includes(` ${normalizedEntity} `)) {
+    if (entityVariants.some((variant) => identityText.includes(` ${variant} `))) {
       metadataScore += 150;
       matchedFields.push("exact-entity-authority");
+    } else if (entityVariants.some((variant) =>
+      ` ${document.combinedText} `.includes(` ${variant} `),
+    ) || fuzzyPersonEntityInText(normalizedEntity, document.combinedText)) {
+      metadataScore += 150;
+      matchedFields.push("exact-entity-content");
     } else {
       penalties -= 90;
       matchedFields.push("entity-mismatch");
@@ -794,7 +884,7 @@ export function rankSearchDocument(
     const profileMatches = distinctQueryTerms.filter((term) => profileTerms.has(term)).length;
     const profileCoverage = profileMatches / Math.max(1, distinctQueryTerms.length);
     if (document.role === "service") contentTypeScore += 45;
-    else if (["editorial", "case-study"].includes(document.role)) penalties -= 35;
+    else if (["editorial", "blog", "press_release", "case_study"].includes(document.role)) penalties -= 35;
     if (profileCoverage >= 0.34) {
       metadataScore += Math.round(profileCoverage * 90);
       matchedFields.push("capability-profile");
@@ -817,10 +907,18 @@ export function rankSearchDocument(
   let score = titleScore + headingScore + metadataScore + contentTypeScore + (best?.score ?? 0);
   // Generic short topics demand evidence that the document identifies itself
   // with the topic. A lone body sentence is supporting evidence, not authority.
-  if (distinctQueryTerms.length <= 2 && authorityCoverage === 0) {
+  if (
+    distinctQueryTerms.length <= 2 &&
+    authorityCoverage === 0 &&
+    !matchedFields.includes("canonical-page-identity")
+  ) {
     penalties -= 75;
     matchedFields.push("incidental-body-only");
-  } else if (distinctQueryTerms.length <= 3 && authorityCoverage < 0.34) {
+  } else if (
+    distinctQueryTerms.length <= 3 &&
+    authorityCoverage < 0.34 &&
+    !matchedFields.includes("canonical-page-identity")
+  ) {
     penalties -= 35;
     matchedFields.push("weak-topic-authority");
   }
@@ -847,7 +945,7 @@ export function rankSearchDocument(
   score += penalties;
   if (best) matchedFields.push(...best.fields);
   const confidence: SearchMatch["confidence"] =
-    matchedFields.some((field) => ["exact-title", "alias", "exact-entity-authority", "canonical-company-authority"].includes(field))
+    matchedFields.some((field) => ["exact-title", "alias", "exact-entity-authority", "exact-entity-content", "canonical-company-authority", "canonical-page-identity"].includes(field))
       ? "high"
       : authorityCoverage >= 0.5 && score >= 90
         ? "medium"
@@ -925,7 +1023,7 @@ export async function retrieveFromIndex(
     ].filter(Boolean).join(" ");
     const bridgeIdf = buildInverseDocumentFrequency(index);
     index
-      .filter((document) => ["case-study", "editorial", "resource"].includes(document.role))
+      .filter((document) => ["case_study", "editorial", "blog", "press_release", "resource"].includes(document.role))
       .map((document) => rankSearchDocument(document, bridgeQuery || query, bridgeIdf, understanding))
       .filter((match) => match.score >= 90)
       .sort((a, b) => b.score - a.score)
@@ -1283,6 +1381,7 @@ export async function retrieveFromIndex(
   }
   const categoryIndex = index.filter((document) => {
     if (understanding?.requestedContentType &&
+        !canonicalPageMatch(document, currentMessage) &&
         !isRequestedContentTypeCompatible(document, understanding.requestedContentType))
       return false;
     if (!matchesRequestedServiceType(currentMessage, document.service_type))
@@ -1410,7 +1509,7 @@ export async function retrieveFromIndex(
       const roleAdjustment = isBusinessNeed
         ? document.role === "service"
           ? 90
-          : ["case-study", "editorial", "resource"].includes(document.role)
+          : ["case_study", "editorial", "blog", "press_release", "resource"].includes(document.role)
             ? -80
             : -25
         : 0;
@@ -1475,8 +1574,19 @@ export async function retrieveFromIndex(
         b.document.contentQuality - a.document.contentQuality,
     );
   const relativeCutoff = Math.max(48, (rankedMatches[0]?.score ?? 0) * 0.65);
-  const matches = rankedMatches
-    .filter((match) => match.score >= relativeCutoff)
+  const authoritativePage = rankedMatches.find((match) =>
+    match.document.type === "page" &&
+    canonicalPageMatch(match.document, currentMessage) &&
+    match.matchedFields.some((field) =>
+      ["exact-title", "title-phrase", "normalized-exact-title", "near-exact-title", "exact-section-heading", "canonical-page-identity"].includes(field),
+    ),
+  );
+  const resultPool = authoritativePage
+    ? rankedMatches.filter((match) => match.document.id === authoritativePage.document.id)
+    : rankedMatches;
+  const resultCutoff = Math.max(48, (resultPool[0]?.score ?? 0) * 0.65);
+  const matches = resultPool
+    .filter((match) => match.score >= resultCutoff)
     .slice(0, 5);
   return {
     normalizedQuery,

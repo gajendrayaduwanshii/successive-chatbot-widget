@@ -25,6 +25,7 @@ export interface SuccessiveSearchDocument {
   headings: string[];
   descriptions: string[];
   faqItems: Array<{ question: string; answer: string }>;
+  structuredFields: import("./acf-extractor").StructuredAcfField[];
   textSegments: string[];
   chunks: SuccessiveSearchChunk[];
   combinedText: string;
@@ -37,13 +38,24 @@ export interface SuccessiveSearchDocument {
   service_type?: string;
   role:
     | "company"
+    | "global_capabilities"
+    | "culture"
+    | "careers"
+    | "awards"
+    | "partners"
     | "service"
+    | "technology"
     | "industry"
     | "partner"
-    | "case-study"
+    | "case_study"
+    | "blog"
+    | "press_release"
     | "resource"
     | "editorial"
     | "career"
+    | "job_listing"
+    | "product"
+    | "contact"
     | "page";
   capabilityProfile: {
     identityTerms: string[];
@@ -139,7 +151,21 @@ export function normalizeSearchText(value: string): string {
 function documentRole(item: WordPressItem, slug: string, serviceType?: string): SuccessiveSearchDocument["role"] {
   const type = item.type ?? "page";
   const normalizedService = normalizeSearchText(serviceType ?? "");
-  if (type.includes("case")) return "case-study";
+  const acf = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
+    ? item.acf as Record<string, unknown>
+    : {};
+  if (Array.isArray(acf.core_values) || Array.isArray(acf.executive_management)) return "company";
+  if (Array.isArray(acf.capabilities_categories)) return "global_capabilities";
+  if (Array.isArray(acf.partnerships_repeater)) return "partners";
+  if (Array.isArray(acf.advantage_slider)) return "careers";
+  if (slug === "our-culture") return "culture";
+  if (slug === "awards") return "awards";
+  if (slug === "contact") return "contact";
+  if (type.includes("case")) return "case_study";
+  if (type === "post") return "blog";
+  if (type === "press-release") return "press_release";
+  if (type === "product") return "product";
+  if (type === "award") return "awards";
   if (type === "industries") return "industry";
   if (type === "partners") return "partner";
   if (type === "careers" || slug === "careers") return "career";
@@ -316,12 +342,24 @@ export function buildSearchDocument(
   deepAnalysis = true,
 ): SuccessiveSearchDocument {
   const extracted = extractAcfContent(item.acf);
+  const acfSectionLabels = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
+    ? Object.entries(item.acf).flatMap(([key, value]) => {
+        if (!Array.isArray(value) || value.length === 0) return [];
+        if (/^(?:image|logo|icon|video|gallery|slider|banner|cta|button)/i.test(key))
+          return [];
+        const label = key.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+        return label.length >= 3 ? [label] : [];
+      })
+    : [];
   const title = htmlToText(rendered(item.title)) || "Untitled";
   const editor = deduplicateSegments([
     ...htmlToParagraphs(rendered(item.excerpt)),
     ...htmlToParagraphs(rendered(item.content)),
   ]);
-  const headings = deduplicateSegments(extracted.headings);
+  const headings = deduplicateSegments([
+    ...acfSectionLabels,
+    ...extracted.headings,
+  ]);
   const descriptions = deduplicateSegments([
     ...editor,
     ...extracted.descriptions,
@@ -394,7 +432,11 @@ export function buildSearchDocument(
   // text segment remains searchable in the subsequent overlapping chunks.
   const chunks = buildSearchChunks(item.id, [
     title,
-    ...headings,
+    ...headings.map((heading) =>
+      heading.length < 20 && !/^[A-Z0-9]{2,6}$/.test(heading)
+        ? `Content section: ${heading}`
+        : heading,
+    ),
     ...textSegments,
   ]);
   const productLike =
@@ -433,6 +475,7 @@ export function buildSearchDocument(
     headings,
     descriptions,
     faqItems: extracted.faqItems,
+    structuredFields: extracted.structuredFields,
     textSegments,
     chunks,
     combinedText,

@@ -33,6 +33,14 @@ import type { NormalizedContent } from "@/types/wordpress";
 import { sanitizeGroundedAnswerOpening } from "@/lib/response-format";
 import { extractPublishedContactDetails } from "@/lib/contact-details";
 import {
+  careerJobSummary,
+  careerJobUrl,
+  careersPageUrl,
+  fetchActiveCareerJobs,
+  filterCareerJobs,
+  isCareerOpeningQuery,
+} from "@/lib/careers-api";
+import {
   asksForAnotherResult,
   buildConversationRetrievalQuery,
   buildRelatedServiceRetrievalQuery,
@@ -49,6 +57,11 @@ import {
   shouldUseSemanticUnderstanding,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
+import {
+  answerStructuredRequest,
+  understandStructuredRequest,
+  type StructuredRequest,
+} from "@/lib/structured-knowledge";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -91,6 +104,24 @@ const error = (
     { status, headers },
   );
 
+async function fetchStructuredItems(request: StructuredRequest) {
+  const pageSlug = request.attribute === "capabilities" || request.attribute === "technologies"
+    ? "global-capabilities"
+    : request.attribute === "partners"
+      ? "partners"
+      : request.attribute === "culture"
+        ? "our-culture"
+        : request.attribute === "career_benefits"
+          ? "careers"
+          : request.attribute === "awards"
+            ? "awards"
+            : "about-us";
+  const pageItems = await fetchSuccessive(`/pages/${pageSlug}`);
+  if (request.attribute !== "awards" || request.mode !== "latest") return pageItems;
+  const awards = await fetchSuccessive("/content?type=award&per_page=100");
+  return [...pageItems, ...awards];
+}
+
 export async function OPTIONS(request: NextRequest) {
   const origin = request.headers.get("origin");
   const cors = corsHeaders(origin);
@@ -124,14 +155,6 @@ export async function POST(request: NextRequest) {
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
     request.headers.get("x-real-ip") ??
     "unknown";
-  const limit = rateLimit(ip);
-  if (!limit.allowed)
-    return error(
-      429,
-      "RATE_LIMITED",
-      "Too many messages. Please wait a moment and try again.",
-      { ...cors.headers, "Retry-After": String(limit.retryAfter) },
-    );
   let body: unknown;
   try {
     body = await request.json();
@@ -150,6 +173,14 @@ export async function POST(request: NextRequest) {
       "INVALID_REQUEST",
       parsed.error.issues[0]?.message ?? "Invalid request.",
       cors.headers,
+    );
+  const limit = rateLimit(`${ip}:${parsed.data.sessionId ?? "anonymous"}`);
+  if (!limit.allowed)
+    return error(
+      429,
+      "RATE_LIMITED",
+      "Too many messages. Please wait a moment and try again.",
+      { ...cors.headers, "Retry-After": String(limit.retryAfter) },
     );
   if (isGreeting(parsed.data.message)) {
     return NextResponse.json(
@@ -206,6 +237,51 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
+  const structuredRequest = understandStructuredRequest(effectiveMessage);
+  if (structuredRequest) {
+    try {
+      const structuredAnswer = answerStructuredRequest(
+        await fetchStructuredItems(structuredRequest),
+        structuredRequest,
+      );
+      if (structuredAnswer) {
+        const { document } = structuredAnswer;
+        return NextResponse.json(
+          {
+            success: true,
+            data: {
+              answer: structuredAnswer.answer,
+              cards: [{
+                type: "page" as const,
+                title: document.title,
+                description: (
+                  document.descriptions[0] ??
+                  document.textSegments[0] ??
+                  document.title
+                ).slice(0, 500),
+                url: document.url,
+                image: document.image,
+                badge: document.role.replace(/_/g, " "),
+              }],
+              sources: [{ title: document.title, url: document.url }],
+              suggestions: structuredAnswer.suggestions,
+              confidence: "high",
+              insufficientContext: false,
+              diagnostics: {
+                route: "structured_api",
+                companyAttribute: structuredRequest.attribute,
+                evidencePaths: structuredAnswer.evidencePaths,
+              },
+            },
+          },
+          { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+        );
+      }
+    } catch {
+      // Continue through shared retrieval when the published corpus is
+      // temporarily incomplete; no static company fact is used as fallback.
+    }
+  }
   const deterministicUnderstanding =
     buildDeterministicUnderstanding(effectiveMessage);
   let understanding: QueryUnderstanding = deterministicUnderstanding;
@@ -239,12 +315,20 @@ export async function POST(request: NextRequest) {
       : understanding.intent,
     businessProblem: deterministicUnderstanding.businessProblem ?? understanding.businessProblem,
     requestedContentType: deterministicUnderstanding.requestedContentType,
+    targetScope: deterministicUnderstanding.targetScope !== "topic"
+      ? deterministicUnderstanding.targetScope
+      : understanding.targetScope,
+    entities: deterministicUnderstanding.entities.length
+      ? deterministicUnderstanding.entities
+      : understanding.entities,
   };
   understanding = applyStructuralBroadQueryRules(resolveConversationUnderstanding(
     understanding,
     parsed.data.history.slice(-8),
   ).understanding, effectiveMessage);
   const intent = detectIntent(effectiveMessage);
+  const isNamedSuccessivePersonQuery =
+    understanding.targetScope === "company" && understanding.entities.length > 0;
   const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
     effectiveMessage,
     intent,
@@ -285,6 +369,59 @@ export async function POST(request: NextRequest) {
       },
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
+  }
+  if (isCareerOpeningQuery(effectiveMessage)) {
+    try {
+      const jobs = await fetchActiveCareerJobs();
+      const matches = filterCareerJobs(jobs, effectiveMessage);
+      const asksForCount = /\b(?:how many|count|total|number of)\b/i.test(
+        effectiveMessage,
+      );
+      const openingLabel = matches.length === 1 ? "opening" : "openings";
+      const answer = matches.length
+        ? [
+            `${asksForCount ? `There ${matches.length === 1 ? "is" : "are"}` : "I found"} **${matches.length} active ${openingLabel}** matching your request.`,
+            ...matches.slice(0, 6).map(
+              (job) => `- [${job.title}](${careerJobUrl(job)}) — ${careerJobSummary(job)}`,
+            ),
+            `[View all current openings](${careersPageUrl()})`,
+          ].join("\n\n")
+        : `I couldn't find an active opening matching those criteria in Successive's current jobs feed. You can [view all current openings](${careersPageUrl()}) or try a different technology, location, or experience level.`;
+      const presented = matches.slice(0, 6);
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer,
+            cards: presented.map((job) => ({
+              type: "page" as const,
+              title: job.title,
+              description: careerJobSummary(job),
+              url: careerJobUrl(job),
+              badge: "job opening",
+            })),
+            sources: presented.length
+              ? presented.map((job) => ({ title: job.title, url: careerJobUrl(job) }))
+              : [{ title: "Successive Career Opportunities", url: careersPageUrl() }],
+            suggestions: [
+              "Show me jobs in Noida",
+              "Show me technology openings",
+              "How many openings are available?",
+            ],
+            confidence: "high",
+            insufficientContext: matches.length === 0,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    } catch {
+      return error(
+        503,
+        "CAREERS_UNAVAILABLE",
+        "Successive’s live openings are temporarily unavailable. Please try again shortly.",
+        cors.headers,
+      );
+    }
   }
   if (
     understanding.needsClarification &&
@@ -383,7 +520,7 @@ export async function POST(request: NextRequest) {
   // Subject-bearing phrasing (for example, "what does Successive do with
   // geospatial data?") is not classified as About and continues to normal
   // topic retrieval.
-  if (intent === "about") {
+  if (intent === "about" && !isNamedSuccessivePersonQuery) {
     try {
       const item = (await fetchSuccessive("/pages/about-us"))[0];
       if (!item) throw new Error("About page is unavailable");
@@ -643,7 +780,7 @@ export async function POST(request: NextRequest) {
     const retrievalStartedAt = performance.now();
     const retrieval = await retrieveFromIndex(
       retrievalMessage,
-      intent,
+      isNamedSuccessivePersonQuery ? "general" : intent,
       effectiveMessage,
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       understanding,

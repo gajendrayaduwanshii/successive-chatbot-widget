@@ -7,6 +7,14 @@ export interface ExtractedAcfContent {
   faqItems: Array<{ question: string; answer: string }>;
   links: Array<{ title?: string; url: string }>;
   images: Array<{ url: string; alt?: string; title?: string }>;
+  structuredFields: StructuredAcfField[];
+}
+
+export interface StructuredAcfField {
+  path: string;
+  label: string;
+  value: string;
+  kind: "text" | "media" | "record";
 }
 
 const MEDIA_METADATA = new Set([
@@ -103,8 +111,16 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
   const links: ExtractedAcfContent["links"] = [],
     images: ExtractedAcfContent["images"] = [];
   const faqItems: ExtractedAcfContent["faqItems"] = [];
+  const structuredFields: StructuredAcfField[] = [];
 
-  const visit = (node: unknown, key = "") => {
+  const fieldLabel = (key: string) => key
+    .replace(/\[\d+\]/g, "")
+    .split(".").pop()!
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const visit = (node: unknown, key = "", path = key) => {
     if (node == null || node === false || node === "") return;
     const lowerKey = key.toLowerCase();
     if (MEDIA_METADATA.has(lowerKey)) return;
@@ -120,15 +136,17 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
         return;
       }
       const text = cleanText(node);
-      if (!text || segmentQuality(text) < 20) return;
-      textSegments.push(text);
+      if (!text) return;
+      structuredFields.push({ path, label: fieldLabel(key), value: text, kind: "text" });
       if (headingKey.test(key)) headings.push(text);
+      if (segmentQuality(text) < 20) return;
+      textSegments.push(text);
       if (descriptionKey.test(key)) descriptions.push(text);
       return;
     }
     if (typeof node === "number" || typeof node === "boolean") return;
     if (Array.isArray(node)) {
-      node.forEach((item) => visit(item, key));
+      node.forEach((item, index) => visit(item, key, `${path}[${index}]`));
       return;
     }
     const record = node as Record<string, unknown>;
@@ -145,8 +163,16 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
             ? cleanText(record.title)
             : undefined,
       });
+      const mediaLabel = [record.alt, record.title, record.caption, record.name]
+        .find((candidate) => typeof candidate === "string" && cleanText(candidate));
+      if (typeof mediaLabel === "string") structuredFields.push({
+        path,
+        label: fieldLabel(key),
+        value: cleanText(mediaLabel),
+        kind: "media",
+      });
       for (const field of ["alt", "title", "caption", "description"])
-        visit(record[field], field);
+        visit(record[field], field, `${path}.${field}`);
       return;
     }
     const linkUrl = safeHttpUrl(record.url);
@@ -158,6 +184,30 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
             ? cleanText(record.title)
             : undefined,
       });
+    }
+    const recordName = typeof record.name === "string"
+      ? cleanText(record.name)
+      : "";
+    const recordRole = [
+      record.designation,
+      record.desgnation,
+      record.role,
+      record.position,
+      record.job_title,
+    ].find((candidate) => typeof candidate === "string" && candidate.trim());
+    if (recordName && typeof recordRole === "string") {
+      const role = cleanText(recordRole);
+      if (role) {
+        const personRecord = `${recordName} — ${role}`;
+        textSegments.push(personRecord);
+        descriptions.push(personRecord);
+        structuredFields.push({
+          path,
+          label: fieldLabel(key),
+          value: personRecord,
+          kind: "record",
+        });
+      }
     }
     const question =
       typeof record.question === "string" ? cleanText(record.question) : "";
@@ -172,7 +222,7 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
       faqItems.push({ question, answer });
     }
     Object.entries(record).forEach(([childKey, child]) =>
-      visit(child, childKey),
+      visit(child, childKey, path ? `${path}.${childKey}` : childKey),
     );
   };
   visit(value);
@@ -192,6 +242,11 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
     images: images.filter(
       (image, index, all) =>
         all.findIndex((x) => x.url === image.url) === index,
+    ),
+    structuredFields: structuredFields.filter((field, index, all) =>
+      all.findIndex((candidate) =>
+        candidate.path === field.path && candidate.value === field.value,
+      ) === index,
     ),
   };
 }

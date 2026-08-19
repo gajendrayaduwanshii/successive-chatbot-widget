@@ -154,8 +154,11 @@ export function buildDeterministicUnderstanding(
         : /\b(?:all|list|which|what)\b.*\b(?:services?|capabilities|industries|offerings)\b/i.test(message)
           ? "list" as const
           : "explain" as const;
+  const namedSuccessivePerson = normalizedQuery.match(
+    /^who is ([a-z][a-z.' -]{2,80}?) (?:at|in|from|of) successive(?: digital)?[?.!]*$/,
+  )?.[1]?.trim();
   const companyPossessive = /\b(?:successive(?: digital)?(?:'s|s')|your)\s+[a-z]/i.test(message);
-  const companyFact = /\b(?:ceo|founder|leadership|award|recognition|value|culture|office|headquarters|employee)\b/i.test(message);
+  const companyFact = /\b(?:ceo|founders?|leadership|awards?|recognitions?|values?|culture|offices?|headquarters|employees?)\b/i.test(message);
   const portfolioRequest = requestedContentType === "service" || requestedContentType === "industry";
   const containsPremise = /^(?:since|because|given that|assuming|as)\b/i.test(message.trim());
   const temporalIntent = /\blatest\b/i.test(message)
@@ -209,10 +212,10 @@ export function buildDeterministicUnderstanding(
     requestedContentType,
     requestedAction: null,
     answerMode,
-    targetScope: companyPossessive || companyFact ? "company" : portfolioRequest ? "portfolio" : "topic",
+    targetScope: namedSuccessivePerson || companyPossessive || companyFact ? "company" : portfolioRequest ? "portfolio" : "topic",
     temporalIntent,
     containsPremise,
-    entities: [],
+    entities: namedSuccessivePerson ? [namedSuccessivePerson] : [],
     constraints: [],
     retrievalConcepts: topics,
     isBroadQuery: topics.length <= 2,

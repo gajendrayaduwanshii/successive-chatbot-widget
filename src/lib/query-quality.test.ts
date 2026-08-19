@@ -86,6 +86,73 @@ describe("generic query understanding", () => {
     expect(detectIntent("What does Successive do with geospatial data?")).not.toBe("about");
   });
 
+  it("extracts a named Successive team member as a company entity", () => {
+    const understanding = buildDeterministicUnderstanding(
+      "Who is Priya Mehta in Successive?",
+    );
+
+    expect(understanding.targetScope).toBe("company");
+    expect(understanding.entities).toEqual(["priya mehta"]);
+    expect(understanding.answerMode).toBe("define");
+  });
+
+  it("treats a team member listed in About content as authoritative", () => {
+    const about = document(
+      "About Us",
+      "about-us",
+      "Priya Mehta is Director of Engineering at Successive Digital.",
+      ["Our Team"],
+    );
+    const understanding = buildDeterministicUnderstanding(
+      "Who is Priya Mehta in Successive?",
+    );
+    const match = rankSearchDocument(
+      about,
+      "Who is Priya Mehta in Successive?",
+      new Map(),
+      understanding,
+    );
+
+    expect(match.matchedFields).toContain("exact-entity-content");
+    expect(match.confidence).toBe("high");
+    expect(match.selectedPassages[0]).toContain("Priya Mehta");
+  });
+
+  it("keeps every API-provided person name and designation in one passage", () => {
+    const about = buildSearchDocument({
+      id: 43,
+      type: "page",
+      slug: "about-us",
+      link: "https://successive.tech/about-us/",
+      title: { rendered: "About Us" },
+      acf: {
+        leadership_team: [{
+          name: "Example Team Member",
+          desgnation: "Engineering Practice Head",
+        }],
+      },
+    });
+
+    expect(about.textSegments).toContain(
+      "Example Team Member — Engineering Practice Head",
+    );
+    expect(about.chunks.some((chunk) =>
+      chunk.text.includes("Example Team Member — Engineering Practice Head"),
+    )).toBe(true);
+
+    const understanding = buildDeterministicUnderstanding(
+      "Who is Example Team Membur in Successive?",
+    );
+    const match = rankSearchDocument(
+      about,
+      "Who is Example Team Membur in Successive?",
+      new Map(),
+      understanding,
+    );
+    expect(match.matchedFields).toContain("exact-entity-content");
+    expect(match.selectedPassages[0]).toContain("Engineering Practice Head");
+  });
+
   it("deterministically rejects live sports-result questions but not sports software", () => {
     expect(isDeterministicallyOffTopic("Who won the football match?")).toBe(true);
     expect(isDeterministicallyOffTopic("Can you build software for a football academy?")).toBe(false);
@@ -128,6 +195,67 @@ describe("canonical website normalization", () => {
     expect(encoded.normalizedTitle).toBe("gis and geoai consulting services");
     expect(match.matchedFields).toContain("exact-title");
     expect(match.confidence).toBe("high");
+  });
+
+  it("prioritizes an exact API page title in a definition question", () => {
+    const page = document(
+      "Global Capabilities",
+      "global-capabilities",
+      "Published capability categories and technology details from this page.",
+    );
+    const match = rankSearchDocument(page, "What is Global Capabilities?");
+
+    expect(match.matchedFields).toContain("exact-title");
+    expect(match.confidence).toBe("high");
+  });
+
+  it("maps a company word-family query to its canonical API page", () => {
+    const partners = document(
+      "Partners & Alliances",
+      "partners",
+      "Published partner ecosystem information.",
+    );
+    const match = rankSearchDocument(partners, "Successive Partnerships");
+
+    expect(match.matchedFields).toContain("canonical-page-identity");
+    expect(match.score).toBeGreaterThan(150);
+
+    for (const query of [
+      "any partnership",
+      "show partnerships",
+      "do you have partners",
+      "which alliances are available",
+    ]) {
+      expect(rankSearchDocument(partners, query).matchedFields)
+        .toContain("canonical-page-identity");
+    }
+  });
+
+  it("makes dynamic ACF section names searchable without page-specific logic", () => {
+    const about = buildSearchDocument({
+      id: 42,
+      type: "page",
+      slug: "about-us",
+      link: "https://successive.tech/about-us/",
+      title: { rendered: "About Us" },
+      acf: {
+        core_values: [
+          { heading: "Integrity", "sub-heading": "We act with accountability." },
+          { heading: "Agility", "sub-heading": "We adapt continuously." },
+        ],
+      },
+    });
+    const understanding = buildDeterministicUnderstanding("What are our core values?");
+    const match = rankSearchDocument(
+      about,
+      "What are our core values?",
+      new Map(),
+      understanding,
+    );
+
+    expect(about.headings).toContain("core values");
+    expect(understanding.targetScope).toBe("company");
+    expect(match.selectedPassages[0]).toContain("Integrity");
   });
 
   it("normalizes smart quotes and dash variants consistently", () => {
