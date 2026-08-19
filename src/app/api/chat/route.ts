@@ -19,6 +19,7 @@ import {
 } from "@/lib/query-language";
 import {
   buildSearchDocument,
+  normalizeSearchText,
   type SuccessiveSearchDocument,
 } from "@/lib/search-index";
 import {
@@ -30,6 +31,7 @@ import {
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
 import { sanitizeGroundedAnswerOpening } from "@/lib/response-format";
+import { extractPublishedContactDetails } from "@/lib/contact-details";
 import {
   asksForAnotherResult,
   buildConversationRetrievalQuery,
@@ -313,6 +315,10 @@ export async function POST(request: NextRequest) {
       const item = (await fetchSuccessive("/pages/contact"))[0];
       if (!item) throw new Error("Contact page is unavailable");
       const document = buildSearchDocument(item);
+      const requestedPublishedDetails = /\b(?:phone|telephone|email|e-mail|number)\b/i.test(
+        effectiveMessage,
+      );
+      const details = extractPublishedContactDetails(item.acf);
       const description =
         document.textSegments.find(
           (segment) => segment.toLowerCase() !== document.title.toLowerCase(),
@@ -321,11 +327,13 @@ export async function POST(request: NextRequest) {
         {
           success: true,
           data: {
-            answer: buildContactAnswer(
-              preparedQuery.contactAnswer,
-              document.url,
-              description,
-            ),
+            answer: requestedPublishedDetails
+              ? buildPublishedContactAnswer(document.url, details)
+              : buildContactAnswer(
+                  preparedQuery.contactAnswer,
+                  document.url,
+                  description,
+                ),
             cards: [
               {
                 type: "page",
@@ -677,13 +685,27 @@ export async function POST(request: NextRequest) {
       .filter((item) => item.role === "assistant")
       .map((item) => item.content.toLowerCase())
       .join("\n");
-    const selectedMatches = asksForUnseenResults
+    const initiallySelectedMatches = asksForUnseenResults
       ? retrieval.matches.filter(
           ({ document }) =>
             !previouslyPresented.includes(document.url.toLowerCase()) &&
             !previouslyPresented.includes(document.title.toLowerCase()),
         )
       : retrieval.matches;
+    const namedResourceSubject = extractNamedResourceSummarySubject(
+      effectiveMessage,
+    );
+    const exactNamedResource = namedResourceSubject
+      ? initiallySelectedMatches.find(
+          ({ document }) =>
+            document.normalizedTitle === namedResourceSubject ||
+            document.normalizedTitle.includes(namedResourceSubject) ||
+            namedResourceSubject.includes(document.normalizedTitle),
+        )
+      : undefined;
+    const selectedMatches = exactNamedResource
+      ? [exactNamedResource]
+      : initiallySelectedMatches;
     // Preserve relevance order for semantic/problem discovery. Collection
     // branches above may still intentionally vary already-qualified items.
     if (asksForUnseenResults && !selectedMatches.length) {
@@ -756,7 +778,9 @@ export async function POST(request: NextRequest) {
         slug: document.slug,
         title: document.title,
         excerpt: document.descriptions[0] ?? selectedPassages[0] ?? "",
-        plainText: selectedPassages.join("\n\n"),
+        plainText: namedResourceSubject
+          ? document.textSegments.slice(0, 10).join("\n\n")
+          : selectedPassages.join("\n\n"),
         url: document.url,
         image: document.image,
         modified: document.modified,
@@ -830,17 +854,22 @@ export async function POST(request: NextRequest) {
       generatedAnswer,
       selectedMatches,
     );
+    const directlyAnswered = ensureDirectDefinition(
+      groundedAnswer,
+      selectedMatches,
+      effectiveMessage,
+    );
     const categoryAnswer = isUseCaseQuery(effectiveMessage)
       ? ensureCategoryHeading(
-          groundedAnswer,
+          directlyAnswered,
           buildUseCaseHeading(effectiveMessage),
         )
       : isBroadAiServicesQuery(effectiveMessage)
-        ? ensureCategoryHeading(groundedAnswer, "Successive AI Services")
-        : groundedAnswer;
+        ? ensureCategoryHeading(directlyAnswered, "Successive AI Services")
+        : directlyAnswered;
     const finalAnswer = categoryAnswer;
-    const cardMatches = selectedMatches.filter(
-      (match) => cardEligibility(match, understanding, topScore).accepted,
+    const cardMatches = selectedMatches.filter((match) =>
+      cardEligibility(match, understanding, topScore).accepted,
     );
     const presentedMatches =
       isWhitepaperCollectionQuery && selectedMatches.length <= 15
@@ -974,6 +1003,13 @@ function buildUseCaseHeading(message: string): string {
     )
     .join(" ");
   return `${label} Use Cases`;
+}
+
+function extractNamedResourceSummarySubject(message: string): string | null {
+  const match = message.match(
+    /^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)\s+['“\"]?(.+?)['”\"]?[?.!]*$/i,
+  );
+  return match?.[1] ? normalizeSearchText(match[1]) : null;
 }
 
 function exhaustedResultsData() {
@@ -1148,6 +1184,19 @@ function buildContactAnswer(
   return `${linkedAnswer}\n\n${supportingDetail}`;
 }
 
+function buildPublishedContactAnswer(
+  url: string,
+  details: { phones: string[]; emails: string[] },
+): string {
+  const phoneText = details.phones.length
+    ? `Published phone numbers: ${details.phones.map((phone) => `**${phone}**`).join(" and ")}.`
+    : "The current Contact page does not publish a phone number.";
+  const emailText = details.emails.length
+    ? `Published email addresses: ${details.emails.map((email) => `**${email}**`).join(" and ")}.`
+    : `The current page does not publish a direct email address; use the official [Contact Us](${url}) form to send a message.`;
+  return `${phoneText} ${emailText}`;
+}
+
 async function buildCollectionStory(
   label: string,
   listing: { title: string; url: string },
@@ -1254,7 +1303,6 @@ function ensureDescriptiveGroundedAnswer(
     selectedPassages: string[];
   }>,
 ): string {
-  const primary = matches[0]?.document;
   answer = sanitizeGroundedAnswerOpening(
     answer,
     matches.map(({ document }) => document.title),
@@ -1283,6 +1331,36 @@ function ensureDescriptiveGroundedAnswer(
   return details.length
     ? `${withHeading}\n\n${details.join("\n\n")}`
     : withHeading;
+}
+
+function ensureDirectDefinition(
+  answer: string,
+  matches: Array<{
+    document: SuccessiveSearchDocument;
+    selectedPassages: string[];
+  }>,
+  message: string,
+): string {
+  const subject = message
+    .trim()
+    .match(/^what\s+is\s+(?:an?\s+)?(.+?)[?.!]*$/i)?.[1]
+    ?.trim();
+  if (!subject || subject.split(/\s+/).length > 8) return answer;
+  const escaped = subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const definitionPattern = new RegExp(
+    `\\b${escaped}\\s+is\\s+[^.!?]{15,320}[.!?]`,
+    "i",
+  );
+  if (definitionPattern.test(answer.slice(0, 500))) return answer;
+  const evidence = matches.flatMap(({ document, selectedPassages }) => [
+    ...selectedPassages,
+    ...document.textSegments,
+    ...document.descriptions,
+  ]);
+  const definition = evidence
+    .map((passage) => passage.match(definitionPattern)?.[0]?.trim())
+    .find(Boolean);
+  return definition ? `${definition}\n\n${answer}` : answer;
 }
 
 function bestStoryDescription(

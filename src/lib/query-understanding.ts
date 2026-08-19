@@ -31,6 +31,10 @@ export const queryUnderstandingSchema = z.object({
     .nullable()
     .default(null),
   requestedAction: z.string().trim().max(160).nullable().default(null),
+  answerMode: z.enum(["explain", "define", "list", "summarize", "recommend", "details"]).default("explain"),
+  targetScope: z.enum(["company", "portfolio", "entity", "topic"]).default("topic"),
+  temporalIntent: z.enum(["current", "latest"]).nullable().default(null),
+  containsPremise: z.boolean().default(false),
   entities: z.array(z.string().trim().min(1).max(100)).max(8).default([]),
   constraints: z.array(z.string().trim().min(1).max(160)).max(8).default([]),
   retrievalConcepts: z
@@ -56,6 +60,10 @@ export function shouldUseSemanticUnderstanding(
   history: Array<{ role: "user" | "assistant"; content: string }>,
 ): boolean {
   if (["recommendation", "solve_problem"].includes(understanding.intent))
+    return true;
+  if (understanding.containsPremise || understanding.temporalIntent) return true;
+  if (understanding.answerMode === "define") return true;
+  if (understanding.targetScope === "company" && understanding.topics.length > 0)
     return true;
   return (
     understanding.isFollowUp &&
@@ -137,6 +145,24 @@ export function buildDeterministicUnderstanding(
           : /\b(?:services?|capabilit(?:y|ies)|offerings?)\b/i.test(message)
             ? "service"
             : null;
+  const answerMode = /^(?:what|who)\s+(?:is|are)\b/i.test(message)
+    ? "define" as const
+    : /\b(?:summarize|summarise|summary)\b/i.test(message)
+      ? "summarize" as const
+      : /\b(?:recommend|best|right|where to start|which (?:service|capability))\b/i.test(message)
+        ? "recommend" as const
+        : /\b(?:all|list|which|what)\b.*\b(?:services?|capabilities|industries|offerings)\b/i.test(message)
+          ? "list" as const
+          : "explain" as const;
+  const companyPossessive = /\b(?:successive(?: digital)?(?:'s|s')|your)\s+[a-z]/i.test(message);
+  const companyFact = /\b(?:ceo|founder|leadership|award|recognition|value|culture|office|headquarters|employee)\b/i.test(message);
+  const portfolioRequest = requestedContentType === "service" || requestedContentType === "industry";
+  const containsPremise = /^(?:since|because|given that|assuming|as)\b/i.test(message.trim());
+  const temporalIntent = /\blatest\b/i.test(message)
+    ? "latest" as const
+    : /\bcurrent(?:ly)?\b/i.test(message)
+      ? "current" as const
+      : null;
   const intent = asksContact
     ? "contact"
     : isFollowUp
@@ -182,6 +208,10 @@ export function buildDeterministicUnderstanding(
     existingPlatform: null,
     requestedContentType,
     requestedAction: null,
+    answerMode,
+    targetScope: companyPossessive || companyFact ? "company" : portfolioRequest ? "portfolio" : "topic",
+    temporalIntent,
+    containsPremise,
     entities: [],
     constraints: [],
     retrievalConcepts: topics,

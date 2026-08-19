@@ -92,24 +92,12 @@ export function shouldDeduplicateDiscoveryResults(
   message: string,
   intent: Intent,
 ): boolean {
-  const normalized = normalizeSearchText(message);
-  if (intent === "contact" || intent === "about") return false;
-  if (
-    /^(?:tell me more about|tell me about|explain)\s+(?!this\b|that\b|it\b)/.test(
-      normalized,
-    )
-  )
-    return false;
-  if (asksForAnotherResult(message)) return true;
-  if (
-    ["products", "case_studies", "blogs", "events", "resources"].includes(
-      intent,
-    )
-  )
-    return true;
-  return /\b(?:services?|serivces?|industr(?:y|ies)|white ?papers?|blogs?|articles?|case studies|webinars?|events?|accelerators?|awards?|partners?|press releases?|media coverage|thought leadership|employee perspectives?|expertise|pillars?)\b/.test(
-    normalized,
-  );
+  void intent; // Retained in the public helper signature for existing callers.
+  // Seeing a link once must not make the subject unavailable for the rest of
+  // the conversation. An exact repeat (including navigation such as Contact
+  // Us) should therefore be answered normally. Exclude seen content only when
+  // the visitor explicitly asks to discover another/more/different result.
+  return asksForAnotherResult(message);
 }
 
 export function buildConversationRetrievalQuery(

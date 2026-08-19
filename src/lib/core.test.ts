@@ -53,6 +53,7 @@ import {
   isGreeting,
 } from "./conversation";
 import { sanitizeGroundedAnswerOpening } from "./response-format";
+import { extractPublishedContactDetails } from "./contact-details";
 import {
   asksForAnotherResult,
   buildConversationRetrievalQuery,
@@ -110,6 +111,22 @@ describe("generic help requests", () => {
     expect(isGenericHelpRequest("help")).toBe(true);
     expect(isGenericHelpRequest("I need help with AI services")).toBe(false);
     expect(isGenericHelpRequest("Help me find a cloud case study")).toBe(false);
+  });
+});
+
+describe("published contact details", () => {
+  it("extracts only contact details actually published in ACF", () => {
+    expect(
+      extractPublishedContactDetails({
+        offices: [
+          { phone: "+1 (315) 818-3656" },
+          { phone: "+91 (120) 425-9482", email: "hello@example.com" },
+        ],
+      }),
+    ).toEqual({
+      phones: ["+1 (315) 818-3656", "+91 (120) 425-9482"],
+      emails: ["hello@example.com"],
+    });
   });
 });
 
@@ -272,8 +289,20 @@ describe("multi-turn conversation context", () => {
     expect(asksForAnotherResult("more")).toBe(true);
   });
 
-  it("deduplicates discovery categories but keeps navigation and detail repeatable", () => {
-    expect(shouldDeduplicateDiscoveryResults("show blogs", "blogs")).toBe(true);
+  it("deduplicates only explicit requests for unseen results", () => {
+    expect(shouldDeduplicateDiscoveryResults("show blogs", "blogs")).toBe(false);
+    expect(
+      shouldDeduplicateDiscoveryResults("show me another blog", "blogs"),
+    ).toBe(true);
+    expect(
+      shouldDeduplicateDiscoveryResults("more services", "products"),
+    ).toBe(true);
+    expect(
+      shouldDeduplicateDiscoveryResults(
+        "Since Successive only works with startups, what services for enterprises?",
+        "products",
+      ),
+    ).toBe(false);
     expect(
       shouldDeduplicateDiscoveryResults("Digital Transformation", "general"),
     ).toBe(false);
@@ -348,6 +377,7 @@ describe("service type query filtering", () => {
   it("treats generic AI services as a complete portfolio query", () => {
     expect(isBroadAiServicesQuery("ai services")).toBe(true);
     expect(isBroadAiServicesQuery("Show me Successive AI services")).toBe(true);
+    expect(isBroadAiServicesQuery("What AI/ML services does Successive provide?")).toBe(true);
     expect(isBroadAiServicesQuery("generative ai services")).toBe(false);
     expect(isBroadAiServicesQuery("AI strategy consulting services")).toBe(
       false,
@@ -1153,9 +1183,7 @@ describe("complete ACF search indexing", () => {
     expect(normalizeQuery("Do you know about Successive EYE?")).toBe(
       "successive eye",
     );
-    expect(normalizeQuery("Please explain Successive ADD")).toBe(
-      "agentic driven delivery legacy systems",
-    );
+    expect(normalizeQuery("Please explain Successive ADD")).toBe("successive add");
   });
   it("does not treat an isolated EYE acronym as the Successive EYE entity", () => {
     const document = buildSearchDocument({

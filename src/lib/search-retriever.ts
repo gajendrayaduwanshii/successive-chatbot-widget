@@ -235,6 +235,7 @@ function isWhitepaperDocument(document: SuccessiveSearchDocument): boolean {
 
 function extractDirectLookupSubject(query: string): string {
   return normalizeSearchText(query)
+    .replace(/^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)\s+/, "")
     .replace(/^(?:tell me (?:more )?about|do you have information about|show me (?:the )?(?:customer story|case study)|what business needs does)\s+/, "")
     .replace(/\s+(?:address|addresses)$/, "")
     .trim();
@@ -286,9 +287,7 @@ export function normalizeQuery(query: string): string {
   const normalized = normalizeSearchText(query);
   // Recover a known high-level topic even when visitors add misspellings or
   // accidental keyboard noise around it (for example, "ai servies fhfghf").
-  const recognizedTopic = /\bsuccessive add\b/.test(normalized)
-    ? "agentic driven delivery legacy systems"
-    : /\bai\b.*\b(?:service|services|servies|solution|solutions)\b/.test(
+  const recognizedTopic = /\bai\b.*\b(?:service|services|servies|solution|solutions)\b/.test(
           normalized,
         )
       ? "ai services"
@@ -360,12 +359,12 @@ function normalizedServiceType(value: string | undefined): string {
 export function isBroadAiServicesQuery(query: string): boolean {
   const normalized = normalizeSearchText(query)
     .replace(
-      /\b(?:show|give|tell|list|explore|find|what|me|about|successive|all|the|your|please)\b/g,
+      /\b(?:show|give|tell|list|explore|find|what|me|about|successive|all|the|your|please|does|do|provide|provides|offer|offers)\b/g,
       " ",
     )
     .replace(/\s+/g, " ")
     .trim();
-  return /^(?:ai|artificial intelligence)(?: (?:services?|solutions?|offerings?))?$/.test(
+  return /^(?:ai|ai (?:and )?ml|artificial intelligence(?: and machine learning)?)(?: (?:services?|solutions?|offerings?))?$/.test(
     normalized,
   );
 }
@@ -1006,9 +1005,9 @@ export async function retrieveFromIndex(
     }));
     return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches, isProductList };
   }
-  const broadServiceRequest = understanding?.requestedContentType === "service" &&
-    understanding.topics.length === 0 && !understanding.businessProblem &&
-    understanding.entities.length === 0;
+  const broadServiceRequest = understanding?.targetScope === "portfolio" &&
+    understanding.requestedContentType === "service" && !understanding.businessProblem &&
+    understanding.entities.length === 0 && understanding.isBroadQuery;
   if (broadServiceRequest) {
     const portfolio = index
       .filter((document) => isRequestedContentTypeCompatible(document, "service"))
@@ -1019,7 +1018,9 @@ export async function retrieveFromIndex(
         const bType = normalizedServiceType(b.service_type) === "pillar" ? 1 : 0;
         return bType - aType || b.contentQuality - a.contentQuality;
       });
-    const matches = portfolio.slice(0, 5).map((document, position) => ({
+    const authoritative = portfolio.filter((document) => normalizedServiceType(document.service_type) === "pillar");
+    const chosen = authoritative.length ? authoritative : portfolio;
+    const matches = chosen.slice(0, 8).map((document, position) => ({
       document,
       score: 180 - position,
       matchedFields: ["authoritative-service-portfolio"],
@@ -1041,8 +1042,29 @@ export async function retrieveFromIndex(
       reliableMatchFound: matches.length > 0,
       matches,
       isProductList,
-      collectionTotal: portfolio.length,
+      collectionTotal: chosen.length,
       collectionLabel: "services",
+    };
+  }
+  const broadIndustryRequest = understanding?.targetScope === "portfolio" &&
+    understanding.requestedContentType === "industry" && understanding.isBroadQuery;
+  if (broadIndustryRequest) {
+    const portfolio = index
+      .filter((document) => document.role === "industry")
+      .filter((document) => !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)))
+      .sort((a, b) => a.title.localeCompare(b.title));
+    const matches = portfolio.slice(0, 10).map((document, position) => ({
+      document,
+      score: 180 - position,
+      matchedFields: ["authoritative-industry-portfolio"],
+      selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
+      confidence: "high" as const,
+      scoreBreakdown: { title: 0, headings: 0, metadata: 180 - position, body: 0, contentType: 0, penalties: 0, authorityCoverage: 1 },
+    }));
+    return {
+      normalizedQuery, indexedDocuments: index.length,
+      reliableMatchFound: matches.length > 0, matches, isProductList,
+      collectionTotal: portfolio.length, collectionLabel: "industries",
     };
   }
   if (isBroadAiServicesQuery(currentMessage)) {
@@ -1286,24 +1308,6 @@ export async function retrieveFromIndex(
         document.slug === "full-stack-development-company"
       );
     }
-    if (
-      intent !== "case_studies" &&
-      /\b(?:location data|location intelligence|gis|arcgis)\b/.test(
-        normalizedQuery,
-      )
-    ) {
-      return (
-        document.type === "page" &&
-        /(?:location-intelligence|esri-arcgis|^gis$)/.test(document.slug)
-      );
-    }
-    if (/\bsuccessive add\b/.test(normalizeSearchText(query))) {
-      return (
-        document.type === "post" &&
-        document.slug ===
-          "achieve-modernisation-through-agentic-driven-delivery-for-legacy-systems"
-      );
-    }
     if (intent === "events") {
       return (
         document.type === "page" &&
@@ -1410,9 +1414,17 @@ export async function retrieveFromIndex(
             ? -80
             : -25
         : 0;
+      const scopeAdjustment = understanding?.targetScope === "company"
+        ? document.role === "company" ? 180 : -90
+        : understanding?.targetScope === "entity" && dimensions.entity > 0
+          ? dimensions.entity * 100
+          : 0;
+      const freshnessAdjustment = understanding?.temporalIntent && document.modified
+        ? Math.max(0, 30 - (Date.now() - Date.parse(document.modified)) / 31_536_000_000 * 3)
+        : 0;
       return {
         ...strongest,
-        score: strongest.score + dimensionScore + roleAdjustment,
+        score: strongest.score + dimensionScore + roleAdjustment + scopeAdjustment + freshnessAdjustment,
         matchedFields: [
           ...strongest.matchedFields,
           `query-plan:${strongest.planIndex + 1}`,
