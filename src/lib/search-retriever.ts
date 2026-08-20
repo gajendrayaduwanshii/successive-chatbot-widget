@@ -1129,10 +1129,11 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
-  if (understanding?.temporalIntent === "latest" && understanding.requestedContentType) {
+  if (understanding?.temporalIntent && understanding.requestedContentType) {
     const dated = index
       .filter((document) => isRequestedContentTypeCompatible(document, understanding.requestedContentType))
       .filter((document) => Number.isFinite(Date.parse(document.modified ?? "")))
+      .filter((document) => understanding.temporalIntent !== "upcoming" || Date.parse(document.modified ?? "") >= Date.now())
       .filter((document) => !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)));
     const topicalQuery = buildRetrievalQuery(understanding);
     const datedIdf = buildInverseDocumentFrequency(dated);
@@ -1142,12 +1143,14 @@ export async function retrieveFromIndex(
           .map((match) => match.document)
       : dated;
     const matches = relevant
-      .sort((a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""))
+      .sort((a, b) => understanding.temporalIntent === "upcoming"
+        ? Date.parse(a.modified ?? "") - Date.parse(b.modified ?? "")
+        : Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""))
       .slice(0, 1)
       .map((document, position): SearchMatch => ({
         document,
         score: 300 - position,
-        matchedFields: ["typed-latest-collection"],
+        matchedFields: [understanding.temporalIntent === "upcoming" ? "typed-upcoming-collection" : "typed-latest-collection"],
         selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
         confidence: "high",
         scoreBreakdown: { title: 0, headings: 0, metadata: 300 - position, body: 0, contentType: 100, penalties: 0, authorityCoverage: 1 },

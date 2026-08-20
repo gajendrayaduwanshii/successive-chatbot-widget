@@ -4,6 +4,66 @@ import { buildDeterministicUnderstanding, buildRetrievalQuery } from "./query-un
 
 type HistoryMessage = { role: "user" | "assistant"; content: string };
 
+export interface PresentedResource {
+  title: string;
+  url: string;
+}
+
+export interface StructuredConversationState {
+  activeTopic: string | null;
+  previousTopic: string | null;
+  activeContentType: ReturnType<typeof buildDeterministicUnderstanding>["requestedContentType"];
+  activeProduct: string | null;
+  activePartner: string | null;
+  lastPresentedResources: PresentedResource[];
+  pendingAlternative: PresentedResource | null;
+}
+
+function resourcesFromAnswer(content: string): PresentedResource[] {
+  return [...content.matchAll(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g)]
+    .map((match) => ({ title: match[1]!.replace(/\*\*/g, "").trim(), url: match[2]! }))
+    .filter(({ title }) => title.length >= 3);
+}
+
+export function buildStructuredConversationState(history: HistoryMessage[]): StructuredConversationState {
+  const userTurns = history.filter((item) => item.role === "user")
+    .map((item) => buildDeterministicUnderstanding(item.content));
+  const explicit = userTurns.filter((item) => item.topics.length || item.entities.length || item.industry);
+  const active = explicit.at(-1);
+  const previous = explicit.length > 1 ? explicit.at(-2) : undefined;
+  const lastAssistant = history.findLast((item) => item.role === "assistant")?.content ?? "";
+  const resources = resourcesFromAnswer(lastAssistant).slice(0, 6);
+  const pending = /would you like me to summarize|related (?:article|resource|case study|alternative)/i.test(lastAssistant)
+    ? resources[0] ?? null
+    : null;
+  const activeTopic = active?.entities[0] ?? active?.topics.join(" ") ?? active?.industry ?? null;
+  return {
+    activeTopic,
+    previousTopic: previous?.entities[0] ?? previous?.topics.join(" ") ?? previous?.industry ?? null,
+    activeContentType: userTurns.findLast((item) => item.requestedContentType)?.requestedContentType ?? null,
+    activeProduct: active && (/\bkagen\b/.test(active.normalizedQuery) || active.requestedContentType === "product" || active.requestedContentType === "kagen-product")
+      ? activeTopic : null,
+    activePartner: active?.requestedContentType === "partner" ? activeTopic : null,
+    lastPresentedResources: resources,
+    pendingAlternative: pending,
+  };
+}
+
+export function resolveStructuredFollowUpMessage(message: string, history: HistoryMessage[]): string | undefined {
+  const normalized = normalizeSearchText(message);
+  const state = buildStructuredConversationState(history);
+  if (/^(?:go back|switch back|back) to (?:the )?previous (?:topic|one)$/.test(normalized))
+    return state.previousTopic ? `Tell me about ${state.previousTopic}` : undefined;
+  if (/^(?:what can it do|who is it for|any latest news|latest news|any case studies|any articles|what do you do together)$/.test(normalized) && state.activeTopic)
+    return `${state.activeTopic} ${message}`;
+  return undefined;
+}
+
+export function rejectsPendingAlternative(message: string, history: HistoryMessage[]): boolean {
+  if (!/^(?:no|no thanks|not that one|something else|another option)$/i.test(message.trim())) return false;
+  return Boolean(buildStructuredConversationState(history).pendingAlternative);
+}
+
 export function asksForAnotherResult(message: string): boolean {
   const normalized = normalizeSearchText(message);
   if (/^(?:tell me more about|tell me about|explain)\b/.test(normalized))
@@ -50,9 +110,7 @@ export function resolveOfferedResourceFollowUp(
   const ordinal = normalized.match(/(?:summarize |show |open |tell me about )?(?:the )?(first|second|third)(?: one| item| article| resource)?/i)?.[1];
   if (!affirmative && !ordinal) return undefined;
   const prior = history.findLast((item) => item.role === "assistant")?.content ?? "";
-  const links = [...prior.matchAll(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g)]
-    .map((match) => ({ title: match[1]!.trim(), url: match[2]! }))
-    .filter(({ title }) => title.length >= 3);
+  const links = resourcesFromAnswer(prior);
   if (!links.length) return undefined;
   if (affirmative && !/would you like me to summarize|related (?:article|resource|case study|alternative)/i.test(prior))
     return undefined;

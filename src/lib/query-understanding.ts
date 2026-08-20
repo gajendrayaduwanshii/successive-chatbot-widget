@@ -36,7 +36,7 @@ export const queryUnderstandingSchema = z.object({
   requestedAction: z.string().trim().max(160).nullable().default(null),
   answerMode: z.enum(["explain", "define", "list", "summarize", "recommend", "details"]).default("explain"),
   targetScope: z.enum(["company", "portfolio", "entity", "topic"]).default("topic"),
-  temporalIntent: z.enum(["current", "latest"]).nullable().default(null),
+  temporalIntent: z.enum(["current", "latest", "upcoming"]).nullable().default(null),
   containsPremise: z.boolean().default(false),
   entities: z.array(z.string().trim().min(1).max(100)).max(8).default([]),
   constraints: z.array(z.string().trim().min(1).max(160)).max(8).default([]),
@@ -115,7 +115,7 @@ const followUpPattern = /^(?:tell me more|what about(?: this| that)?|anything el
 const explicitTypeRequest = (message: string, type: RegExp): boolean => {
   const normalized = normalizeSearchText(message);
   return type.test(normalized) && (
-    /\b(?:show|find|list|give|summarize|summarise|read|download|explore|any|another|latest|newest|recent|current)\b/.test(normalized) ||
+    /\b(?:show|find|list|give|summarize|summarise|read|download|explore|any|another|latest|newest|recent|recently|current|upcoming|published)\b/.test(normalized) ||
     /^(?:[a-z0-9.+# -]+\s+)?(?:services?|capabilit(?:y|ies)|approach|case stud(?:y|ies)|blogs?|articles?|white ?papers?|e-?books?|webinars?|events?|news|press releases?|products?|partners?|industries)\??$/.test(normalized) ||
     /\b(?:do you have|have you (?:done|published)|what (?:services?|products?|industries)|which (?:services?|products?|industries))\b/.test(normalized)
   );
@@ -187,7 +187,7 @@ export function buildDeterministicUnderstanding(
           ? "webinar"
           : /\bevents?\b/i.test(message)
             ? "event"
-            : /\bpress releases?\b/i.test(message)
+            : /\b(?:press releases?|press announcements?)\b/i.test(message)
               ? "press-release"
               : /\bmedia coverage\b/i.test(message)
                 ? "media-coverage"
@@ -229,7 +229,9 @@ export function buildDeterministicUnderstanding(
   const portfolioRequest = requestedContentType === "service" || requestedContentType === "industry";
   const containsPremise = /^(?:since|because|given that|assuming|as)\b/i.test(message.trim()) ||
     /\b(?:does not|doesn.t|do not|don.t|cannot|can.t|is not|isn.t|are not|aren.t|no |only |unrelated|right|correct)\b.*[?]?$/i.test(message.trim());
-  const temporalIntent = /\b(?:latest|newest|most recent)\b/i.test(message)
+  const temporalIntent = /\b(?:upcoming|next scheduled|future)\b/i.test(message)
+    ? "upcoming" as const
+    : /\b(?:latest|newest|most recent|recently published|newly published|new release)\b/i.test(message)
     ? "latest" as const
     : /\bcurrent(?:ly)?\b/i.test(message)
       ? "current" as const
@@ -308,6 +310,9 @@ export interface ConversationState {
   businessProblem: string | null;
   lastExplicitTopicTurn: number | null;
   lastIntent: QueryUnderstanding["intent"];
+  previousTopics: string[];
+  activeProduct: string | null;
+  activePartner: string | null;
 }
 
 export function resolveConversationUnderstanding(
@@ -326,6 +331,7 @@ export function resolveConversationUnderstanding(
   });
   const shouldInherit = current.isFollowUp || current.topics.length === 0 ||
     /\b(?:this|that|it|its|these|those|them)\b/i.test(current.normalizedQuery);
+  const preserveTypeForTopicSwitch = /^what about\b/.test(current.normalizedQuery);
   const topics = current.topics.length
     ? current.topics
     : shouldInherit
@@ -361,7 +367,7 @@ export function resolveConversationUnderstanding(
       current.existingPlatform ??
       (shouldInherit ? prior?.existingPlatform ?? null : null),
     requestedContentType:
-      current.requestedContentType ?? (shouldInherit ? prior?.requestedContentType ?? null : null),
+      current.requestedContentType ?? (shouldInherit || preserveTypeForTopicSwitch ? prior?.requestedContentType ?? null : null),
     retrievalConcepts: current.retrievalConcepts.length
       ? current.retrievalConcepts
       : shouldInherit
@@ -379,6 +385,9 @@ export function resolveConversationUnderstanding(
       businessProblem: understanding.businessProblem,
       lastExplicitTopicTurn: current.topics.length ? priorUsers.length : lastExplicitTopicTurn,
       lastIntent: understanding.intent,
+      previousTopics: prior?.topics ?? [],
+      activeProduct: /\bkagen\b/.test(understanding.normalizedQuery) ? topics.join(" ") || null : null,
+      activePartner: understanding.requestedContentType === "partner" ? topics.join(" ") || null : null,
     },
   };
 }
@@ -447,7 +456,7 @@ export function isExplicitListRequest(message: string): boolean {
     /\b(?:list|enumerate)\b/.test(normalized) ||
     /\b(?:show|give|provide)\s+(?:me\s+)?(?:all|every|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+are\s+(?:all|the complete|the full)\b/.test(normalized) ||
-    /\b(?:what|which)\s+(?:industries|categories|technologies|services|offerings)\b.*\b(?:serve|cover|available|offer|provide|use)\b/.test(normalized) ||
+    /\b(?:what|which)\s+(?:industries|categories|technologies|services|offerings)\b.*\b(?:serve|served|cover|covered|available|offer|offered|provide|provided|use|used)\b/.test(normalized) ||
     /^(?:all|every)\s+\S+/.test(normalized)
   );
 }

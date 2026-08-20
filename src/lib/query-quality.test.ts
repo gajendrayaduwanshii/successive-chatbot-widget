@@ -16,6 +16,7 @@ import {
   shouldUseSemanticUnderstanding,
 } from "./query-understanding";
 import { QUERY_QUALITY_CASES } from "./query-quality-cases";
+import { extractQueryFacets, inferQueryRelation } from "./query-facets";
 
 const document = (title: string, slug: string, body: string, headings: string[] = []) =>
   buildSearchDocument({
@@ -29,6 +30,32 @@ const document = (title: string, slug: string, body: string, headings: string[] 
   });
 
 describe("generic query understanding", () => {
+  it("extracts independent facets and their requested relations", () => {
+    const facets = extractQueryFacets(
+      "What is React, does Successive use it, and do you have a case study?",
+    );
+    expect(facets.map((facet) => facet.relation)).toEqual([
+      "DEFINES", "USES", "HAS_CASE_STUDY",
+    ]);
+    expect(inferQueryRelation("How do you secure delivery pipelines?")).toBe("SECURES");
+    expect(inferQueryRelation("Are you formally allied with Acme?")).toBe("PARTNER_OF");
+  });
+
+  it("does not split ordinary compound service names into fake facets", () => {
+    expect(extractQueryFacets("Tell me about data and analytics services")).toHaveLength(1);
+  });
+
+  it("recognizes publication and upcoming freshness grammar independently of topic", () => {
+    expect(buildDeterministicUnderstanding("most recently published case study")).toMatchObject({
+      temporalIntent: "latest", requestedContentType: "case-study",
+    });
+    expect(buildDeterministicUnderstanding("show upcoming webinars")).toMatchObject({
+      temporalIntent: "upcoming", requestedContentType: "webinar",
+    });
+    expect(buildDeterministicUnderstanding("newest press announcement")).toMatchObject({
+      temporalIntent: "latest", requestedContentType: "press-release",
+    });
+  });
   it("distinguishes overview questions from explicit catalogue requests across dynamic subjects", () => {
     const subjects = [...new Set(
       QUERY_QUALITY_CASES.flatMap(({ expectedTopic }) => expectedTopic ? [expectedTopic] : []),

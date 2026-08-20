@@ -65,7 +65,7 @@ import {
   shouldDeduplicateDiscoveryResults,
   resolveOfferedResourceFollowUp,
 } from "./conversation-context";
-import { buildDeterministicUnderstanding } from "./query-understanding";
+import { buildDeterministicUnderstanding, resolveConversationUnderstanding } from "./query-understanding";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -185,6 +185,15 @@ describe("answer opening formatting", () => {
 });
 
 describe("multi-turn conversation context", () => {
+  it("preserves a requested content type across a what-about topic switch", () => {
+    const current = buildDeterministicUnderstanding("What about retail?");
+    const resolved = resolveConversationUnderstanding(current, [
+      { role: "user", content: "Show healthcare case studies" },
+      { role: "assistant", content: "Healthcare examples" },
+    ]);
+    expect(resolved.understanding.topics).toContain("retail");
+    expect(resolved.understanding.requestedContentType).toBe("case-study");
+  });
   it("grounds related-service follow-ups in the latest assistant sources", () => {
     const history = [
       { role: "user" as const, content: "more blogs" },

@@ -50,6 +50,8 @@ import {
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
   resolveOfferedResourceFollowUp,
+  rejectsPendingAlternative,
+  resolveStructuredFollowUpMessage,
 } from "@/lib/conversation-context";
 import {
   buildDeterministicUnderstanding,
@@ -61,12 +63,13 @@ import {
   isExplicitListRequest,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
+import { extractQueryFacets, inferQueryRelation } from "@/lib/query-facets";
 import {
   answerStructuredRequest,
   understandStructuredRequest,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
-import { safeEvidenceResponse, validateEvidence } from "@/lib/evidence-validation";
+import { recoverAuthoritativeEvidence, safeEvidenceResponse, validateEvidence } from "@/lib/evidence-validation";
 import { alignedCta, selectAlignedSecondaryMatches } from "@/lib/response-alignment";
 
 export const runtime = "nodejs";
@@ -236,7 +239,19 @@ export async function POST(request: NextRequest) {
   const effectiveMessage = resolveOfferedResourceFollowUp(
     preparedQuery.englishQuery,
     parsed.data.history,
-  ) ?? preparedQuery.englishQuery;
+  ) ?? resolveStructuredFollowUpMessage(preparedQuery.englishQuery, parsed.data.history)
+    ?? preparedQuery.englishQuery;
+  if (rejectsPendingAlternative(preparedQuery.englishQuery, parsed.data.history)) {
+    return NextResponse.json({
+      success: true,
+      data: {
+        answer: "Understood—I won’t use that suggested resource. Tell me whether you want another related item or a different topic.",
+        cards: [], sources: [],
+        suggestions: ["Show me another related resource", "Explore a different topic"],
+        confidence: "high", insufficientContext: true,
+      },
+    }, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
   // Do not let a vague help request inherit an old topic and surface an
   // unrelated document title. Ask for the missing need before retrieval.
   if (isGenericHelpRequest(effectiveMessage)) {
@@ -873,13 +888,65 @@ export async function POST(request: NextRequest) {
   }
   try {
     const retrievalStartedAt = performance.now();
-    const retrieval = await retrieveFromIndex(
+    let retrieval = await retrieveFromIndex(
       retrievalMessage,
       isNamedSuccessivePersonQuery ? "general" : intent,
       effectiveMessage,
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       understanding,
     );
+    const facets = extractQueryFacets(effectiveMessage);
+    const facetResults = facets.length > 1
+      ? await Promise.all(facets.map(async (facet) => {
+          const facetUnderstanding: QueryUnderstanding = {
+            ...facet.understanding,
+            topics: facet.understanding.topics.length ? facet.understanding.topics : understanding.topics,
+            entities: facet.understanding.entities.length ? facet.understanding.entities : understanding.entities,
+            industry: facet.understanding.industry ?? understanding.industry,
+            retrievalConcepts: facet.understanding.retrievalConcepts.length
+              ? facet.understanding.retrievalConcepts
+              : understanding.retrievalConcepts,
+          };
+          const facetQuery = buildRetrievalQuery(facetUnderstanding) || facet.text;
+          const result = await retrieveFromIndex(
+            facetQuery,
+            detectIntent(facet.text),
+            facet.text,
+            shouldDeduplicate ? seenContentKeys : new Set<string>(),
+            facetUnderstanding,
+          );
+          const recovered = result.reliableMatchFound
+            ? result.matches
+            : recoverAuthoritativeEvidence({
+                candidates: result.candidates ?? [],
+                understanding: facetUnderstanding,
+                relation: facet.relation,
+              });
+          return { facet, understanding: facetUnderstanding, result, matches: recovered };
+        }))
+      : [];
+    if (facetResults.length) {
+      const merged = [...retrieval.matches, ...facetResults.flatMap((item) => item.matches)]
+        .filter((match, index, all) => all.findIndex((candidate) => candidate.document.id === match.document.id) === index)
+        .slice(0, 8);
+      retrieval = {
+        ...retrieval,
+        reliableMatchFound: merged.length > 0,
+        matches: merged,
+      };
+    }
+    if (!retrieval.reliableMatchFound) {
+      const recovered = recoverAuthoritativeEvidence({
+        candidates: retrieval.candidates ?? [],
+        understanding,
+        relation: inferQueryRelation(effectiveMessage),
+      });
+      if (recovered.length) retrieval = {
+        ...retrieval,
+        reliableMatchFound: true,
+        matches: recovered,
+      };
+    }
     retrievalDurationMs = performance.now() - retrievalStartedAt;
     const namedResourceSubject = extractNamedResourceSummarySubject(
       effectiveMessage,
@@ -1032,14 +1099,37 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
-    const evidenceValidation = validateEvidence({
+    let evidenceValidation = validateEvidence({
       message: effectiveMessage,
       contextMessage: retrievalMessage,
       understanding,
       matches: selectedMatches,
       hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
     });
-    if (["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
+    if (
+      facets.length === 1 &&
+      ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)
+    ) {
+      const recovered = recoverAuthoritativeEvidence({
+        candidates: retrieval.candidates ?? selectedMatches,
+        understanding,
+        relation: inferQueryRelation(effectiveMessage),
+      });
+      if (recovered.length) {
+        const recoveredValidation = validateEvidence({
+          message: effectiveMessage,
+          contextMessage: retrievalMessage,
+          understanding,
+          matches: recovered,
+          hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
+        });
+        if (recoveredValidation.status === "SUPPORTED") {
+          selectedMatches = recovered;
+          evidenceValidation = recoveredValidation;
+        }
+      }
+    }
+    if (facets.length === 1 && ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
       return NextResponse.json(
         {
           success: true,
@@ -1055,7 +1145,7 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
-    if (evidenceValidation.status === "PARTIALLY_SUPPORTED") {
+    if (facets.length === 1 && evidenceValidation.status === "PARTIALLY_SUPPORTED") {
       const related = evidenceValidation.accepted[0];
       return NextResponse.json(
         {
@@ -1079,7 +1169,9 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
-    const validatedMatches = evidenceValidation.accepted.length
+    const validatedMatches = facets.length > 1
+      ? selectedMatches
+      : evidenceValidation.accepted.length
       ? evidenceValidation.accepted
       : selectedMatches;
     selectedMatches = validatedMatches;
@@ -1211,9 +1303,13 @@ export async function POST(request: NextRequest) {
       (match): match is SearchMatch => Boolean(match),
     );
     const cta = alignedCta(alignment.primary, understanding);
-    const finalAnswer = cta && !categoryAnswer.includes(alignment.primary?.document.url ?? "")
-      ? `${categoryAnswer.trim()}\n\n${cta}`
+    const incompleteFacets = facetResults.filter((item) => item.matches.length === 0);
+    const facetCompleteAnswer = incompleteFacets.length
+      ? `${categoryAnswer.trim()}\n\n${incompleteFacets.map(({ facet }) => `I couldn’t find authoritative published evidence for the requested ${facet.relation.toLowerCase().replace(/_/g, " ")} facet.`).join("\n")}`
       : categoryAnswer;
+    const finalAnswer = cta && !facetCompleteAnswer.includes(alignment.primary?.document.url ?? "")
+      ? `${facetCompleteAnswer.trim()}\n\n${cta}`
+      : facetCompleteAnswer;
     const cardMatches = alignedMatches.filter((match) =>
       cardEligibility(match, understanding, topScore).accepted,
     );

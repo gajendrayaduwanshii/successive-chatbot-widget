@@ -1,6 +1,7 @@
 import { normalizeSearchText } from "./search-index";
-import type { SearchMatch } from "./search-retriever";
+import { isRequestedContentTypeCompatible, type SearchMatch } from "./search-retriever";
 import type { QueryUnderstanding } from "./query-understanding";
+import type { QueryRelation } from "./query-facets";
 
 export type EvidenceStatus =
   | "SUPPORTED"
@@ -21,6 +22,61 @@ export interface EvidenceValidation {
   accepted: SearchMatch[];
   rejected: Array<{ title: string; reason: string }>;
   reason: string;
+}
+
+const AUTHORITATIVE_ROLES = new Set([
+  "service", "company", "global_capabilities", "partner", "partners",
+  "product", "press_release", "culture", "careers", "awards",
+  "case_study", "blog", "resource", "industry", "contact",
+]);
+
+function relationCompatible(match: SearchMatch, relation: QueryRelation): boolean {
+  const role = match.document.role;
+  const identity = normalizeSearchText(`${match.document.title} ${match.document.slug} ${match.document.service_type ?? ""}`);
+  if (relation === "PARTNER_OF") return role === "partner" || role === "partners";
+  if (relation === "HAS_OFFICE_IN") return role === "company" || role === "contact";
+  if (relation === "HAS_CASE_STUDY") return role === "case_study";
+  if (relation === "HAS_ARTICLE") return ["blog", "resource", "press_release", "editorial"].includes(role);
+  if (relation === "SERVES_INDUSTRY") return role === "industry" || role === "case_study";
+  if (relation === "HAS_PRODUCT") return role === "product" || /\bkagen\b/.test(identity);
+  if (["SECURES", "MODERNIZES", "AUTOMATES", "INTEGRATES", "CONSULTS_ON", "OFFERS", "SUPPORTS"].includes(relation))
+    return role === "service" || role === "global_capabilities" || role === "technology";
+  return AUTHORITATIVE_ROLES.has(role) || role === "technology";
+}
+
+/**
+ * Controlled recovery for candidates rejected by the normal relative cutoff.
+ * It never changes global thresholds: an item must independently satisfy the
+ * requested content type, authority, relation, and an identity/capability
+ * signal produced by the corpus index.
+ */
+export function recoverAuthoritativeEvidence(args: {
+  candidates: SearchMatch[];
+  understanding: QueryUnderstanding;
+  relation: QueryRelation;
+}): SearchMatch[] {
+  return args.candidates
+    .filter((match) => isRequestedContentTypeCompatible(match.document, args.understanding.requestedContentType))
+    .filter((match) => relationCompatible(match, args.relation))
+    .filter((match) => !match.matchedFields.some((field) => /incidental-body-only|entity-mismatch/.test(field)))
+    .filter((match) => {
+      const strongIndexSignal = match.matchedFields.some((field) =>
+        /exact-title|title-phrase|alias|canonical|exact-section|exact-entity-authority|capability-profile|primary-service-authority|authoritative-.*-portfolio|case-study-capability-bridge/.test(field),
+      );
+      const dimensions = match.scoreBreakdown;
+      const strongRelationSignal = (dimensions?.entity ?? 0) >= 0.5 ||
+        (dimensions?.functional ?? 0) >= 0.2 ||
+        (dimensions?.topic ?? 0) >= 0.34 ||
+        (dimensions?.problem ?? 0) >= 0.2;
+      return strongIndexSignal || strongRelationSignal;
+    })
+    .sort((a, b) => b.score - a.score || b.document.contentQuality - a.document.contentQuality)
+    .slice(0, 3)
+    .map((match) => ({
+      ...match,
+      matchedFields: [...new Set([...match.matchedFields, "controlled-authority-recovery"])],
+      confidence: match.confidence ?? "medium",
+    }));
 }
 
 const stop = new Set([
@@ -61,7 +117,7 @@ function evidenceTermSet(value: string): Set<string> {
 export function requestedAttribute(message: string, understanding: QueryUnderstanding): RequestedAttribute {
   const query = normalizeSearchText(message);
   if (/\b(?:how long|timeline|duration|how quickly|how soon|guarantee .*?(?:date|timeline)|next (?:week|month|quarter|year)|this (?:week|month|quarter|year)|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen)\s*(?:days?|weeks?|months?))\b/.test(query)) return "duration";
-  if (/\b(?:how much|cost|price|pricing|budget|revenue)\b/.test(query)) return "cost";
+  if (/\b(?:how much|price|pricing|budget|revenue|project cost|engagement cost|cost to|cost of (?:building|developing|implementing))\b/.test(query)) return "cost";
   if (/\b(?:how many (?:developers|engineers|people|team members)|team size|(?:developers|engineers|people) (?:are )?required)\b/.test(query)) return "staffing";
   if (/\b(?:appraisal|salary|bonus|leave|promotion|probation|notice period|attendance|employee id|my manager|personal|private|confidential|internal|absent)\b/.test(query))
     return /\b(?:my|mine|i|manager|rating|approved)\b/.test(query) ? "private_record" : "schedule";
