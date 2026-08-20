@@ -439,6 +439,18 @@ export function buildRetrievalQuery(understanding: QueryUnderstanding): string {
     .trim();
 }
 
+/** True only when the visitor explicitly asks for a catalogue or count. */
+export function isExplicitListRequest(message: string): boolean {
+  const normalized = normalizeSearchText(message);
+  return (
+    /\b(?:how many|count|total number|number of)\b/.test(normalized) ||
+    /\b(?:list|enumerate)\b/.test(normalized) ||
+    /\b(?:show|give|provide)\s+(?:me\s+)?(?:all|every|the complete|the full)\b/.test(normalized) ||
+    /\b(?:what|which)\s+are\s+(?:all|the complete|the full)\b/.test(normalized) ||
+    /^(?:all|every)\s+\S+/.test(normalized)
+  );
+}
+
 export function isDeterministicallyOffTopic(message: string): boolean {
   const normalized = normalizeSearchText(message);
   return (/(?:\b(?:weather|forecast|movie|film|poem|song|joke|capital of|president of|prime minister|sports? score|recipe|horoscope|sorting code)\b|\b(?:who won|score|result)\b.*\b(?:match|game|football|cricket|basketball|tennis|hockey)\b)/.test(normalized)) &&

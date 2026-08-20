@@ -12,6 +12,7 @@ import {
   buildRetrievalQuery,
   queryUnderstandingSchema,
   isDeterministicallyOffTopic,
+  isExplicitListRequest,
   shouldUseSemanticUnderstanding,
 } from "./query-understanding";
 import { QUERY_QUALITY_CASES } from "./query-quality-cases";
@@ -28,6 +29,30 @@ const document = (title: string, slug: string, body: string, headings: string[] 
   });
 
 describe("generic query understanding", () => {
+  it("distinguishes overview questions from explicit catalogue requests across dynamic subjects", () => {
+    const subjects = [...new Set(
+      QUERY_QUALITY_CASES.flatMap(({ expectedTopic }) => expectedTopic ? [expectedTopic] : []),
+    )];
+    expect(subjects.length).toBeGreaterThan(3);
+    for (const subject of subjects) {
+      expect(isExplicitListRequest(`What about ${subject} services?`)).toBe(false);
+      expect(isExplicitListRequest(`Tell me about ${subject}`)).toBe(false);
+      expect(isExplicitListRequest(`List ${subject} offerings`)).toBe(true);
+      expect(isExplicitListRequest(`Show me all ${subject} offerings`)).toBe(true);
+      expect(isExplicitListRequest(`How many ${subject} items are published?`)).toBe(true);
+    }
+  });
+
+  it("does not turn detail, factual, or unsupported-style questions into catalogue requests", () => {
+    const questions = [
+      "Explain the selected capability in detail",
+      "Where is the company headquarters?",
+      "Does the company support this technology?",
+      "Tell me about an unknown subject",
+    ];
+    for (const question of questions) expect(isExplicitListRequest(question)).toBe(false);
+  });
+
   it("does not flatten a short explicit technology service query into the broad portfolio", () => {
     const understanding = buildDeterministicUnderstanding("Node.js + services");
     expect(understanding).toMatchObject({

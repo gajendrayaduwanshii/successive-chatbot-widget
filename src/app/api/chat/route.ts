@@ -58,6 +58,7 @@ import {
   applyStructuralBroadQueryRules,
   shouldUseSemanticUnderstanding,
   buildRetrievalQuery,
+  isExplicitListRequest,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
 import {
@@ -950,7 +951,11 @@ export async function POST(request: NextRequest) {
             answer: `I couldn't find that exact published item in the available Successive content.${alternatives}`,
             cards: [],
             sources: [],
-            suggestions: related.length ? [`Summarize '${related[0]!.document.title}'`] : buildRelatedSuggestions("general"),
+            suggestions: related.length ? [`Summarize '${related[0]!.document.title}'`] : [
+              "Show me another related resource",
+              "Show me a related case study",
+              "Explore Successive services",
+            ],
             confidence: "low",
             insufficientContext: true,
           },
@@ -1045,8 +1050,7 @@ export async function POST(request: NextRequest) {
       /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
     const isExplicitCollectionQuery =
       retrieval.collectionTotal !== undefined &&
-      (understanding.answerMode === "list" ||
-        /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage));
+      isExplicitListRequest(effectiveMessage);
     if (isExplicitCollectionQuery) {
       const presented = validatedMatches.slice(0, 15);
       const total = retrieval.collectionTotal ?? presented.length;
@@ -1489,8 +1493,8 @@ function buildCollectionListAnswer(
   const shown = matches.length;
   const summary =
     total <= 15
-      ? `The configured Successive website API currently contains **${total} published item${total === 1 ? "" : "s"}** in ${label}.`
-      : `The configured Successive website API currently contains **${total} published items** in ${label}. Here are the latest **${shown}**.`;
+      ? `Successive has **${total} published ${total === 1 ? "entry" : "entries"}** in ${label}.`
+      : `Successive has **${total} published entries** in ${label}. Here are the latest **${shown}**.`;
   const items = matches
     .map(
       ({ document }, index) =>
@@ -1558,7 +1562,7 @@ function buildRelatedSuggestions(
   return [
     learnMore,
     "Show me a related case study",
-    "Show me related Successive services",
+    "Explore Successive industries",
   ];
 }
 
