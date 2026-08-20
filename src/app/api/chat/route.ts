@@ -996,6 +996,42 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    // Complete collections are already constrained by deterministic content
+    // type/role filters. Present that authoritative collection before
+    // per-question evidence validation can collapse it to one topical item.
+    if (
+      retrieval.collectionTotal !== undefined &&
+      isExplicitListRequest(effectiveMessage)
+    ) {
+      const presented = retrieval.matches.slice(0, 15);
+      const total = retrieval.collectionTotal;
+      const label = retrieval.collectionLabel ?? "items";
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: buildCollectionListAnswer(label, total, presented),
+            cards: presented.map(({ document, selectedPassages }) => ({
+              type: cardType(document.type),
+              title: document.title,
+              description: bestStoryDescription(document, selectedPassages),
+              url: document.url,
+              image: document.image,
+              badge: document.type,
+              service_type: document.service_type,
+            })),
+            sources: presented.map(({ document }) => ({
+              title: document.title,
+              url: document.url,
+            })),
+            suggestions: buildCollectionSuggestions(label, total),
+            confidence: "high",
+            insufficientContext: false,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
     const evidenceValidation = validateEvidence({
       message: effectiveMessage,
       contextMessage: retrievalMessage,
@@ -1055,39 +1091,6 @@ export async function POST(request: NextRequest) {
     const isWhitepaperCollectionQuery =
       isWhitepaperQuery &&
       /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
-    const isExplicitCollectionQuery =
-      retrieval.collectionTotal !== undefined &&
-      isExplicitListRequest(effectiveMessage);
-    if (isExplicitCollectionQuery) {
-      const presented = validatedMatches.slice(0, 15);
-      const total = retrieval.collectionTotal ?? presented.length;
-      const label = retrieval.collectionLabel ?? "items";
-      return NextResponse.json(
-        {
-          success: true,
-          data: {
-            answer: buildCollectionListAnswer(label, total, presented),
-            cards: presented.map(({ document, selectedPassages }) => ({
-              type: cardType(document.type),
-              title: document.title,
-              description: bestStoryDescription(document, selectedPassages),
-              url: document.url,
-              image: document.image,
-              badge: document.type,
-              service_type: document.service_type,
-            })),
-            sources: presented.map(({ document }) => ({
-              title: document.title,
-              url: document.url,
-            })),
-            suggestions: buildCollectionSuggestions(label, total),
-            confidence: "high",
-            insufficientContext: false,
-          },
-        },
-        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
-      );
-    }
     const preGenerationAlignment = selectAlignedSecondaryMatches({
       matches: validatedMatches,
       understanding,
@@ -1177,15 +1180,20 @@ export async function POST(request: NextRequest) {
     }
     if (explicitNoEvidence)
       generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
+    if (
+      understanding.containsPremise &&
+      /\bSuccessive\s+(?:does not|doesn't|cannot|can't|has no|only)\b/i.test(generatedAnswer)
+    )
+      generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
     const groundedAnswer = ensureDescriptiveGroundedAnswer(
       generatedAnswer,
       selectedMatches,
     );
-    const directlyAnswered = ensureDirectDefinition(
+    const directlyAnswered = ensureExplicitPremiseCorrection(ensureDirectDefinition(
       groundedAnswer,
       selectedMatches,
       effectiveMessage,
-    );
+    ), understanding);
     const categoryAnswer = isUseCaseQuery(effectiveMessage)
       ? ensureCategoryHeading(
           directlyAnswered,
@@ -1215,6 +1223,9 @@ export async function POST(request: NextRequest) {
         : isWhitepaperCollectionQuery && selectedMatches.length <= 15
         ? selectedMatches
         : cardMatches.slice(0, 3);
+    const sourceMatches = presentedMatches.length
+      ? presentedMatches
+      : alignedMatches.slice(0, 2);
     const response = {
       ...(generatedData ?? {
         answer: groundedAnswer,
@@ -1234,7 +1245,7 @@ export async function POST(request: NextRequest) {
         badge: document.type,
         service_type: document.service_type,
       })),
-      sources: presentedMatches.map(({ document }) => ({
+      sources: sourceMatches.map(({ document }) => ({
         title: document.title,
         url: document.url,
       })),
@@ -1363,15 +1374,29 @@ function extractNamedResourceSummarySubject(message: string): string | null {
     /\b(?:called|named|titled)\s+(.+?)(?:\s+(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource))?[?.!]*$/i,
   )?.[1];
   if (explicitlyNamed) return normalizeSearchText(explicitlyNamed);
-  if (!/^(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is|what does)\b/i.test(message.trim())) return null;
+  // Unquoted discovery grammar ("find an article about X", "show blogs on X")
+  // names a topic and content type, not a resource identity. Only summary or
+  // content-inspection verbs may use descriptive partial-title resolution.
+  if (!/^(?:summarize|summarise|explain|tell me (?:the key points|what it says)|what does)\b/i.test(message.trim())) return null;
   const prefixType = message.match(
-    /^(?:(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is)\s+)?(?:the\s+|an?\s+)?(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource)\s+(?:called|named|titled)?\s*['“\"]?(.+?)['”\"]?[?.!]*$/i,
+    /^(?:(?:summarize|summarise|explain|tell me (?:the key points from|what it says about)|what does)\s+)?(?:the\s+|an?\s+)?(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|guide|downloadable resource|resource)\s+(?:about\s+)?['“\"]?(.+?)['”\"]?[?.!]*$/i,
   );
   const suffixType = message.match(
-    /^(?:(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is)\s+)?(?:the\s+|an?\s+)?['“\"]?(.+?)['”\"]?\s+(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource)[?.!]*$/i,
+    /^(?:(?:summarize|summarise|explain|what does)\s+)?(?:the\s+|an?\s+)?['“\"]?(.+?)['”\"]?\s+(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|guide|downloadable resource|resource)[?.!]*$/i,
   );
   const subject = prefixType?.[1] ?? suffixType?.[1];
   return subject ? normalizeSearchText(subject) : null;
+}
+
+function ensureExplicitPremiseCorrection(
+  answer: string,
+  understanding: QueryUnderstanding,
+): string {
+  if (!understanding.containsPremise || !/\b(?:does not|cannot|has no|only|doesn't|can't|no )\b/i.test(understanding.normalizedQuery))
+    return answer;
+  if (/^\s*(?:no\b|that(?:'s| is) not correct|the premise)/i.test(answer) || /couldn.?t (?:find|confirm)/i.test(answer))
+    return answer;
+  return `No—the premise is not supported by Successive’s published evidence.\n\n${answer}`;
 }
 
 function selectRelatedNamedResource(
@@ -1499,9 +1524,9 @@ function buildCollectionListAnswer(
 ): string {
   const shown = matches.length;
   const summary =
-    total <= 15
+    shown >= total
       ? `Successive has **${total} published ${total === 1 ? "entry" : "entries"}** in ${label}.`
-      : `Successive has **${total} published entries** in ${label}. Here are the latest **${shown}**.`;
+      : `Successive has **${total} published entries** in ${label}. Showing **${shown} of ${total}**.`;
   const items = matches
     .map(
       ({ document }, index) =>

@@ -84,6 +84,16 @@ describe("structured API knowledge", () => {
   ])("does not route job-location phrasing as company presence: %s", (query) => {
     expect(understandStructuredRequest(query)?.attribute).not.toBe("company_location");
   });
+
+  it("separates company certifications from continuous-compliance services", () => {
+    expect(understandStructuredRequest("What certifications do you have?")).toMatchObject({
+      attribute: "certifications",
+    });
+    expect(understandStructuredRequest("What continuous cloud compliance services do you provide?"))
+      .toBeNull();
+    expect(understandStructuredRequest("Security compliance automation"))
+      .toBeNull();
+  });
   it.each([
     ["What are your core values?", "values"],
     ["What is Global Capabilities?", "capabilities"],
@@ -283,6 +293,28 @@ describe("structured API knowledge", () => {
     expect(result?.document.slug).toBe("contact");
     expect(result?.answer).toContain("Noida, Uttar Pradesh, India");
     expect(result?.answer).not.toMatch(/location intelligence|gis|geospatial/i);
+  });
+
+  it("turns raw contact country icons and addresses into a direct visitor-facing answer", () => {
+    const about = page(23, "about-us", "About Us", {
+      worldwide_footprint: "Successive operates across global locations including India and the US.",
+    });
+    const contact = page(24, "contact", "Contact Us", {
+      offices: [
+        { country_icon: "footer-icon-India", address: "Windsor Grand, Sector 126, Noida, UP 201301" },
+        { country_icon: "footer-icon-US", address: "325 N Saint Paul St Suite 3100, Dallas, TX 75201" },
+      ],
+    });
+    const result = answerStructuredRequest(
+      [about, contact],
+      understandStructuredRequest("US-only? India offices?")!,
+    );
+
+    expect(result?.answer).toMatch(/^No—/);
+    expect(result?.answer).toContain("Yes—Successive has a published office location in India");
+    expect(result?.answer).toContain("Windsor Grand, Sector 126, Noida, UP 201301");
+    expect(result?.answer).toContain("325 N Saint Paul St Suite 3100, Dallas, TX 75201");
+    expect(result?.answer).not.toMatch(/country icon|footer-icon/i);
   });
 
   it.each([

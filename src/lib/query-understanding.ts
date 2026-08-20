@@ -447,6 +447,7 @@ export function isExplicitListRequest(message: string): boolean {
     /\b(?:list|enumerate)\b/.test(normalized) ||
     /\b(?:show|give|provide)\s+(?:me\s+)?(?:all|every|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+are\s+(?:all|the complete|the full)\b/.test(normalized) ||
+    /\b(?:what|which)\s+(?:industries|categories|technologies|services|offerings)\b.*\b(?:serve|cover|available|offer|provide|use)\b/.test(normalized) ||
     /^(?:all|every)\s+\S+/.test(normalized)
   );
 }

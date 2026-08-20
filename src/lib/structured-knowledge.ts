@@ -65,6 +65,13 @@ function isCompanyLocationQuery(query: string): boolean {
   );
 }
 
+function isCompanyCertificationQuery(query: string): boolean {
+  if (/\b(?:continuous|cloud|application|security|service|services|consulting|automation|pipeline|sdlc|devsecops)\b/.test(query))
+    return false;
+  return /\b(?:company|successive|your|our)?\s*(?:certifications?|accreditations?|standards?)\b/.test(query) ||
+    /\bwhat (?:certifications?|standards?) (?:do|does|are)\b/.test(query);
+}
+
 export function understandStructuredRequest(message: string): StructuredRequest | null {
   const q = normalizeVisitorQuery(message);
   const mode = /\b(?:how many|count|number of|total)\b/.test(q) ? "count"
@@ -82,14 +89,14 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     bareNameCandidate;
   const personTokens = personCandidate?.split(" ").filter(Boolean) ?? [];
   const person = personTokens.length >= 2 && personTokens.length <= 5 &&
-    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|solutions?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?|gis|geospatial|site selection)\b/.test(personCandidate ?? "")
+    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|solutions?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?|gis|geospatial|site selection|security|compliance|automation)\b/.test(personCandidate ?? "")
     ? personCandidate
     : undefined;
   let attribute: StructuredAttribute | undefined;
   if (/\b(?:appraisals?|performance reviews?|promotion|salary|hike|bonus|leave|notice period|probation|attendance|employee id|my manager|personal (?:phone|address)|private|confidential|internal .*?(?:forecast|policy|record)|absent today)\b/.test(q)) attribute = "employee_policy";
   else if (person) attribute = "person";
   else if (/\b(?:core values?|values?|principles?)\b/.test(q)) attribute = "values";
-  else if (/\b(?:certifications?|standards?|compliance|accreditation)\b/.test(q)) attribute = "certifications";
+  else if (isCompanyCertificationQuery(q)) attribute = "certifications";
   else if (/\b(?:board(?: of directors)?|board members?)\b/.test(q)) attribute = "board";
   else if (/\b(?:executives?|executive management|management team)\b/.test(q)) attribute = "executives";
   else if (/\b(?:advisors?|partners and advisors)\b/.test(q)) attribute = "advisors";
@@ -187,8 +194,20 @@ function globalPresenceFacts(values: string[], request: StructuredRequest): stri
 function officeLocationAnswer(facts: string[], request: StructuredRequest): string {
   const evidence = facts.join(" ").replace(/\s+/g, " ").trim();
   const lines: string[] = [];
-  const specificFacts = facts.filter((fact) => /^[^:]*\b(?:office|location|address|city|country|headquarter)[^:]*:/i.test(fact));
-  lines.push(...specificFacts);
+  const countries = [...new Set(facts.flatMap((fact) => {
+    const match = fact.match(/^[^:]*\bcountry[^:]*:\s*(.+)$/i);
+    if (!match) return [];
+    const country = match[1]!
+      .replace(/\b(?:footer|country|icon)\b/gi, " ")
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return country ? [country] : [];
+  }))];
+  const addresses = [...new Set(facts.flatMap((fact) => {
+    const match = fact.match(/^[^:]*\baddress[^:]*:\s*(.+)$/i);
+    return match?.[1]?.trim() ? [match[1].trim()] : [];
+  }))];
   const footprint = evidence.match(/\boperate(?:s)? across ([^.!?;,]*?locations?)\b/i)?.[1];
   const locations = evidence.match(/\b(?:such as|including)\s+(.+?)(?=,?\s+(?:serving|supporting)\b|[.!?]|$)/i)?.[1];
   const locationNames = locations?.split(/,|\band\b/i).map((name) => name.trim()).filter(Boolean) ?? [];
@@ -199,17 +218,30 @@ function officeLocationAnswer(facts: string[], request: StructuredRequest): stri
     ?.replace(/^and\s+/i, "")
     .trim();
   const asksLimitedScope = /\bonly\b/.test(request.normalizedQuery);
-  if (asksLimitedScope)
-    lines.push("No—Successive’s published footprint is not limited to the location named in your question.");
-  if (requestedLocations.length)
+  const requestedCountries = countries.filter((country) =>
+    request.normalizedQuery.includes(normalizeSearchText(country)),
+  );
+  if (asksLimitedScope && (countries.length > 1 || locationNames.length > 1))
+    lines.push(countries.length > 1
+      ? `No—Successive is not limited to one country; its published office presence includes ${countries.join(" and ")}.`
+      : "No—Successive’s published footprint covers multiple locations.");
+  if (requestedCountries.length)
+    lines.push(`Yes—Successive has a published office location in ${requestedCountries.join(" and ")}.`);
+  else if (requestedLocations.length)
     lines.push(`Yes—Successive’s published footprint includes ${requestedLocations.join(" and ")}.`);
+  if (!asksLimitedScope && !requestedCountries.length && countries.length)
+    lines.push(`Successive’s official Contact page lists office locations in ${countries.join(" and ")}.`);
+  if (addresses.length) {
+    lines.push("Published office addresses are:");
+    lines.push(...addresses.map((address) => `- ${address}`));
+  }
   if (footprint) lines.push(`Successive operates across ${footprint} worldwide.`);
   if (locations) lines.push(`Its published locations include ${locations.replace(/,?\s+and\s+/i, ", and ")}.`);
   if (headquarters) lines.push(`${headquarters} is identified as Successive’s headquarters.`);
   const reach = evidence.match(/\bserving\s+(.+?worldwide)\b/i)?.[1];
   if (reach && !asksLimitedScope && !requestedLocations.length)
     lines.push(`From its global presence, Successive serves ${reach}.`);
-  if (lines.length >= 3) return [...new Set(lines)].slice(0, 4).join("\n\n");
+  if (lines.length >= 3) return [...new Set(lines)].slice(0, 6).join("\n\n");
   return facts.join("\n\n");
 }
 

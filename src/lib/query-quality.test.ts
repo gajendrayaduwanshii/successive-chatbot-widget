@@ -53,6 +53,12 @@ describe("generic query understanding", () => {
     for (const question of questions) expect(isExplicitListRequest(question)).toBe(false);
   });
 
+  it("recognizes natural complete-portfolio questions without treating overviews as lists", () => {
+    expect(isExplicitListRequest("What industries do you serve?")).toBe(true);
+    expect(isExplicitListRequest("Which technologies are available?")).toBe(true);
+    expect(isExplicitListRequest("Tell me about retail services")).toBe(false);
+  });
+
   it("does not flatten a short explicit technology service query into the broad portfolio", () => {
     const understanding = buildDeterministicUnderstanding("Node.js + services");
     expect(understanding).toMatchObject({
