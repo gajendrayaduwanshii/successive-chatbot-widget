@@ -34,6 +34,36 @@ describe("structured API knowledge", () => {
       attribute: "global_presence",
     });
   });
+
+  it.each([
+    "office location",
+    "office locations",
+    "Where are your offices?",
+    "Where is Successive located?",
+    "Where are you based?",
+    "Successive locations",
+    "company address",
+    "head office",
+    "corporate office",
+    "headquarters",
+    "HQ",
+    "branches",
+    "Do you have an office in India?",
+    "What is your presence outside the US?",
+    "offcie loaction",
+  ])("recognizes company-location phrasing: %s", (query) => {
+    expect(understandStructuredRequest(query)).toMatchObject({ attribute: "global_presence" });
+  });
+
+  it.each([
+    "jobs by location",
+    "office jobs in Noida",
+    "location intelligence services",
+    "GIS site selection",
+    "geospatial capabilities",
+  ])("does not route non-office location intent as company presence: %s", (query) => {
+    expect(understandStructuredRequest(query)?.attribute).not.toBe("global_presence");
+  });
   it.each([
     ["What are your core values?", "values"],
     ["What is Global Capabilities?", "capabilities"],
@@ -178,6 +208,30 @@ describe("structured API knowledge", () => {
     expect(result?.answer).toContain("150+ enterprise clients");
     expect(result?.answer).not.toContain("couldn’t confirm the capability");
     expect(result?.document.slug).toBe("about-us");
+  });
+
+  it("answers an office-location query without prepending company history", () => {
+    const about = page(18, "about-us", "About Us", {
+      worldwide_footprint: "Founded in 2012 by a small group of technologists, Successive became a global digital transformation company. Today, Successive operates across seven strategic locations, including India, London, Dallas (HQ), and Johannesburg, serving 150+ enterprise clients worldwide.",
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("office location")!);
+
+    expect(result?.answer).toContain("seven strategic locations");
+    expect(result?.answer).toContain("Dallas (HQ)");
+    expect(result?.answer).toContain("Dallas is identified as Successive’s headquarters");
+    expect(result?.answer).toContain("150+ enterprise clients worldwide");
+    expect(result?.answer.split(/\n\n/)).toHaveLength(4);
+    expect(result?.answer).not.toMatch(/founded|2012|small group/i);
+  });
+
+  it("removes a historical prefix even when it shares a sentence with the location fact", () => {
+    const about = page(19, "about-us", "About Us", {
+      worldwide_footprint: "Founded in 2012 by technologists, Successive expanded globally; today it operates from offices in India, London, Dallas, and Johannesburg.",
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("Where are your offices?")!);
+
+    expect(result?.answer).toContain("operates from offices");
+    expect(result?.answer).not.toMatch(/founded|2012|technologists/i);
   });
 
   it.each([
