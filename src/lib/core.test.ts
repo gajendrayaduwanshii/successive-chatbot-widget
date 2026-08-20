@@ -40,6 +40,7 @@ import {
   normalizeQuery,
   rankSearchDocument,
   requestedCollection,
+  requestsSpecificServiceTaxonomy,
   retrieveFromIndex,
 } from "./search-retriever";
 import { fetchAllPublishedContent } from "./successive-api";
@@ -63,6 +64,7 @@ import {
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
 } from "./conversation-context";
+import { buildDeterministicUnderstanding } from "./query-understanding";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -202,7 +204,7 @@ describe("multi-turn conversation context", () => {
       "digital transformation cloud data artificial intelligence experience design services",
     );
   });
-  it("carries recent business context into referential content transitions", () => {
+  it("uses the latest explicit subject for a referential content transition", () => {
     const query = buildConversationRetrievalQuery("Any case studies?", [
       { role: "user", content: "I work in healthcare." },
       { role: "assistant", content: "How can we help?" },
@@ -210,8 +212,9 @@ describe("multi-turn conversation context", () => {
       { role: "assistant", content: "AI may help." },
       { role: "user", content: "Can AI help us as well?" },
     ]);
-    expect(query).toContain("healthcare");
-    expect(query).toContain("hospital operations");
+    expect(query).toContain("ai");
+    expect(query).not.toContain("healthcare");
+    expect(query).not.toContain("hospital operations");
     expect(query).toContain("Any case studies?");
   });
 
@@ -221,7 +224,7 @@ describe("multi-turn conversation context", () => {
         { role: "user", content: "ai service" },
         { role: "assistant", content: "Generative AI and AI strategy" },
       ]),
-    ).toBe("ai service. more serivces");
+    ).toBe("ai more serivces");
     expect(asksForAnotherResult("more serivces")).toBe(true);
     expect(shouldDeduplicateDiscoveryResults("more serivces", "products")).toBe(
       true,
@@ -235,6 +238,51 @@ describe("multi-turn conversation context", () => {
         [{ role: "user", content: "Show me AI services" }],
       ),
     ).toBe("Actually I am more interested in cloud");
+  });
+
+  it.each([
+    ["React", "Node.js services"],
+    ["AI consulting", "Cloud services"],
+    ["Healthcare", "Retail case studies"],
+    ["Kagen VOICE", "Kagen ADD"],
+    ["AWS partnership", "Google Cloud partnership"],
+    ["Application modernization", "DevOps blogs"],
+    ["Cloud", "Healthcare whitepapers"],
+  ])("replaces an old explicit subject generically: %s -> %s", (oldTopic, current) => {
+    expect(buildConversationRetrievalQuery(current, [
+      { role: "user", content: oldTopic },
+      { role: "assistant", content: `Information about ${oldTopic}` },
+    ])).toBe(current);
+  });
+
+  it.each([
+    ["Tell me more", null],
+    ["What services?", "service"],
+    ["Any case studies?", "case-study"],
+    ["Any blogs?", "blog"],
+    ["How can this help?", null],
+  ])("inherits the active subject for a contextual follow-up: %s", (current, contentType) => {
+    const query = buildConversationRetrievalQuery(current, [
+      { role: "user", content: "Geospatial engineering" },
+      { role: "assistant", content: "Geospatial engineering overview" },
+    ]);
+    expect(query).toContain("geospatial");
+    expect(query).toContain(current);
+    expect(buildDeterministicUnderstanding(current).requestedContentType).toBe(contentType);
+  });
+
+  it.each([
+    "Compare React and Angular",
+    "AWS vs Google Cloud",
+    "Can Node.js work with React?",
+    "How does AI help healthcare?",
+  ])("preserves all current subjects without adding an old one: %s", (current) => {
+    const query = buildConversationRetrievalQuery(current, [
+      { role: "user", content: "Retail commerce" },
+      { role: "assistant", content: "Retail overview" },
+    ]);
+    expect(query).toBe(current);
+    expect(query.toLowerCase()).not.toContain("retail");
   });
 
   it("keeps a standalone AI services query independent from old history", () => {
@@ -417,6 +465,12 @@ describe("service type query filtering", () => {
     expect(matchesRequestedServiceType("cloud services", undefined)).toBe(
       false,
     );
+  });
+
+  it("treats ordinary services as a service family but preserves explicit taxonomy filters", () => {
+    expect(requestsSpecificServiceTaxonomy("Node.js services")).toBe(false);
+    expect(requestsSpecificServiceTaxonomy("Node.js expertise")).toBe(true);
+    expect(requestsSpecificServiceTaxonomy("digital engineering pillars")).toBe(true);
   });
 });
 describe("collection pagination requests", () => {

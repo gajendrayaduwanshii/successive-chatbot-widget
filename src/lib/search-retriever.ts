@@ -76,6 +76,15 @@ const SYNONYM_GROUPS = [
   ["event", "events", "webinar", "webinars"],
   ["location", "locations", "office", "offices", "address"],
   ["modernization", "modernisation", "migration", "transformation"],
+  ["chatbot", "chatbots", "conversational ai", "virtual assistant", "ai assistant"],
+  ["crm", "customer relationship management", "salesforce"],
+  ["devsecops", "secure delivery", "secure sdlc", "shift left", "ci cd security", "application security", "security automation", "iac security"],
+  ["finops", "cloud cost optimization", "cloud cost visibility", "spend governance", "cloud economics"],
+  ["cms", "headless cms", "content management", "content platform", "content publishing", "content operations"],
+  ["application modernization", "legacy modernization", "monolith modernization", "technical debt"],
+  ["cloud migration", "workload migration", "minimal downtime", "migration modernization"],
+  ["api engineering", "api management", "api governance", "integration architecture"],
+  ["workflow automation", "intelligent automation", "manual process automation"],
 ];
 const INDEX_CACHE_MS = 5 * 60 * 1000;
 let cachedIndex:
@@ -105,6 +114,7 @@ export interface SearchMatch {
     outcome?: number;
     industry?: number;
     entity?: number;
+    functional?: number;
     bridge?: number;
     constraintsSatisfied?: number;
     constraintsTotal?: number;
@@ -247,6 +257,7 @@ function directIdentityStrength(document: SuccessiveSearchDocument, subject: str
   const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
   if (document.normalizedTitle === subject) return 1;
   if (slug === subject) return 0.99;
+  if (document.aliases.includes(subject)) return 0.98;
   if (subject.split(" ").length < 2) return 0;
   const meaningfulSubject = subject
     .replace(/\b(?:successive|digital|company|about us)\b/g, " ")
@@ -255,7 +266,6 @@ function directIdentityStrength(document: SuccessiveSearchDocument, subject: str
   // Brand-only phrasing is company discovery, not an exact resource alias.
   // Many editorial titles contain the brand and must not hijack About.
   if (!meaningfulSubject) return 0;
-  if (document.aliases.includes(subject)) return 0.98;
   const subjectTerms = new Set(subject.split(" "));
   const titleTerms = new Set(document.normalizedTitle.split(" "));
   const overlap = [...subjectTerms].filter((term) => titleTerms.has(term)).length;
@@ -278,7 +288,7 @@ function canonicalPageMatch(
   const identities = [
     document.normalizedTitle,
     normalizeSearchText(document.slug.replace(/-/g, " ")),
-    ...document.headings.map(normalizeSearchText),
+    ...document.aliases.map(normalizeSearchText),
   ].filter((identity) => identity.length >= 4);
   const canonicalTerm = (term: string) => term
     .replace(/ships?$/i, "")
@@ -303,7 +313,23 @@ export function isRequestedContentTypeCompatible(
   if (requested === "case-study") return document.type.includes("case");
   if (requested === "blog") return document.type === "post";
   if (requested === "event") return /event|webinar/.test(identity);
+  if (requested === "webinar") return /webinar/.test(identity);
   if (requested === "whitepaper") return isWhitepaperDocument(document);
+  if (requested === "ebook") return /ebook|e-book/.test(identity);
+  if (requested === "press-release") return document.type === "press-release";
+  if (requested === "media-coverage") return document.type === "media-coverage";
+  if (requested === "news") return ["press-release", "media-coverage"].includes(document.type);
+  if (requested === "accelerator") return document.type === "accelerators" || /accelerator/.test(identity);
+  if (requested === "award") return document.role === "awards";
+  if (requested === "product" || requested === "kagen-product")
+    return (document.role === "product" || document.productLike) && (requested !== "kagen-product" || /kagen/.test(identity));
+  if (requested === "technology") return document.role === "technology" || document.role === "global_capabilities";
+  if (requested === "company" || requested === "leadership") return document.role === "company";
+  if (requested === "culture") return document.role === "culture" || document.role === "company";
+  if (requested === "sub-service") return normalizedServiceType(document.service_type) === "sub service";
+  if (requested === "expertise") return normalizedServiceType(document.service_type) === "expertise";
+  if (requested === "solution") return document.role === "service" || /solution/.test(identity);
+  if (requested === "resource") return document.role === "resource";
   if (requested === "thought-leadership")
     return ["thought-leadership", "employee-perspective"].includes(document.type);
   if (requested === "partner") return document.type === "partners";
@@ -482,6 +508,12 @@ export function matchesRequestedServiceType(
   );
 }
 
+export function requestsSpecificServiceTaxonomy(query: string): boolean {
+  return detectRequestedServiceTypes(query).some(
+    (type) => type === "pillar" || type === "expertise",
+  );
+}
+
 function withoutServiceTypeTerms(query: string): string {
   return normalizeSearchText(query)
     .replace(
@@ -534,10 +566,17 @@ function expandedTerms(normalizedQuery: string): Set<string> {
   const base = normalizedQuery.split(" ").filter(Boolean);
   const terms = new Set(base.flatMap((token) => [token, stem(token)]));
   for (const group of SYNONYM_GROUPS) {
-    if (group.some((term) => terms.has(term) || terms.has(stem(term))))
+    if (group.some((term) =>
+      terms.has(term) || terms.has(stem(term)) ||
+      (term.includes(" ") && ` ${normalizedQuery} `.includes(` ${term} `)),
+    ))
       group.forEach((term) => {
         terms.add(term);
         terms.add(stem(term));
+        term.split(" ").filter(Boolean).forEach((token) => {
+          terms.add(token);
+          terms.add(stem(token));
+        });
       });
   }
   return terms;
@@ -548,6 +587,18 @@ function termCoverage(query: string, profileTerms: string[]): number {
   if (!queryTerms.length) return 0;
   const profile = new Set(profileTerms.map(stem));
   return queryTerms.filter((term) => profile.has(term)).length / queryTerms.length;
+}
+
+function functionalCompatibility(query: string, document: SuccessiveSearchDocument): number {
+  const queryTerms = new Set(normalizeQuery(query).split(" ").map(stem).filter((term) => term.length > 2));
+  const evidence = new Set([
+    ...document.capabilityProfile.identityTerms,
+    ...document.capabilityProfile.activityTerms,
+    ...document.capabilityProfile.businessFunctionTerms,
+    ...document.capabilityProfile.technologyTerms,
+  ].map(stem));
+  const overlap = [...queryTerms].filter((term) => evidence.has(term)).length;
+  return Math.min(1, overlap / 2);
 }
 
 function businessDimensions(
@@ -568,6 +619,7 @@ function businessDimensions(
       ...document.aliases.flatMap((alias) => alias.split(" ")),
       ...document.capabilityProfile.technologyTerms,
     ]),
+    functional: functionalCompatibility(problemQuery || topicQuery, document),
   };
 }
 
@@ -1077,7 +1129,32 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
-  const directSubject = extractDirectLookupSubject(currentMessage);
+  if (understanding?.temporalIntent === "latest" && understanding.requestedContentType) {
+    const dated = index
+      .filter((document) => isRequestedContentTypeCompatible(document, understanding.requestedContentType))
+      .filter((document) => Number.isFinite(Date.parse(document.modified ?? "")))
+      .filter((document) => !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)));
+    const topicalQuery = buildRetrievalQuery(understanding);
+    const datedIdf = buildInverseDocumentFrequency(dated);
+    const relevant = understanding.topics.length || understanding.entities.length || understanding.industry
+      ? dated.map((document) => rankSearchDocument(document, topicalQuery, datedIdf, understanding))
+          .filter((match) => match.score >= 45 && !match.matchedFields.includes("incidental-body-only"))
+          .map((match) => match.document)
+      : dated;
+    const matches = relevant
+      .sort((a, b) => Date.parse(b.modified ?? "") - Date.parse(a.modified ?? ""))
+      .slice(0, 1)
+      .map((document, position): SearchMatch => ({
+        document,
+        score: 300 - position,
+        matchedFields: ["typed-latest-collection"],
+        selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
+        confidence: "high",
+        scoreBreakdown: { title: 0, headings: 0, metadata: 300 - position, body: 0, contentType: 100, penalties: 0, authorityCoverage: 1 },
+      }));
+    return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: matches.length > 0, matches, isProductList };
+  }
+  const directSubject = withoutServiceTypeTerms(extractDirectLookupSubject(currentMessage));
   const explicitlyTypedLookup =
     /^(?:show me (?:the )?(?:customer story|case study)|(?:find|show|do you have) (?:me )?(?:a |an |the )?(?:white ?paper|e-?book|webinar|event|blog|article|thought leadership|case stud(?:y|ies)))\b/i.test(
       currentMessage.trim(),
@@ -1105,7 +1182,7 @@ export async function retrieveFromIndex(
   }
   const broadServiceRequest = understanding?.targetScope === "portfolio" &&
     understanding.requestedContentType === "service" && !understanding.businessProblem &&
-    understanding.entities.length === 0 && understanding.isBroadQuery;
+    understanding.entities.length === 0 && understanding.topics.length === 0;
   if (broadServiceRequest) {
     const portfolio = index
       .filter((document) => isRequestedContentTypeCompatible(document, "service"))
@@ -1145,7 +1222,7 @@ export async function retrieveFromIndex(
     };
   }
   const broadIndustryRequest = understanding?.targetScope === "portfolio" &&
-    understanding.requestedContentType === "industry" && understanding.isBroadQuery;
+    understanding.requestedContentType === "industry" && understanding.topics.length === 0;
   if (broadIndustryRequest) {
     const portfolio = index
       .filter((document) => document.role === "industry")
@@ -1384,7 +1461,12 @@ export async function retrieveFromIndex(
         !canonicalPageMatch(document, currentMessage) &&
         !isRequestedContentTypeCompatible(document, understanding.requestedContentType))
       return false;
-    if (!matchesRequestedServiceType(currentMessage, document.service_type))
+    // In visitor language, "services" means the whole service family. Keep
+    // strict ACF filtering only when the visitor explicitly asks for a pillar
+    // or expertise; otherwise a dedicated Expertise/Sub-service page may be
+    // the strongest authoritative answer for the named topic.
+    if (requestsSpecificServiceTaxonomy(currentMessage) &&
+        !matchesRequestedServiceType(currentMessage, document.service_type))
       return false;
     if (isLegalDocument(document)) {
       if (!explicitlyRequestsLegalContent(currentMessage)) return false;
@@ -1433,6 +1515,8 @@ export async function retrieveFromIndex(
       );
     }
     if (intent === "products" || intent === "product_detail") {
+      if (["product", "kagen-product"].includes(understanding?.requestedContentType ?? ""))
+        return document.productLike;
       // Successive publishes services/solutions as standard pages and posts,
       // not a custom `product` post type. Keep both collections eligible and
       // let full-text relevance select AI, engineering, cloud, data, etc.
@@ -1504,7 +1588,8 @@ export async function retrieveFromIndex(
       const bridge = bridgeBoosts.get(document.id) ?? 0;
       const dimensionScore = isBusinessNeed
         ? dimensions.topic * 55 + dimensions.problem * 100 + dimensions.outcome * 70 +
-          dimensions.industry * 80 + dimensions.entity * 90 + bridge - constraints.contradictions * 75
+          dimensions.industry * 80 + dimensions.entity * 90 + dimensions.functional * 140 + bridge -
+          constraints.contradictions * 75 - (dimensions.functional === 0 ? 140 : 0)
         : dimensions.industry * 55 + dimensions.entity * 65;
       const roleAdjustment = isBusinessNeed
         ? document.role === "service"
@@ -1538,6 +1623,7 @@ export async function retrieveFromIndex(
               outcome: dimensions.outcome,
               industry: dimensions.industry,
               entity: dimensions.entity,
+              functional: dimensions.functional,
               bridge: Math.round(bridge * 100) / 100,
               constraintsSatisfied: constraints.satisfied,
               constraintsTotal: constraints.total,

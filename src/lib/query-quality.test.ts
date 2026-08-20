@@ -28,6 +28,44 @@ const document = (title: string, slug: string, body: string, headings: string[] 
   });
 
 describe("generic query understanding", () => {
+  it("does not flatten a short explicit technology service query into the broad portfolio", () => {
+    const understanding = buildDeterministicUnderstanding("Node.js + services");
+    expect(understanding).toMatchObject({
+      topics: ["node", "js"],
+      requestedContentType: "service",
+      targetScope: "portfolio",
+    });
+    expect(understanding.topics).not.toHaveLength(0);
+  });
+
+  it("keeps content-family words out of product and news topics", () => {
+    expect(buildDeterministicUnderstanding("Kagen platform & products")).toMatchObject({
+      topics: ["kagen"], requestedContentType: "kagen-product",
+    });
+    expect(buildDeterministicUnderstanding("Latest news")).toMatchObject({
+      topics: [], requestedContentType: "news", temporalIntent: "latest",
+    });
+  });
+
+  it("assigns partner identity to authoritative partner pages regardless of service taxonomy", () => {
+    const partner = buildSearchDocument({
+      id: 91, type: "page", slug: "example-cloud-partner",
+      title: { rendered: "Example Cloud Consulting Partner" },
+      link: "https://successive.tech/example-cloud-partner/",
+      acf: { service_type: "Expertise", description: "Formal consulting partnership." },
+    });
+    expect(partner.role).toBe("partner");
+  });
+
+  it("derives product evidence from API launch and product metadata", () => {
+    const launch = buildSearchDocument({
+      id: 92, type: "press-release", slug: "company-launches-orbit-ai",
+      title: { rendered: "Company Launches Orbit AI" },
+      link: "https://successive.tech/press-release/company-launches-orbit-ai/",
+      acf: { body_content: "Orbit AI is an enterprise automation platform." },
+    });
+    expect(launch.productLike).toBe(true);
+  });
   it("treats terse AI prompts as broad AI service discovery", () => {
     expect(isBroadAiServicesQuery("what about ai")).toBe(true);
     expect(isBroadAiServicesQuery("AI")).toBe(true);
@@ -62,6 +100,12 @@ describe("generic query understanding", () => {
     );
     expect(result).toMatchObject({ requestedContentType: "service", topics: [], isBroadQuery: true });
   });
+
+  it("keeps current-affairs, creative, and unrelated coding requests out of retrieval", () => {
+    expect(isDeterministicallyOffTopic("Who is the Prime Minister?")).toBe(true);
+    expect(isDeterministicallyOffTopic("Tell me a joke")).toBe(true);
+    expect(isDeterministicallyOffTopic("Write Python sorting code")).toBe(true);
+  });
   it("keeps intent and topic as separate dimensions", () => {
     expect(buildDeterministicUnderstanding("AI")).toMatchObject({
       intent: "explore",
@@ -79,6 +123,42 @@ describe("generic query understanding", () => {
       .toBeNull();
     expect(buildDeterministicUnderstanding("Tell me about Successive Digital").requestedContentType)
       .toBeNull();
+  });
+
+  it("uses grammatical content-type requests instead of noun presence", () => {
+    expect(buildDeterministicUnderstanding("Our product search is poor").requestedContentType).toBeNull();
+    expect(buildDeterministicUnderstanding("Which offering fits this problem?").requestedContentType).toBeNull();
+    expect(buildDeterministicUnderstanding("Find a cloud cost article").requestedContentType).toBe("blog");
+    expect(buildDeterministicUnderstanding("Show me a product").requestedContentType).toBe("product");
+    expect(detectIntent("application security")).toBe("general");
+  });
+
+  it("extracts controlled problem families and desired outcomes", () => {
+    expect(buildDeterministicUnderstanding("Our monolith is expensive to change")).toMatchObject({
+      intent: "solve_problem",
+      domains: expect.arrayContaining(["application modernization"]),
+      retrievalConcepts: expect.arrayContaining(["legacy modernization"]),
+      desiredOutcomes: expect.arrayContaining(["modernize"]),
+    });
+    expect(buildDeterministicUnderstanding("Editors wait for developers to publish content")).toMatchObject({
+      domains: expect.arrayContaining(["content management"]),
+      retrievalConcepts: expect.arrayContaining(["headless cms"]),
+    });
+    expect(buildDeterministicUnderstanding("Cloud spending has no clear owner")).toMatchObject({
+      retrievalConcepts: expect.arrayContaining(["finops"]),
+    });
+    expect(buildDeterministicUnderstanding("Can you integrate security into CI/CD?")).toMatchObject({
+      retrievalConcepts: expect.arrayContaining(["devsecops"]),
+    });
+  });
+
+  it("recognizes negative premises and broad industry lists", () => {
+    expect(buildDeterministicUnderstanding("You don't build AI systems, right?").containsPremise).toBe(true);
+    const industries = applyStructuralBroadQueryRules(
+      buildDeterministicUnderstanding("Industries focus"),
+      "Industries focus",
+    );
+    expect(industries).toMatchObject({ requestedContentType: "industry", targetScope: "portfolio", topics: [] });
   });
 
   it("keeps pure company discovery separate from company phrasing with a subject", () => {

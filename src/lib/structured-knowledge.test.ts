@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WordPressItem } from "@/types/wordpress";
-import { answerStructuredRequest, understandStructuredRequest } from "./structured-knowledge";
+import { answerStructuredRequest, cleanMediaLabel, understandStructuredRequest } from "./structured-knowledge";
 import { buildSearchDocument } from "./search-index";
 
 const page = (id: number, slug: string, title: string, acf: Record<string, unknown>): WordPressItem => ({
@@ -23,9 +23,17 @@ const corpus: WordPressItem[] = [
   page(3, "partners", "Partners & Alliances", {
     partnerships_repeater: [{ acf_repeater: "Cloud Alliances", partnerships_logos: [{ logo: { url: "https://example.test/partner.svg", alt: "Example Cloud" } }] }],
   }),
+  page(4, "our-culture", "Our Culture", {
+    culture_content: "We support employee learning and workplace inclusion.",
+  }),
 ];
 
 describe("structured API knowledge", () => {
+  it("does not mistake a short office-location phrase for a person name", () => {
+    expect(understandStructuredRequest("Office locations")).toMatchObject({
+      attribute: "global_presence",
+    });
+  });
   it.each([
     ["What are your core values?", "values"],
     ["What is Global Capabilities?", "capabilities"],
@@ -33,6 +41,8 @@ describe("structured API knowledge", () => {
     ["Who is Aarav Malhotraa in Successive?", "person"],
     ["Who is Aarav Malhotraa?", "person"],
     ["Aarav Malhotra", "person"],
+    ["When is appraisal?", "employee_policy"],
+    ["Do you work with Example Runtime?", "technologies"],
   ] as const)("classifies %s", (query, attribute) => {
     expect(understandStructuredRequest(query)?.attribute).toBe(attribute);
   });
@@ -49,6 +59,140 @@ describe("structured API knowledge", () => {
     expect(result?.answer).toBe("**Aarav Malhotra** is listed as **Director of Engineering** in Successive’s executive management section.");
   });
 
+  it.each([
+    ["Executive Management", "Executive One", "#w-tabs-5-data-w-pane-1"],
+    ["Leadership Team", "Leadership One", "#w-tabs-5-data-w-pane-3"],
+  ])(
+    "returns the first three correctly mapped API people with designations for %s",
+    (query, firstExpectedName, expectedAnchor) => {
+      const aboutWithManagement = page(10, "about-us", "About Us", {
+        executive_management: [
+          { name: "Executive One", desgnation: "Chief Revenue Officer" },
+          { name: "Executive Two", desgnation: "Executive Vice President" },
+          { name: "Executive Three", desgnation: "Chief Technology Officer" },
+          { name: "Executive Four", desgnation: "Chief Operating Officer" },
+        ],
+        leadership_team: [
+          { name: "Leadership One", desgnation: "Business Unit Head" },
+          { name: "Leadership Two", desgnation: "Engineering Director" },
+          { name: "Leadership Three", desgnation: "Delivery Director" },
+          { name: "Leadership Four", desgnation: "Practice Head" },
+        ],
+      });
+      const result = answerStructuredRequest(
+        [aboutWithManagement],
+        understandStructuredRequest(query)!,
+      );
+
+      expect(result?.answer).toContain(firstExpectedName);
+      expect(result?.answer).not.toContain(query === "Executive Management" ? "Leadership One" : "Executive One");
+      expect(result?.answer).not.toContain(query === "Executive Management" ? "Executive Four" : "Leadership Four");
+      expect(result?.answer.match(/^- \*\*/gm)).toHaveLength(3);
+      expect(result?.answer).toContain("Showing the first 3 of 4.");
+      expect(result?.answer).toContain("[More](");
+      expect(result?.answer).toContain(expectedAnchor);
+      expect(result?.document.url).toContain(expectedAnchor);
+    },
+  );
+
+  it.each(["ceo", "Current CEO", "chief executive", "Who runs Successive?", "owner", "Who owns Successive?", "founder", "Who founded Successive?"])(
+    "answers %s from Executive Management instead of unrelated retrieval",
+    (query) => {
+    const about = page(13, "about-us", "About Us", {
+      executive_management: [
+        { name: "API Chief", desgnation: "Founder & CEO" },
+        { name: "API Executive", desgnation: "Chief Revenue Officer" },
+      ],
+      leadership_team: [
+        { name: "Delivery Leader", desgnation: "Vice President – Global Delivery" },
+      ],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+
+    expect(result?.answer).toBe("- **API Chief** — Founder & CEO");
+    expect(result?.answer).not.toContain("Delivery Leader");
+    expect(result?.answer).not.toContain("Showing the first 3");
+    expect(result?.document.url).toContain("#w-tabs-5-data-w-pane-1");
+    },
+  );
+
+  it.each([
+    ["managing partner", "Managing Partner"],
+    ["CRO", "Chief Revenue Officer"],
+    ["CTO", "Chief Technology Officer"],
+    ["COO", "Chief Operating Officer"],
+    ["CFO", "Chief Financial Officer"],
+  ])("matches the requested executive designation: %s", (query, designation) => {
+    const about = page(15, "about-us", "About Us", {
+      executive_management: [
+        { name: `${query} Person`, desgnation: designation },
+        { name: "Other Executive", desgnation: "Executive Vice President" },
+      ],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+
+    expect(result?.answer).toContain(`${query} Person`);
+    expect(result?.answer).toContain(designation);
+    expect(result?.answer).not.toContain("Other Executive");
+  });
+
+  it("does not replace a missing requested executive role with arbitrary executives", () => {
+    const about = page(16, "about-us", "About Us", {
+      executive_management: [{ name: "API Chief", desgnation: "Founder & CEO" }],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("CFO")!);
+
+    expect(result?.answer).toContain("couldn’t confirm");
+    expect(result?.answer).not.toContain("API Chief");
+    expect(result?.evidencePaths).toEqual([]);
+  });
+
+  it.each([
+    ["How old is Successive Digital?", "approximately"],
+    ["When was Successive founded?", "founded in **2012**"],
+  ])("answers company-age intent from the published About founding year: %s", (query, expected) => {
+    const about = page(14, "about-us", "About Us", {
+      executive_management: [{ name: "API Chief", desgnation: "Founder & CEO" }],
+      worldwide_footprint: "Founded in 2012, Successive has evolved into a global digital transformation company.",
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+
+    expect(result?.answer).toContain("2012");
+    expect(result?.answer).toContain(expected);
+    expect(result?.answer).not.toMatch(/hybrid app|cloud re-sales/i);
+    expect(result?.document.slug).toBe("about-us");
+  });
+
+  it.each([
+    "How does Successive support global enterprises?",
+    "How do you support international clients?",
+    "What is Successive's global presence?",
+  ])("answers global-enterprise presence from the About worldwide-footprint field: %s", (query) => {
+    const about = page(17, "about-us", "About Us", {
+      executive_management: [{ name: "API Chief", desgnation: "Founder & CEO" }],
+      worldwide_footprint: "Successive operates across seven strategic locations and serves 150+ enterprise clients worldwide.",
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+
+    expect(result?.answer).toContain("seven strategic locations");
+    expect(result?.answer).toContain("150+ enterprise clients");
+    expect(result?.answer).not.toContain("couldn’t confirm the capability");
+    expect(result?.document.slug).toBe("about-us");
+  });
+
+  it.each([
+    ["Board of Directors", "board-directors", "#w-tabs-5-data-w-pane-0"],
+    ["Partners & Advisors", "partners_and_advisors", "#w-tabs-5-data-w-pane-2"],
+  ])("maps %s to its own API field and About tab", (query, field, expectedAnchor) => {
+    const about = page(11, "about-us", "About Us", {
+      [field]: [{ name: `${query} Person`, desgnation: `${query} Role` }],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+
+    expect(result?.answer).toContain(`${query} Person`);
+    expect(result?.document.url).toContain(expectedAnchor);
+  });
+
   it("resolves a bare team-member name from the API record", () => {
     const result = answerStructuredRequest(corpus, understandStructuredRequest("Aarav Malhotra")!);
     expect(result?.answer).toContain("Director of Engineering");
@@ -57,6 +201,11 @@ describe("structured API knowledge", () => {
   it("does not fabricate a record for an unmatched bare name", () => {
     const result = answerStructuredRequest(corpus, understandStructuredRequest("Unknown Person")!);
     expect(result).toBeNull();
+  });
+
+  it("does not confuse an industry relationship with a technology lookup", () => {
+    expect(understandStructuredRequest("Do you work with healthcare companies?")).toBeNull();
+    expect(understandStructuredRequest("Do you use Example Runtime?")?.attribute).toBe("technologies");
   });
 
   it("keeps structured facts within their canonical API pages", () => {
@@ -69,6 +218,62 @@ describe("structured API knowledge", () => {
   });
 
   it("derives authority roles from ACF structure", () => {
-    expect(corpus.map((item) => buildSearchDocument(item)).map(({ role }) => role)).toEqual(["company", "company", "global_capabilities", "partners"]);
+    expect(corpus.map((item) => buildSearchDocument(item)).map(({ role }) => role)).toEqual(["company", "company", "global_capabilities", "partners", "culture"]);
+  });
+
+  it("cleans generic media filenames without inventing a label", () => {
+    expect(cleanMediaLabel("Example-Cloud-logo-final-2.png")).toBe("Example Cloud");
+    expect(cleanMediaLabel("vendor_1699999999999_a3f22d019bc4.svg")).toBe("vendor");
+  });
+
+  it("normalizes bounded common typos for structured catalogs", () => {
+    expect(understandStructuredRequest("parnters")?.attribute).toBe("partners");
+    expect(understandStructuredRequest("tecnologies")?.attribute).toBe("technologies");
+  });
+
+  it("returns a bounded answer when an employee policy is not published", () => {
+    const result = answerStructuredRequest(corpus, understandStructuredRequest("When is appraisal?")!);
+    expect(result?.answer).toContain("couldn’t confirm");
+    expect(result?.answer).not.toMatch(/cloud|CMS|UX project/i);
+    expect(result?.document.role).toBe("culture");
+  });
+
+  it("returns career benefits from the structured advantage slider without media filenames", () => {
+    const careers = page(12, "careers", "Careers", {
+      description: "Join our team.",
+      image_repeater: [{ image: { title: "why-successive1", url: "https://example.test/why-successive1.png" } }],
+      advantage_subtitle: "Successive employees enjoy published workplace benefits.",
+      advantage_slider: [
+        {
+          advantage_image: { title: "rewards", url: "https://example.test/rewards.webp" },
+          advantage_heading: "Rewards & Recognitions",
+          advantage_description: "Monthly and annual employee awards.",
+        },
+        {
+          advantage_heading: "Learning & Development",
+          advantage_description: "A progressive knowledge-sharing culture.",
+        },
+      ],
+    });
+    const result = answerStructuredRequest(
+      [careers],
+      understandStructuredRequest("What career benefits does Successive publish?")!,
+    );
+
+    expect(result?.answer).toContain("Rewards & Recognitions");
+    expect(result?.answer).toContain("Monthly and annual employee awards");
+    expect(result?.answer).toContain("Learning & Development");
+    expect(result?.answer).not.toMatch(/why-successive|rewards\.webp/i);
+    expect(result?.evidencePaths).toEqual(["advantage_subtitle", "advantage_slider"]);
+  });
+
+  it.each(["What is my employee ID?", "Who is my manager?", "What is the CEO personal phone number?"])(
+    "routes private/internal information safely: %s",
+    (query) => expect(understandStructuredRequest(query)?.attribute).toBe("employee_policy"),
+  );
+
+  it("does not classify a project-cost question as company overview", () => {
+    expect(understandStructuredRequest("What is Successive exact chatbot project cost?"))
+      .toBeNull();
   });
 });

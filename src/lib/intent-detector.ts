@@ -105,21 +105,9 @@ export function detectIntent(query: string): Intent {
     /^(?:tell me about|explain|what is) (?:your|the) company[?.!]*$/.test(q)
   )
     return "about";
-  if (
-    includes(q, [
-      "product",
-      "products",
-      "service",
-      "services",
-      "offering",
-      "offerings",
-      "development",
-      "consulting",
-      "solution",
-      "solutions",
-      "platform",
-    ])
-  )
+  if (/\b(?:services?|consulting|development|capabilit(?:y|ies)|solutions?)\b/.test(q) ||
+      /\b(?:show|list|find|explore|what|which)\b.*\bproducts?\b/.test(q) ||
+      /\bkagen(?: add| voice)?\b/.test(q))
     return "products";
   if (
     includes(q, [

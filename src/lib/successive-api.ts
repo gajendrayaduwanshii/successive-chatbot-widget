@@ -32,6 +32,8 @@ const PAGE_SIZE = 100;
 const WORDPRESS_CONCURRENCY = 4;
 const CORPUS_TTL_MS = 5 * 60 * 1000;
 const CORPUS_STALE_MS = 30 * 60 * 1000;
+const CANONICAL_TTL_MS = 5 * 60 * 1000;
+const CANONICAL_STALE_MS = 60 * 60 * 1000;
 
 export interface ContentLoadDiagnostics {
   cache: "hit" | "miss" | "stale";
@@ -45,6 +47,8 @@ let corpusCache:
   | { items: WordPressItem[]; loadedAt: number; diagnostics: ContentLoadDiagnostics }
   | undefined;
 let corpusBuildPromise: Promise<WordPressItem[]> | undefined;
+const canonicalCache = new Map<string, { items: WordPressItem[]; loadedAt: number }>();
+const canonicalRequests = new Map<string, Promise<WordPressItem[]>>();
 let lastDiagnostics: ContentLoadDiagnostics = {
   cache: "miss",
   durationMs: 0,
@@ -175,6 +179,30 @@ async function fetchCollection(
   ];
 }
 
+async function fetchCanonicalPage(slug: string): Promise<WordPressItem[]> {
+  if (process.env.NODE_ENV === "test")
+    return fetchCollection("pages", new URLSearchParams({ slug }));
+  const now = Date.now();
+  const cached = canonicalCache.get(slug);
+  if (cached && now - cached.loadedAt < CANONICAL_TTL_MS) return cached.items;
+  const pending = canonicalRequests.get(slug);
+  if (pending) return cached && now - cached.loadedAt < CANONICAL_STALE_MS
+    ? cached.items
+    : pending;
+  const request = fetchCollection("pages", new URLSearchParams({ slug }))
+    .then((items) => {
+      if (items.length) canonicalCache.set(slug, { items, loadedAt: Date.now() });
+      return items;
+    })
+    .catch((error) => {
+      if (cached && Date.now() - cached.loadedAt < CANONICAL_STALE_MS) return cached.items;
+      throw error;
+    })
+    .finally(() => canonicalRequests.delete(slug));
+  canonicalRequests.set(slug, request);
+  return request;
+}
+
 async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
   const startedAt = Date.now();
   const settled = await mapBounded(
@@ -278,13 +306,16 @@ export async function fetchSuccessive(path: string): Promise<WordPressItem[]> {
   if (search) params.set("search", search);
 
   if (url.pathname.startsWith("/pages/")) {
-    params.set("slug", url.pathname.slice("/pages/".length));
-    return fetchCollection("pages", params);
+    return fetchCanonicalPage(url.pathname.slice("/pages/".length));
   }
   if (url.pathname === "/pages") return fetchCollection("pages", params);
   if (url.pathname === "/posts") return fetchCollection("posts", params);
   const requestedType = url.searchParams.get("type");
   if (requestedType === "post") return fetchCollection("posts", params);
   if (requestedType === "page") return fetchCollection("pages", params);
+  const collection = CONTENT_COLLECTIONS.find((candidate) =>
+    customContentType(candidate) === requestedType || candidate === requestedType,
+  );
+  if (collection) return fetchCollection(collection, params);
   return fetchAllPublishedContent();
 }

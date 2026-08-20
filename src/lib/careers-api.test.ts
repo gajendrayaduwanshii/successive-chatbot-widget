@@ -44,6 +44,8 @@ describe("dynamic Successive career openings", () => {
       .toBe(false);
     expect(isCareerOpeningQuery("What role does cloud play in modernization?"))
       .toBe(false);
+    expect(isCareerOpeningQuery("Which role does AI play in your solutions?"))
+      .toBe(false);
   });
 
   it("returns all jobs for a total-opening question", () => {
@@ -66,5 +68,15 @@ describe("dynamic Successive career openings", () => {
 
   it("returns no matches for unsupported criteria", () => {
     expect(filterCareerJobs(jobs, "Show Golang jobs in Noida")).toEqual([]);
+  });
+
+  it("requires strong skill evidence instead of an incidental long-description mention", () => {
+    const weak: CareerJob = {
+      id: 4,
+      title: "Business Analyst",
+      description: `${"Business analysis and stakeholder coordination. ".repeat(20)} Our company also employs React teams elsewhere.`,
+    };
+    expect(filterCareerJobs([...jobs, weak], "React jobs").map(({ id }) => id))
+      .toEqual([1, 2]);
   });
 });

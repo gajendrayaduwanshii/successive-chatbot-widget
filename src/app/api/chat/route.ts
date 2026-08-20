@@ -28,6 +28,7 @@ import {
   getIndexDiagnostics,
   retrieveFromIndex,
   cardEligibility,
+  type SearchMatch,
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
 import { sanitizeGroundedAnswerOpening } from "@/lib/response-format";
@@ -55,6 +56,7 @@ import {
   isDeterministicallyOffTopic,
   applyStructuralBroadQueryRules,
   shouldUseSemanticUnderstanding,
+  buildRetrievalQuery,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
 import {
@@ -62,6 +64,8 @@ import {
   understandStructuredRequest,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
+import { safeEvidenceResponse, validateEvidence } from "@/lib/evidence-validation";
+import { alignedCta, selectAlignedSecondaryMatches } from "@/lib/response-alignment";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -105,6 +109,13 @@ const error = (
   );
 
 async function fetchStructuredItems(request: StructuredRequest) {
+  if (request.attribute === "employee_policy") {
+    const [culture, careers] = await Promise.all([
+      fetchSuccessive("/pages/our-culture"),
+      fetchSuccessive("/pages/careers"),
+    ]);
+    return [...culture, ...careers];
+  }
   const pageSlug = request.attribute === "capabilities" || request.attribute === "technologies"
     ? "global-capabilities"
     : request.attribute === "partners"
@@ -237,6 +248,41 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
+  if (/\b(?:free trials?|trial availability|free demos?|demo availability|hourly rates?|discounts?)\b/i.test(effectiveMessage)) {
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          answer: "I couldn't confirm published information about that commercial offering from the available Successive content. Availability, pricing, or commercial terms would need to be confirmed directly with Successive through the official contact channel.",
+          cards: [],
+          sources: [],
+          suggestions: ["Contact Successive", "Explore Successive services"],
+          confidence: "high",
+          insufficientContext: true,
+        },
+      },
+      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+    );
+  }
+  if (
+    parsed.data.history.length === 0 &&
+    /^(?:how long|how much|when|where|who|what about that|can you do it|tell me more|what will it cost|how quickly can you finish)[?.!\s]*$/i.test(effectiveMessage.trim())
+  ) {
+    return NextResponse.json(
+      {
+        success: true,
+        data: {
+          answer: "What subject or project are you asking about? Please add a little context so I can check the relevant Successive information.",
+          cards: [],
+          sources: [],
+          suggestions: buildRelatedSuggestions("general"),
+          confidence: "low",
+          insufficientContext: true,
+        },
+      },
+      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+    );
+  }
   const structuredRequest = understandStructuredRequest(effectiveMessage);
   if (structuredRequest) {
     try {
@@ -246,12 +292,13 @@ export async function POST(request: NextRequest) {
       );
       if (structuredAnswer) {
         const { document } = structuredAnswer;
+        const suppressUnsupportedCard = structuredAnswer.evidencePaths.length === 0;
         return NextResponse.json(
           {
             success: true,
             data: {
               answer: structuredAnswer.answer,
-              cards: [{
+              cards: suppressUnsupportedCard ? [] : [{
                 type: "page" as const,
                 title: document.title,
                 description: (
@@ -263,15 +310,17 @@ export async function POST(request: NextRequest) {
                 image: document.image,
                 badge: document.role.replace(/_/g, " "),
               }],
-              sources: [{ title: document.title, url: document.url }],
+              sources: suppressUnsupportedCard ? [] : [{ title: document.title, url: document.url }],
               suggestions: structuredAnswer.suggestions,
               confidence: "high",
-              insufficientContext: false,
-              diagnostics: {
-                route: "structured_api",
-                companyAttribute: structuredRequest.attribute,
-                evidencePaths: structuredAnswer.evidencePaths,
-              },
+              insufficientContext: suppressUnsupportedCard,
+              ...(process.env.NODE_ENV !== "production" ? {
+                diagnostics: {
+                  route: "structured_api",
+                  companyAttribute: structuredRequest.attribute,
+                  evidencePaths: structuredAnswer.evidencePaths,
+                },
+              } : {}),
             },
           },
           { headers: { ...cors.headers, "Cache-Control": "no-store" } },
@@ -284,6 +333,10 @@ export async function POST(request: NextRequest) {
   }
   const deterministicUnderstanding =
     buildDeterministicUnderstanding(effectiveMessage);
+  const deterministicWithContext = resolveConversationUnderstanding(
+    deterministicUnderstanding,
+    parsed.data.history.slice(-8),
+  ).understanding;
   let understanding: QueryUnderstanding = deterministicUnderstanding;
   if (
     getEnv().AI_API_KEY &&
@@ -310,10 +363,33 @@ export async function POST(request: NextRequest) {
   // thought-leadership, service, or case-study-only search.
   understanding = {
     ...understanding,
-    intent: ["solve_problem", "recommendation"].includes(deterministicUnderstanding.intent)
+    intent: deterministicUnderstanding.containsPremise || ["solve_problem", "recommendation"].includes(deterministicUnderstanding.intent)
       ? deterministicUnderstanding.intent
       : understanding.intent,
     businessProblem: deterministicUnderstanding.businessProblem ?? understanding.businessProblem,
+    topics: deterministicUnderstanding.topics.length === 0 && parsed.data.history.length
+      ? deterministicWithContext.topics
+      : [...new Set([
+          ...deterministicUnderstanding.topics,
+          ...understanding.topics,
+        ])].slice(0, 8),
+    desiredOutcomes: [...new Set([
+      ...deterministicWithContext.desiredOutcomes,
+      ...understanding.desiredOutcomes,
+    ])].slice(0, 8),
+    domains: [...new Set([
+      ...deterministicWithContext.domains,
+      ...understanding.domains,
+    ])].slice(0, 8),
+    technicalSignals: [...new Set([
+      ...deterministicWithContext.technicalSignals,
+      ...understanding.technicalSignals,
+    ])].slice(0, 10),
+    retrievalConcepts: [...new Set([
+      ...deterministicWithContext.retrievalConcepts,
+      ...understanding.retrievalConcepts,
+    ])].slice(0, 12),
+    industry: deterministicUnderstanding.industry ?? understanding.industry,
     requestedContentType: deterministicUnderstanding.requestedContentType,
     targetScope: deterministicUnderstanding.targetScope !== "topic"
       ? deterministicUnderstanding.targetScope
@@ -339,9 +415,16 @@ export async function POST(request: NextRequest) {
     ),
     ...contentIdentitiesFromAssistantHistory(parsed.data.history),
   ]);
+  const premiseVerificationQuery = understanding.containsPremise
+    ? normalizeSearchText(effectiveMessage)
+        .replace(/\b(?:successive|digital|you|your|have|has|does|do|is|are|cannot|can|not|no|only|right|correct|it|unrelated|to)\b/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    : "";
   const contextualQuery =
     buildRelatedServiceRetrievalQuery(effectiveMessage, parsed.data.history) ??
-    buildConversationRetrievalQuery(effectiveMessage, parsed.data.history);
+    (premiseVerificationQuery || buildRetrievalQuery(understanding) ||
+      buildConversationRetrievalQuery(effectiveMessage, parsed.data.history));
   const retrievalMessage = isVagueBusinessDiscovery(contextualQuery)
     ? "digital transformation digital engineering cloud data artificial intelligence experience design services"
     : contextualQuery;
@@ -833,14 +916,48 @@ export async function POST(request: NextRequest) {
       effectiveMessage,
     );
     const exactNamedResource = namedResourceSubject
-      ? initiallySelectedMatches.find(
-          ({ document }) =>
-            document.normalizedTitle === namedResourceSubject ||
-            document.normalizedTitle.includes(namedResourceSubject) ||
-            namedResourceSubject.includes(document.normalizedTitle),
-        )
+      ? initiallySelectedMatches.find(({ document }) => {
+          const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
+          return document.normalizedTitle === namedResourceSubject ||
+            slug === namedResourceSubject || document.aliases.includes(namedResourceSubject);
+        }) ?? initiallySelectedMatches.find(({ document }) => {
+          const subjectTerms = new Set(namedResourceSubject.split(" "));
+          const titleTerms = new Set(document.normalizedTitle.split(" "));
+          const overlap = [...subjectTerms].filter((term) => titleTerms.has(term)).length;
+          const subjectCoverage = overlap / Math.max(subjectTerms.size, 1);
+          const symmetricCoverage = overlap / Math.max(subjectTerms.size, titleTerms.size, 1);
+          return symmetricCoverage >= 0.88 ||
+            (subjectTerms.size >= 2 && subjectCoverage >= 0.8 && document.normalizedTitle.includes(namedResourceSubject));
+        })
       : undefined;
-    const selectedMatches = exactNamedResource
+    if (namedResourceSubject && !exactNamedResource) {
+      const related = initiallySelectedMatches.slice(0, 2);
+      const alternatives = related.length
+        ? ` Related published items include: ${related.map(({ document }) => `[${document.title}](${document.url})`).join("; ")}.`
+        : "";
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: `I couldn't find that exact published item in the available Successive content.${alternatives}`,
+            cards: related.map(({ document, selectedPassages }) => ({
+              type: cardType(document.type),
+              title: document.title,
+              description: bestStoryDescription(document, selectedPassages),
+              url: document.url,
+              image: document.image,
+              badge: document.type,
+            })),
+            sources: related.map(({ document }) => ({ title: document.title, url: document.url })),
+            suggestions: buildRelatedSuggestions("general"),
+            confidence: "low",
+            insufficientContext: true,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
+    let selectedMatches = exactNamedResource
       ? [exactNamedResource]
       : initiallySelectedMatches;
     // Preserve relevance order for semantic/problem discovery. Collection
@@ -866,6 +983,57 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    const evidenceValidation = validateEvidence({
+      message: effectiveMessage,
+      contextMessage: retrievalMessage,
+      understanding,
+      matches: selectedMatches,
+      hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
+    });
+    if (["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: safeEvidenceResponse(evidenceValidation),
+            cards: [],
+            sources: [],
+            suggestions: buildRelatedSuggestions("general"),
+            confidence: "low",
+            insufficientContext: true,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
+    if (evidenceValidation.status === "PARTIALLY_SUPPORTED") {
+      const related = evidenceValidation.accepted[0];
+      return NextResponse.json(
+        {
+          success: true,
+          data: {
+            answer: safeEvidenceResponse(evidenceValidation),
+            cards: related ? [{
+              type: cardType(related.document.type),
+              title: related.document.title,
+              description: bestStoryDescription(related.document, related.selectedPassages),
+              url: related.document.url,
+              image: related.document.image,
+              badge: related.document.role.replace(/_/g, " "),
+            }] : [],
+            sources: related ? [{ title: related.document.title, url: related.document.url }] : [],
+            suggestions: buildRelatedSuggestions("general", related?.document.title),
+            confidence: "medium",
+            insufficientContext: true,
+          },
+        },
+        { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      );
+    }
+    const validatedMatches = evidenceValidation.accepted.length
+      ? evidenceValidation.accepted
+      : selectedMatches;
+    selectedMatches = validatedMatches;
     const topScore = selectedMatches[0]?.score ?? 0;
     const isWhitepaperQuery =
       /\b(?:white ?papers?|whitepepers?|whtieperpers?)\b/i.test(
@@ -876,9 +1044,10 @@ export async function POST(request: NextRequest) {
       /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
     const isExplicitCollectionQuery =
       retrieval.collectionTotal !== undefined &&
-      /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
+      (understanding.answerMode === "list" ||
+        /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage));
     if (isExplicitCollectionQuery) {
-      const presented = selectedMatches.slice(0, 15);
+      const presented = validatedMatches.slice(0, 15);
       const total = retrieval.collectionTotal ?? presented.length;
       const label = retrieval.collectionLabel ?? "items";
       return NextResponse.json(
@@ -907,8 +1076,17 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    const preGenerationAlignment = selectAlignedSecondaryMatches({
+      matches: validatedMatches,
+      understanding,
+      limit: 4,
+    });
+    const contextMatches = preGenerationAlignment.primary
+      ? [preGenerationAlignment.primary, ...preGenerationAlignment.related]
+      : validatedMatches.slice(0, 1);
+    selectedMatches = contextMatches;
     const contextStartedAt = performance.now();
-    const context: NormalizedContent[] = selectedMatches.map(
+    const context: NormalizedContent[] = contextMatches.map(
       ({ document, selectedPassages }) => ({
         id: document.id,
         type: document.type,
@@ -1004,12 +1182,25 @@ export async function POST(request: NextRequest) {
       : isBroadAiServicesQuery(effectiveMessage)
         ? ensureCategoryHeading(directlyAnswered, "Successive AI Services")
         : directlyAnswered;
-    const finalAnswer = categoryAnswer;
-    const cardMatches = selectedMatches.filter((match) =>
+    const alignment = selectAlignedSecondaryMatches({
+      matches: selectedMatches,
+      understanding,
+      limit: 2,
+    });
+    const alignedMatches = [alignment.primary, ...alignment.related].filter(
+      (match): match is SearchMatch => Boolean(match),
+    );
+    const cta = alignedCta(alignment.primary, understanding);
+    const finalAnswer = cta && !categoryAnswer.includes(alignment.primary?.document.url ?? "")
+      ? `${categoryAnswer.trim()}\n\n${cta}`
+      : categoryAnswer;
+    const cardMatches = alignedMatches.filter((match) =>
       cardEligibility(match, understanding, topScore).accepted,
     );
     const presentedMatches =
-      isWhitepaperCollectionQuery && selectedMatches.length <= 15
+      exactNamedResource
+        ? [exactNamedResource]
+        : isWhitepaperCollectionQuery && selectedMatches.length <= 15
         ? selectedMatches
         : cardMatches.slice(0, 3);
     const response = {
@@ -1143,10 +1334,21 @@ function buildUseCaseHeading(message: string): string {
 }
 
 function extractNamedResourceSummarySubject(message: string): string | null {
-  const match = message.match(
-    /^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)\s+['“\"]?(.+?)['”\"]?[?.!]*$/i,
+  const quoted = message.match(/['“"]([^'”"]{3,200})['”"]/i)?.[1];
+  if (quoted) return normalizeSearchText(quoted);
+  const explicitlyNamed = message.match(
+    /\b(?:called|named|titled)\s+(.+?)(?:\s+(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology))?[?.!]*$/i,
+  )?.[1];
+  if (explicitlyNamed) return normalizeSearchText(explicitlyNamed);
+  if (!/^(?:summarize|summarise|give me a summary of)\b/i.test(message.trim())) return null;
+  const prefixType = message.match(
+    /^(?:(?:summarize|summarise|give me a summary of|tell me about|show me)\s+)?(?:the\s+)?(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology)\s+(?:called|named|titled)?\s*['“\"]?(.+?)['”\"]?[?.!]*$/i,
   );
-  return match?.[1] ? normalizeSearchText(match[1]) : null;
+  const suffixType = message.match(
+    /^(?:(?:summarize|summarise|give me a summary of|tell me about|show me)\s+)?['“\"]?(.+?)['”\"]?\s+(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology)[?.!]*$/i,
+  );
+  const subject = prefixType?.[1] ?? suffixType?.[1];
+  return subject ? normalizeSearchText(subject) : null;
 }
 
 function exhaustedResultsData() {

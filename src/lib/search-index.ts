@@ -150,6 +150,7 @@ export function normalizeSearchText(value: string): string {
 
 function documentRole(item: WordPressItem, slug: string, serviceType?: string): SuccessiveSearchDocument["role"] {
   const type = item.type ?? "page";
+  const identity = normalizeSearchText(`${typeof item.title === "string" ? item.title : item.title?.rendered ?? ""} ${slug}`);
   const normalizedService = normalizeSearchText(serviceType ?? "");
   const acf = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
     ? item.acf as Record<string, unknown>
@@ -163,6 +164,7 @@ function documentRole(item: WordPressItem, slug: string, serviceType?: string): 
   if (slug === "contact") return "contact";
   if (type.includes("case")) return "case_study";
   if (type === "post") return "blog";
+  if (type === "page" && /\b(?:partner|partnership|alliance)\b/.test(identity)) return "partner";
   if (type === "press-release") return "press_release";
   if (type === "product") return "product";
   if (type === "award") return "awards";
@@ -401,7 +403,12 @@ export function buildSearchDocument(
     )
     .map((token) => token[0])
     .join("");
-  const explicitAcronyms = [...headings, ...descriptions, ...textSegments]
+  const titleAcronyms = titleTokens.flatMap((_, start) =>
+    Array.from({ length: Math.min(5, titleTokens.length - start) - 1 }, (__, offset) =>
+      titleTokens.slice(start, start + offset + 2).map((token) => token[0]).join(""),
+    ),
+  ).filter((value) => value.length >= 3 && value.length <= 5);
+  const explicitAcronyms = headings
     .flatMap((text) => text.match(/\b[A-Z]{3,6}\b/g) ?? [])
     .filter((value) => !["FAQ", "HTML", "HTTPS"].includes(value));
   const aliases = deduplicateSegments([
@@ -410,6 +417,7 @@ export function buildSearchDocument(
     named ? `successive ${named}` : "",
     named ?? "",
     acronym.length >= 3 && acronym.length <= 6 ? acronym : "",
+    ...titleAcronyms,
     ...explicitAcronyms,
   ]).map(normalizeSearchText);
   const fieldNames =
@@ -441,6 +449,9 @@ export function buildSearchDocument(
   ]);
   const productLike =
     item.type === "product" ||
+    ((item.type === "press-release" || item.type === "media-coverage") &&
+      (/\b(?:launches?|unveils?|introduces?)\b/.test(normalizedTitle) ||
+        /\b(?:product|platform)\b/.test(combinedText))) ||
     (item.type === "page" &&
       (/product|platform/i.test(`${title} ${item.slug} ${fieldNames}`) ||
         /content intelligence platform/i.test(combinedText)));
@@ -484,7 +495,7 @@ export function buildSearchDocument(
     image:
       normalizeWordPressUrl(featured ?? extracted.images[0]?.url ?? "") ||
       undefined,
-    modified: item.modified ?? item.date,
+    modified: item.date ?? item.modified,
     contentQuality,
     productLike,
     service_type: serviceType,

@@ -1,20 +1,8 @@
 import { normalizeSearchText } from "./search-index";
 import type { Intent } from "./intent-detector";
+import { buildDeterministicUnderstanding, buildRetrievalQuery } from "./query-understanding";
 
 type HistoryMessage = { role: "user" | "assistant"; content: string };
-
-const CONTEXTUAL_FOLLOW_UP =
-  /\b(?:that|this|it|these|those|them|first one|second one|another|another one|similar|example|case stud(?:y|ies)|article|blog|webinar|event|service|services|serivce|serivces|recommend|suggest|implement|more detail|tell me more|explain more|simpler|what about|how does|what should i do next)\b/i;
-const EXPLICIT_TOPIC_SWITCH =
-  /\b(?:actually|instead|switch(?:ing)? to|more interested in|new topic)\b/i;
-const SELF_CONTAINED_TOPIC =
-  /\b(?:(?:all|total|list|count|how many)\s+(?:services?|white ?papers?|whitepepers?|whtieperpers?|webinars?|events?|case studies|blogs?|industries|accelerators?|expertise|pillars?)|white ?papers?|whitepepers?|whtieperpers?|ai (?:services?|solutions?|consulting)|artificial intelligence (?:services?|solutions?|consulting)|cloud (?:services?|solutions?|migration)|migrate (?:to )?(?:aws|azure|cloud)|full[ -]?stack development|location intelligence|arcgis|gis|retail business|healthcare solutions?)\b/i;
-
-// Suggestion chips often use "Tell me more about <published title>". The
-// explicit title is a complete new retrieval subject, not a pronoun-based
-// follow-up that should inherit every earlier user query.
-const EXPLICIT_NAMED_SUBJECT =
-  /^(?:tell me more about|tell me about|explain|show me)\s+(?!this\b|that\b|it\b|the (?:first|second|next) one\b).{8,}$/i;
 
 export function asksForAnotherResult(message: string): boolean {
   const normalized = normalizeSearchText(message);
@@ -105,40 +93,23 @@ export function buildConversationRetrievalQuery(
   history: HistoryMessage[],
 ): string {
   const clean = message.trim();
-  if (
-    !clean ||
-    EXPLICIT_TOPIC_SWITCH.test(clean) ||
-    SELF_CONTAINED_TOPIC.test(clean) ||
-    EXPLICIT_NAMED_SUBJECT.test(clean)
-  )
+  if (!clean) return clean;
+  const current = buildDeterministicUnderstanding(clean);
+  // Any explicit current subject wins. This also preserves intentional
+  // comparisons/relationships because every current subject stays in the
+  // current plan while no older subject is introduced.
+  if (current.topics.length || current.entities.length || current.industry)
     return clean;
-  let userHistory = history
+  const prior = history
     .filter((item) => item.role === "user")
-    .map((item) => item.content.trim())
-    .filter(Boolean);
-  const lastSwitch = userHistory.findLastIndex((item) =>
-    EXPLICIT_TOPIC_SWITCH.test(item),
-  );
-  if (lastSwitch >= 0) {
-    userHistory = userHistory.slice(lastSwitch);
-    userHistory[0] = userHistory[0]
-      .replace(/^.*?\b(?:more interested in|switch(?:ing)? to|instead)\s+/i, "")
-      .replace(/[.!?]+$/, "")
-      .trim();
-  }
-  userHistory = userHistory.filter(
-    (item) =>
-      !/^(?:any |do you have (?:any )?)?(?:webinar|webinars|event|events)\??$/i.test(
-        item,
-      ) && !/^(?:that sounds useful|okay|thanks|thank you)[.!]?$/i.test(item),
-  );
-  userHistory = userHistory.slice(-4);
-  if (!userHistory.length) return clean;
-  // A short named topic such as "Innovation" or "Digital Transformation"
-  // must be searched on its own. Only short messages containing an actual
-  // referential/follow-up term inherit history.
-  if (!CONTEXTUAL_FOLLOW_UP.test(clean)) return clean;
-  return [...userHistory, clean].join(". ");
+    .map((item) => buildDeterministicUnderstanding(item.content))
+    .findLast((candidate) => candidate.topics.length || candidate.entities.length || candidate.industry);
+  if (!prior) return clean;
+  const inheritedSubject = buildRetrievalQuery({
+    ...prior,
+    requestedContentType: current.requestedContentType ?? prior.requestedContentType,
+  });
+  return inheritedSubject ? `${inheritedSubject} ${clean}`.trim() : clean;
 }
 
 export function isVagueBusinessDiscovery(query: string): boolean {

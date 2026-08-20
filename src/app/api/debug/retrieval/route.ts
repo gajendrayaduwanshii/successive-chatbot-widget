@@ -6,6 +6,7 @@ import { detectIntent } from "@/lib/intent-detector";
 import { getEnv } from "@/lib/env";
 import { getLLMProvider } from "@/lib/llm";
 import { buildDeterministicUnderstanding } from "@/lib/query-understanding";
+import { validateEvidence } from "@/lib/evidence-validation";
 
 export const dynamic = "force-dynamic";
 const schema = z.object({
@@ -66,6 +67,12 @@ export async function POST(request: NextRequest) {
     const selectedIds = new Set(
       result.matches.map(({ document }) => `${document.type}:${document.id}`),
     );
+    const evidenceValidation = validateEvidence({
+      message: parsed.data.query,
+      understanding,
+      matches: result.matches,
+      hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
+    });
     return NextResponse.json({
       originalQuery: parsed.data.query,
       normalizedQuery: result.normalizedQuery,
@@ -77,6 +84,18 @@ export async function POST(request: NextRequest) {
         index: getIndexDiagnostics(),
       },
       reliableMatchFound: result.reliableMatchFound,
+      evidenceValidation: {
+        status: evidenceValidation.status,
+        confidence: evidenceValidation.confidence,
+        requestedAttribute: evidenceValidation.requestedAttribute,
+        subject: evidenceValidation.subject,
+        reason: evidenceValidation.reason,
+        accepted: evidenceValidation.accepted.map(({ document }) => ({
+          title: document.title,
+          url: document.url,
+        })),
+        rejected: evidenceValidation.rejected,
+      },
       confidence:
         (result.matches[0]?.score ?? 0) >= 140
           ? "high"

@@ -30,7 +30,8 @@ export function isCareerOpeningQuery(message: string): boolean {
   const employment = /\b(?:job|jobs|opening|openings|open role|open roles|vacanc(?:y|ies)|hiring|career opportunit(?:y|ies))\b/i;
   const employmentPosition = /\b(?:position|positions|role|roles)\b/i;
   const application = /\b(?:apply|application)\b/i;
-  const softwareContext = /\b(?:software|web|mobile|cloud|enterprise|moderniz|development|architecture|system|platform)\b/i;
+  const softwareContext = /\b(?:ai|artificial intelligence|software|web|mobile|cloud|enterprise|moderniz|development|architecture|system|platform|solution)\b/i;
+  if (/\b(?:what|which)\s+role\s+(?:does|do|can)\b/i.test(message)) return false;
   return employment.test(message) ||
     (employmentPosition.test(message) && !softwareContext.test(message)) ||
     (application.test(message) && (
@@ -78,20 +79,22 @@ const QUERY_NOISE = new Set([
   "which", "with", "you", "your",
 ]);
 
-function searchableJobText(job: CareerJob): string {
+function strongJobSkillText(job: CareerJob): string {
+  const description = htmlToText(job.description ?? job.excerpt ?? "");
+  const explicitSections = description
+    .split(/(?:requirements?|skills?|technologies|tech stack|qualification)s?\s*:/i)
+    .slice(1)
+    .join(" ");
   return normalizeSearchText([
     job.title,
     job.departmentName,
-    job.experience,
     ...(job.skillNames ?? []),
-    ...(job.jobLocations ?? []).flatMap((location) => [
-      location.name,
-      location.city,
-      location.state,
-      location.countryName,
-    ]),
-    htmlToText(job.description ?? job.excerpt ?? ""),
+    explicitSections || (description.length <= 600 ? description : ""),
   ].filter(Boolean).join(" "));
+}
+
+function searchableJobText(job: CareerJob): string {
+  return normalizeSearchText([strongJobSkillText(job), htmlToText(job.description ?? job.excerpt ?? "")].join(" "));
 }
 
 export function filterCareerJobs(jobs: CareerJob[], message: string): CareerJob[] {
@@ -136,8 +139,13 @@ export function filterCareerJobs(jobs: CareerJob[], message: string): CareerJob[
   );
   if (!terms.length) return experienceFiltered;
   return experienceFiltered.filter((job) => {
-    const text = searchableJobText(job);
-    return terms.every((term) => ` ${text} `.includes(` ${term} `));
+    const generalText = searchableJobText(job);
+    const strongText = strongJobSkillText(job);
+    return terms.every((term) => {
+      const requestedAsSkill = /^(?:react|angular|vue|node|nodejs|python|java|golang|dotnet|net|php|flutter|qa|devops|aws|azure|gis)$/.test(term);
+      const evidence = requestedAsSkill ? strongText : generalText;
+      return ` ${evidence} `.includes(` ${term} `);
+    });
   });
 }
 

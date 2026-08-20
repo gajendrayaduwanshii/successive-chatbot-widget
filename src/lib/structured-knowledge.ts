@@ -3,10 +3,10 @@ import { buildSearchDocument, normalizeSearchText, type SuccessiveSearchDocument
 import type { WordPressItem } from "@/types/wordpress";
 
 export type StructuredAttribute =
-  | "company_overview" | "values" | "leadership" | "executives" | "board"
+  | "company_overview" | "founded" | "values" | "leadership" | "executives" | "board"
   | "advisors" | "certifications" | "global_presence" | "capabilities"
   | "technologies" | "culture" | "career_benefits" | "partners" | "awards"
-  | "person";
+  | "employee_policy" | "person";
 
 export interface StructuredRequest {
   attribute: StructuredAttribute;
@@ -36,7 +36,8 @@ const queryNoise = /\b(?:what|which|who|where|when|why|how|is|are|was|were|do|do
 export function normalizeVisitorQuery(message: string): string {
   const vocabulary = new Map([
     ["abot", "about"], ["bussiness", "business"], ["capabilites", "capabilities"],
-    ["valus", "values"], ["parnership", "partnership"],
+    ["valus", "values"], ["parnership", "partnership"], ["parnters", "partners"],
+    ["tecnologies", "technologies"], ["succesive", "successive"],
     ["modernisation", "modernization"], ["ur", "your"], ["u", "you"],
   ]);
   return normalizeSearchText(message).split(" ")
@@ -61,25 +62,31 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     bareNameCandidate;
   const personTokens = personCandidate?.split(" ").filter(Boolean) ?? [];
   const person = personTokens.length >= 2 && personTokens.length <= 5 &&
-    !/\b(?:what|which|who|where|how|tell|show|list|company|values?|ceo|founder|leader|leadership|board|director|executive|services?|capabilities|technologies|partner|culture|career|awards?)\b/.test(personCandidate ?? "")
+    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?)\b/.test(personCandidate ?? "")
     ? personCandidate
     : undefined;
   let attribute: StructuredAttribute | undefined;
-  if (person) attribute = "person";
+  if (/\b(?:appraisals?|performance reviews?|promotion|salary|hike|bonus|leave|notice period|probation|attendance|employee id|my manager|personal (?:phone|address)|private|confidential|internal .*?(?:forecast|policy|record)|absent today)\b/.test(q)) attribute = "employee_policy";
+  else if (person) attribute = "person";
   else if (/\b(?:core values?|values?|principles?)\b/.test(q)) attribute = "values";
   else if (/\b(?:certifications?|standards?|compliance|accreditation)\b/.test(q)) attribute = "certifications";
   else if (/\b(?:board(?: of directors)?|board members?)\b/.test(q)) attribute = "board";
   else if (/\b(?:executives?|executive management|management team)\b/.test(q)) attribute = "executives";
   else if (/\b(?:advisors?|partners and advisors)\b/.test(q)) attribute = "advisors";
-  else if (/\b(?:ceo|founder|leadership|leaders?|who leads)\b/.test(q)) attribute = "leadership";
-  else if (/\b(?:headquarters|offices?|worldwide footprint|global presence|company locations?|operate globally)\b/.test(q) && !/\b(?:gis|arcgis|location intelligence|site selection|spatial)\b/.test(q)) attribute = "global_presence";
+  else if (q === "owner" || /\b(?:ceo|chief executive(?: officer)?|founder|who owns(?: successive| the company)?|owner(?:ship)? of (?:successive|the company)|who founded|founded by|who runs|company head|head of (?:successive|the company)|managing partner|cro|chief revenue officer|cto|chief technology officer|coo|chief operating officer|cfo|chief financial officer|leadership|leaders?|who leads)\b/.test(q)) attribute = "leadership";
+  else if (/\b(?:how old|founded|founding year|established|started|company age|company history|history of successive|get started)\b/.test(q)) attribute = "founded";
+  else if (/\b(?:headquarters|\bhq\b|main office|offices?|worldwide footprint|global footprint|global presence|presence outside|global enterprises?|global clients?|international clients?|company locations?|operate globally|operates? (?:in|outside)|support global|team in india|india (?:office|operations?|presence|contact)|us only|only (?:in )?(?:the )?us)\b/.test(q) && !/\b(?:gis|arcgis|location intelligence|site selection|spatial)\b/.test(q)) attribute = "global_presence";
   else if (/\b(?:work culture|workplace|life at successive|employee culture|inclusive workplace|continuous learning|employee growth)\b/.test(q)) attribute = "culture";
   else if (/\b(?:employee benefits?|career benefits?|perks?|rewards and recognitions?|learning and development|why (?:join|work at) successive|successive careers|career page)\b/.test(q) && !/\b(?:job|opening|vacancy|hiring|apply)\b/.test(q)) attribute = "career_benefits";
   else if (/\b(?:partners?|partnerships?|alliances?|partner ecosystem)\b/.test(q)) attribute = "partners";
   else if (/\b(?:awards?|recognitions?|achievements?)\b/.test(q)) attribute = "awards";
-  else if (/\b(?:technologies|technology stack|tech stack|programming languages?|frameworks?|devops tools?|automation tools?|frontend|backend|mobile technologies)\b/.test(q) || /^do you use [a-z0-9.+# -]+\??$/.test(q)) attribute = "technologies";
+  else if (/\b(?:technologies|technology stack|tech stack|programming languages?|frameworks?|devops tools?|automation tools?|frontend|backend|mobile technologies)\b/.test(q) || (
+    /^(?:do you (?:use|work with)|can (?:you|successive) build (?:with|using)) [a-z0-9.+# -]+\??$/.test(q) &&
+    !/\b(?:companies|businesses|organizations|organisations|industry|sector)\b/.test(q)
+  )) attribute = "technologies";
   else if (/\b(?:global capabilities|technical capabilities|technical expertise|ai capabilities|digital experience capabilities|creative capabilities|devops capabilities|automation capabilities|your capabilities)\b/.test(q)) attribute = "capabilities";
-  else if (/\b(?:what is successive|what does successive|about successive|company info|kind of company)\b/.test(q)) attribute = "company_overview";
+  else if (/^(?:what is successive(?: digital)?|what does successive(?: digital)? do|tell me about successive(?: digital)?|about successive(?: digital)?|company info(?:rmation)?|what kind of company is successive(?: digital)?)\??$/.test(q) ||
+    /\b(?:successive advantage|what makes successive different|company differentiators?|why (?:choose|successive))\b/.test(q)) attribute = "company_overview";
   if (!attribute) return null;
   return { attribute, mode, subject: person ?? subject, normalizedQuery: q };
 }
@@ -120,12 +127,50 @@ function valueFrom(source: Record<string, unknown>, keys: string[]): string {
   return "";
 }
 
+function sectionCompanionText(value: unknown, headingPattern: RegExp): string[] {
+  if (Array.isArray(value)) return value.flatMap((item) => sectionCompanionText(item, headingPattern));
+  const source = record(value);
+  if (!source) return [];
+  const entries = Object.entries(source);
+  const results: string[] = [];
+  for (const [key, candidate] of entries) {
+    const heading = text(candidate);
+    if (!heading || !headingPattern.test(heading)) continue;
+    const suffix = key.match(/\d+$/)?.[0] ?? "";
+    const prefix = key.replace(/(?:heading|title)\d*$/i, "");
+    const companionKeys = [
+      `${prefix}description${suffix}`, `${prefix}content${suffix}`, `${prefix}text${suffix}`,
+      `description${suffix}`, `content${suffix}`, `text${suffix}`, `sub_heading${suffix}`, `sub-heading${suffix}`,
+    ];
+    const companion = valueFrom(source, companionKeys);
+    if (companion) results.push(companion);
+  }
+  return [...results, ...entries.flatMap(([, child]) => sectionCompanionText(child, headingPattern))];
+}
+
+export function cleanMediaLabel(value: string): string {
+  return decodeEntities(value)
+    .replace(/^https?:\/\/[^/]+\//i, "")
+    .replace(/\?.*$/, "")
+    .replace(/\.(?:avif|gif|jpe?g|png|svg|webp)$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b[0-9a-f]{10,}\b/gi, "")
+    .replace(/\b(?:1[5-9]|2[0-9])\d{8,}\b/g, "")
+    .replace(/\b(?:logo|image|asset|file|final|copy|scaled)(?:\s+\d+)?\b/gi, "")
+    .replace(/\s*\(\s*\d+\s*\)\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function mediaLabel(value: unknown): string {
   const source = record(value);
   if (!source) return "";
-  return valueFrom(source, ["alt", "caption", "title", "name"])
-    .replace(/[_-]+/g, " ").replace(/\s+logo(?:file)?\b/gi, "")
-    .replace(/\blogo\b/gi, "").replace(/\s+/g, " ").trim();
+  const candidates = ["alt", "caption", "title", "name", "filename", "url"]
+    .map((key) => cleanMediaLabel(text(source[key])))
+    .filter(Boolean);
+  return candidates.find((candidate) =>
+    /[a-z]{2,}/i.test(candidate) && !/^(?:img|image|asset|untitled|logo)\s*\d*$/i.test(candidate),
+  ) ?? candidates[0] ?? "";
 }
 
 function nestedMediaLabels(value: unknown): string[] {
@@ -135,6 +180,13 @@ function nestedMediaLabels(value: unknown): string[] {
   const direct = mediaLabel(source);
   if (source.url && direct) return [direct];
   return Object.values(source).flatMap(nestedMediaLabels);
+}
+
+function cleanCatalogLabels(values: string[]): string[] {
+  return [...new Set(values.map((value) => cleanMediaLabel(value)))]
+    .filter(Boolean)
+    .filter((value) => !/\b(?:wp content|uploads?|vector|logo ?file|new project|make it|owesome)\b|poop|https?:|[/\\]/i.test(value))
+    .filter((value) => value.length <= 80);
 }
 
 function editDistance(left: string, right: string): number {
@@ -169,12 +221,37 @@ export function answerStructuredRequest(
   request: StructuredRequest,
 ): StructuredAnswer | null {
   const company = roleDocument(items, "company");
-  if (["company_overview", "values", "leadership", "executives", "board", "advisors", "certifications", "global_presence", "person"].includes(request.attribute)) {
+  if (["company_overview", "founded", "values", "leadership", "executives", "board", "advisors", "certifications", "global_presence", "person"].includes(request.attribute)) {
     if (!company) return null;
     const { item, document } = company;
     if (request.attribute === "company_overview") {
-      const overview = document.descriptions.slice(0, 3).join("\n\n");
+      const asksDifferentiator = /\b(?:advantage|different|differentiator|why choose)\b/.test(request.normalizedQuery);
+      const differentiators = asksDifferentiator
+        ? sectionCompanionText(item.acf, /what sets us apart|why successive|successive advantage|our advantage|differentiator/i)
+        : [];
+      const overview = (differentiators.length ? differentiators : document.descriptions.slice(0, 3)).join("\n\n");
       return pageAnswer(document, overview, ["about_content", "description"], ["What are Successive’s core values?", "Who leads Successive?", "What is Successive’s global presence?"]);
+    }
+    if (request.attribute === "founded") {
+      const foundingEvidence = [
+        ...document.structuredFields.map(({ value }) => value),
+        ...document.textSegments,
+      ].find((value) => /\b(?:founded|established|started)\s+(?:in\s+)?(?:19|20)\d{2}\b/i.test(value));
+      const foundingYear = foundingEvidence?.match(/\b(?:19|20)\d{2}\b/)?.[0];
+      if (!foundingYear) {
+        return pageAnswer(
+          document,
+          "I couldn’t confirm Successive Digital’s founding year from the current published About Us API content.",
+          [],
+          ["Tell me about Successive Digital", "Who founded Successive?"],
+        );
+      }
+      const currentYear = new Date().getUTCFullYear();
+      const approximateAge = currentYear - Number(foundingYear);
+      const answer = request.normalizedQuery.includes("how old")
+        ? `Successive Digital was founded in **${foundingYear}**, so it is approximately **${approximateAge} years old** in ${currentYear}.`
+        : `Successive Digital was founded in **${foundingYear}**.`;
+      return pageAnswer(document, answer, ["worldwide_footprint"], ["Tell me about Successive Digital", "Who founded Successive?"]);
     }
     if (request.attribute === "values") {
       const values = collection(item.acf, "core_values").map((entry) => ({
@@ -188,10 +265,11 @@ export function answerStructuredRequest(
         : [`Successive’s current core values are:`, ...values.map(({ name, description }) => `- **${name}**${description ? ` — ${description}` : ""}`)].join("\n");
       return pageAnswer(document, answer, ["core_values"], ["What does agility mean at Successive?", "Tell me about Successive’s culture"]);
     }
+    const explicitLeadershipTeam = /\bleadership team\b/.test(request.normalizedQuery);
     const peopleKeys = request.attribute === "board" ? ["board-directors"]
       : request.attribute === "executives" ? ["executive_management"]
         : request.attribute === "advisors" ? ["partners_and_advisors"]
-          : request.attribute === "leadership" ? ["executive_management"]
+          : request.attribute === "leadership" ? [explicitLeadershipTeam ? "leadership_team" : "executive_management"]
             : ["executive_management", "leadership_team", "board-directors", "partners_and_advisors"];
     const people = peopleKeys.flatMap((key) => collection(item.acf, key).map((entry) => ({
       name: valueFrom(entry, ["name", "title", "heading"]),
@@ -205,26 +283,75 @@ export function answerStructuredRequest(
       return pageAnswer(document, answer, peopleKeys, ["Show Successive’s leadership team", "Who is the CEO of Successive?"]);
     }
     if (["leadership", "executives", "board", "advisors"].includes(request.attribute)) {
-      const roleTerm = request.subject;
-      const roleMatch = people.filter(({ designation }) => normalizeSearchText(designation).split(" ").some((term) => normalizeSearchText(roleTerm).includes(term)));
-      const selected = roleMatch.length ? roleMatch : people;
+      // The query names a published section, not a designation filter. For
+      // example, "Executive Management" must not select only people whose
+      // designation happens to contain the word "Executive".
+      const requestedExecutiveRole = /\bceo\b|chief executive(?: officer)?|who runs|company head|head of (?:successive|the company)/.test(request.normalizedQuery)
+        ? /\bceo\b|chief executive officer/i
+        : /\b(?:founder|owners?|ownership|who owns|who founded|founded by)\b/.test(request.normalizedQuery)
+          ? /\bfounder\b/i
+          : /\b(?:managing partner)\b/.test(request.normalizedQuery)
+            ? /\bmanaging partner\b/i
+            : /\b(?:cro|chief revenue officer)\b/.test(request.normalizedQuery)
+              ? /\b(?:cro|chief revenue officer)\b/i
+              : /\b(?:cto|chief technology officer)\b/.test(request.normalizedQuery)
+                ? /\b(?:cto|chief technology officer)\b/i
+                : /\b(?:coo|chief operating officer)\b/.test(request.normalizedQuery)
+                  ? /\b(?:coo|chief operating officer)\b/i
+                  : /\b(?:cfo|chief financial officer)\b/.test(request.normalizedQuery)
+                    ? /\b(?:cfo|chief financial officer)\b/i
+          : undefined;
+      const roleMatches = requestedExecutiveRole
+        ? people.filter(({ designation }) => requestedExecutiveRole.test(designation))
+        : [];
+      if (requestedExecutiveRole && !roleMatches.length) {
+        return pageAnswer(
+          document,
+          "I couldn’t confirm that executive role from Successive’s current published Executive Management API records.",
+          [],
+          ["Show Successive’s executives", "Show the Leadership Team"],
+        );
+      }
+      const selected = (requestedExecutiveRole ? roleMatches : people).slice(0, 3);
+      const tabAnchors = {
+        board: "#w-tabs-5-data-w-pane-0",
+        executives: "#w-tabs-5-data-w-pane-1",
+        advisors: "#w-tabs-5-data-w-pane-2",
+        leadership: "#w-tabs-5-data-w-pane-3",
+      } as const;
+      const sectionKey = request.attribute === "leadership" && !explicitLeadershipTeam
+        ? "executives"
+        : request.attribute as keyof typeof tabAnchors;
+      const sectionUrl = `${document.url.split("#")[0]}${tabAnchors[sectionKey]}`;
+      const moreLine = !requestedExecutiveRole && people.length > selected.length
+        ? `\n\nShowing the first 3 of ${people.length}. [More](${sectionUrl})`
+        : "";
       const answer = request.mode === "count"
-        ? `The current published ${request.attribute} records list **${selected.length} people**.`
-        : selected.map(({ name, designation }) => `- **${name}**${designation ? ` — ${designation}` : ""}`).join("\n");
-      return pageAnswer(document, answer, peopleKeys, ["Show the board of directors", "Show Successive’s executives"]);
+        ? `The current published ${request.attribute} records list **${people.length} people**.`
+        : `${selected.map(({ name, designation }) => `- **${name}**${designation ? ` — ${designation}` : ""}`).join("\n")}${moreLine}`;
+      const sectionDocument = {
+        ...document,
+        url: sectionUrl,
+      };
+      return pageAnswer(sectionDocument, answer, peopleKeys, ["Show the board of directors", "Show Successive’s executives"]);
     }
     if (request.attribute === "certifications") {
       const labels = nestedMediaLabels(collection(item.acf, "certifications"))
-        .filter((label, index, all) => label && all.indexOf(label) === index);
+        .filter((label, index, all) => label && all.indexOf(label) === index)
+        .filter((label) => !/^(?:iso|soc|cmmi|certificate|certification)\d+$/i.test(label));
       const answer = labels.length
         ? `Successive’s About content currently publishes these certification or standards labels:\n${labels.map((label) => `- **${label}**`).join("\n")}`
         : `I couldn’t confirm specific certification labels from the current published About content.`;
       return pageAnswer(document, answer, ["certifications"], ["Tell me about Successive’s company standards", "Show Successive’s leadership"]);
     }
-    const footprint = document.structuredFields.filter((field) => /footprint|office|location|headquarter/i.test(`${field.path} ${field.label} ${field.value}`));
-    const factual = footprint.filter((field) => field.value.length > 25 && !/\.(?:png|jpe?g|webp|svg|avif)/i.test(field.value));
+    const sectionFacts = sectionCompanionText(item.acf, /worldwide footprint|global presence|office locations?|headquarters?/i);
+    const footprint = document.structuredFields.filter((field) => /footprint|office|location|headquarter/i.test(`${field.path} ${field.label}`));
+    const factual = [...new Set([
+      ...sectionFacts,
+      ...footprint.map((field) => field.value),
+    ].filter((value) => value.length > 25 && !/https?:|\.(?:png|jpe?g|webp|svg|avif)|global map|chief revenue officer/i.test(value)))];
     const answer = factual.length
-      ? factual.slice(0, 5).map((field) => field.value).join("\n\n")
+      ? factual.slice(0, 5).join("\n\n")
       : `Successive’s About content includes a worldwide-footprint section, but the available API text does not provide enough explicit location details to confirm office names or a location count.`;
     return pageAnswer(document, answer, ["worldwide_footprint"], ["Tell me about Successive Digital", "How does Successive support global enterprises?"]);
   }
@@ -235,7 +362,7 @@ export function answerStructuredRequest(
     const categories = collection(source.item.acf, "capabilities_categories").map((entry) => ({
       name: valueFrom(entry, ["inner_title", "title", "heading", "name", "label"]),
       description: valueFrom(entry, ["short_description", "description", "content", "text"]),
-      technologies: [...new Set(nestedMediaLabels(entry.logo_repeater))],
+      technologies: cleanCatalogLabels(nestedMediaLabels(entry.logo_repeater)),
     })).filter(({ name }) => name);
     const subjectTerms = normalizeSearchText(request.subject).split(" ").filter((term) => term.length > 2);
     const matched = categories.filter(({ name, technologies }) => {
@@ -259,7 +386,7 @@ export function answerStructuredRequest(
     if (!source) return null;
     const groups = collection(source.item.acf, "partnerships_repeater").map((entry) => ({
       category: valueFrom(entry, ["acf_repeater", "title", "heading", "name", "label"]) || "Partnerships",
-      partners: [...new Set(nestedMediaLabels(entry.partnerships_logos))],
+      partners: cleanCatalogLabels(nestedMediaLabels(entry.partnerships_logos)),
     }));
     const all = groups.flatMap(({ category, partners }) => partners.map((name) => ({ category, name })));
     const subjectTokens = new Set(normalizeSearchText(request.subject).split(" ").filter((term) => term.length > 2 && !["partner", "partners", "partnership"].includes(term)));
@@ -272,12 +399,56 @@ export function answerStructuredRequest(
     return pageAnswer(source.document, answer, ["partnerships_repeater"], ["Which cloud partners does Successive have?", "How do partnerships help clients?"]);
   }
 
-  if (request.attribute === "culture" || request.attribute === "career_benefits") {
-    const source = roleDocument(items, request.attribute === "culture" ? "culture" : "careers");
+  if (["culture", "career_benefits", "employee_policy"].includes(request.attribute)) {
+    const source = roleDocument(items, request.attribute === "career_benefits" ? "careers" : "culture") ??
+      roleDocument(items, "careers");
     if (!source) return null;
-    const fields = source.document.structuredFields.filter((field) => field.kind === "text" && field.value.length > 12);
-    const terms = normalizeSearchText(request.subject).split(" ").filter((term) => term.length > 3);
-    const matched = fields.filter((field) => terms.some((term) => normalizeSearchText(`${field.label} ${field.value}`).includes(term)));
+    if (request.attribute === "career_benefits") {
+      const benefits = collection(source.item.acf, "advantage_slider").map((entry) => ({
+        name: valueFrom(entry, ["advantage_heading", "heading", "title", "name"]),
+        description: valueFrom(entry, ["advantage_description", "description", "content", "text"]),
+      })).filter(({ name, description }) => name && description);
+      if (!benefits.length) {
+        return pageAnswer(
+          source.document,
+          "I couldn’t confirm explicit career-benefit details from Successive’s current published Careers API content.",
+          [],
+          ["Tell me about Successive’s culture", "Show current job openings"],
+        );
+      }
+      const introduction = valueFrom(record(source.item.acf) ?? {}, ["advantage_subtitle"]);
+      const answer = [
+        introduction,
+        ...benefits.map(({ name, description }) => `- **${name}** — ${description}`),
+      ].filter(Boolean).join("\n");
+      return pageAnswer(
+        source.document,
+        answer,
+        ["advantage_subtitle", "advantage_slider"],
+        ["Tell me about Successive’s culture", "Show current job openings"],
+      );
+    }
+    const fields = source.document.structuredFields.filter((field) =>
+      field.kind === "text" && field.value.length > 12 &&
+      !/image_repeater|\.image(?:\.|\[|$)|banner_image|advantage_image|cta_image/i.test(field.path) &&
+      !/^(?:why[-_ ]?successive\d*|careerbanner|aboutus[_ -]?latest)$/i.test(field.value),
+    );
+    const terms = normalizeSearchText(request.subject).split(" ").filter((term) => term.length > 3 && !["employee", "policy", "successive"].includes(term));
+    const policyTerms = request.attribute === "employee_policy"
+      ? request.normalizedQuery.match(/\b(?:appraisal|performance review|promotion|salary|hike|bonus|leave|notice period|probation|attendance|employee id|manager|personal phone|personal address|confidential|internal|absent)\b/g) ?? []
+      : [];
+    const matchTerms = policyTerms.length ? policyTerms : terms;
+    const matched = fields.filter((field) => matchTerms.some((term) =>
+      normalizeSearchText(`${field.label} ${field.value}`).includes(normalizeSearchText(term)),
+    ));
+    if (request.attribute === "employee_policy" && !matched.length) {
+      return pageAnswer(
+        source.document,
+        "I couldn’t confirm this employee-policy detail from Successive’s current published Culture or Careers API content. For an authoritative answer, please check with Successive HR or your internal employee policy portal.",
+        [],
+        ["Tell me about Successive’s culture", "What career benefits does Successive publish?"],
+      );
+    }
     const selected = (matched.length ? matched : fields).slice(0, 8);
     return pageAnswer(source.document, selected.map((field) => field.value).join("\n\n"), [...new Set(selected.map((field) => field.path.split("[")[0]!))], ["Tell me about life at Successive", "What career benefits does Successive offer?"]);
   }
