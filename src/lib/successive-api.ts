@@ -97,7 +97,9 @@ function endpoint(collection: Collection, params?: URLSearchParams): string {
   if (collection === "pages" && slug) {
     return `${base}/pages/${encodeURIComponent(slug)}`;
   }
-  query.delete("slug");
+  // The custom content endpoint accepts WordPress-style filters for non-page
+  // collections. Keep `slug` here so an older post can be resolved directly
+  // even when it is absent from the paginated discovery corpus.
   query.set("type", customContentType(collection));
   query.set("per_page", query.get("per_page") ?? String(PAGE_SIZE));
   return `${base}/content?${query}`;
@@ -302,8 +304,10 @@ export async function fetchRelevantRenderedPages(
 export async function fetchSuccessive(path: string): Promise<WordPressItem[]> {
   const url = new URL(path, "https://adapter.local");
   const params = new URLSearchParams();
-  const search = url.searchParams.get("search");
-  if (search) params.set("search", search);
+  for (const name of ["search", "slug", "per_page"] as const) {
+    const value = url.searchParams.get(name);
+    if (value) params.set(name, value);
+  }
 
   if (url.pathname.startsWith("/pages/")) {
     return fetchCanonicalPage(url.pathname.slice("/pages/".length));

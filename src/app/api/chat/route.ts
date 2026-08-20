@@ -915,7 +915,7 @@ export async function POST(request: NextRequest) {
     const namedResourceSubject = extractNamedResourceSummarySubject(
       effectiveMessage,
     );
-    const exactNamedResource = namedResourceSubject
+    let exactNamedResource = namedResourceSubject
       ? initiallySelectedMatches.find(({ document }) => {
           const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
           return document.normalizedTitle === namedResourceSubject ||
@@ -930,6 +930,20 @@ export async function POST(request: NextRequest) {
             (subjectTerms.size >= 2 && subjectCoverage >= 0.8 && document.normalizedTitle.includes(namedResourceSubject));
         })
       : undefined;
+    if (namedResourceSubject && !exactNamedResource) {
+      const directDocument = await fetchExactNamedResource(
+        namedResourceSubject,
+        intent,
+      );
+      if (directDocument) {
+        exactNamedResource = {
+          document: directDocument,
+          score: 1_000,
+          matchedFields: ["slug"],
+          selectedPassages: directDocument.chunks.slice(0, 4).map((chunk) => chunk.text),
+        };
+      }
+    }
     if (namedResourceSubject && !exactNamedResource) {
       const related = initiallySelectedMatches.slice(0, 2);
       const alternatives = related.length
@@ -949,7 +963,11 @@ export async function POST(request: NextRequest) {
               badge: document.type,
             })),
             sources: related.map(({ document }) => ({ title: document.title, url: document.url })),
-            suggestions: buildRelatedSuggestions("general"),
+            suggestions: [
+              "Show me another related resource",
+              "Show me a related case study",
+              "Explore Successive services",
+            ],
             confidence: "low",
             insufficientContext: true,
           },
@@ -1351,6 +1369,59 @@ function extractNamedResourceSummarySubject(message: string): string | null {
   return subject ? normalizeSearchText(subject) : null;
 }
 
+function namedResourceCollections(
+  intent: ReturnType<typeof detectIntent>,
+): string[] {
+  if (intent === "blogs") return ["post", "thought-leadership", "page"];
+  if (intent === "case_studies") return ["case_study", "post", "page"];
+  if (intent === "events") return ["thought-leadership", "post", "page"];
+  if (intent === "resources")
+    return ["thought-leadership", "post", "page"];
+  if (intent === "products" || intent === "product_detail")
+    return ["accelerators", "page", "post"];
+  if (intent === "page" || intent === "about" || intent === "contact")
+    return ["page"];
+  return ["post", "page", "case_study", "thought-leadership", "accelerators"];
+}
+
+async function fetchExactNamedResource(
+  subject: string,
+  intent: ReturnType<typeof detectIntent>,
+): Promise<SuccessiveSearchDocument | undefined> {
+  const slug = subject.replace(/\s+/g, "-");
+  const collections = namedResourceCollections(intent);
+  const settled = await Promise.allSettled(
+    collections.map((type) =>
+      type === "page"
+        ? fetchSuccessive(`/pages/${encodeURIComponent(slug)}`)
+        : fetchSuccessive(
+            `/content?type=${encodeURIComponent(type)}&slug=${encodeURIComponent(slug)}&per_page=10`,
+          ),
+    ),
+  );
+  const documents = settled.flatMap((result) =>
+    result.status === "fulfilled"
+      ? result.value.map((item) => buildSearchDocument(item))
+      : [],
+  );
+  const exact = documents.find((document) => {
+    const documentSlug = normalizeSearchText(document.slug.replace(/-/g, " "));
+    return documentSlug === subject ||
+      document.normalizedTitle === subject ||
+      document.aliases.includes(subject);
+  });
+  if (exact) return exact;
+
+  const subjectTerms = new Set(subject.split(" "));
+  return documents.find((document) => {
+    const identityTerms = new Set(
+      `${document.normalizedTitle} ${document.slug.replace(/-/g, " ")}`.split(" "),
+    );
+    const overlap = [...subjectTerms].filter((term) => identityTerms.has(term)).length;
+    return subjectTerms.size >= 3 && overlap / subjectTerms.size >= 0.9;
+  });
+}
+
 function exhaustedResultsData() {
   return {
     answer:
@@ -1506,7 +1577,7 @@ function buildRelatedSuggestions(
   return [
     learnMore,
     "Show me a related case study",
-    "Show me related Successive services",
+    "Explore Successive industries",
   ];
 }
 

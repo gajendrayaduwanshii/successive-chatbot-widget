@@ -138,4 +138,21 @@ describe("Successive custom v1 adapter", () => {
     expect(requestedUrls[0]).toContain("type=page");
     expect(requestedUrls[1]).toContain("type=post");
   });
+
+  it("forwards slug filters for exact post lookup", async () => {
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        requestedUrls.push(String(input));
+        return response([]);
+      }),
+    );
+
+    await fetchSuccessive("/content?type=post&slug=what-is-an-api&per_page=10");
+    const requested = new URL(requestedUrls[0]!);
+    expect(requested.searchParams.get("type")).toBe("post");
+    expect(requested.searchParams.get("slug")).toBe("what-is-an-api");
+    expect(requested.searchParams.get("per_page")).toBe("10");
+  });
 });
