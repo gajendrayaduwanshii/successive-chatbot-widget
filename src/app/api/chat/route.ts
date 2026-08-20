@@ -118,6 +118,13 @@ async function fetchStructuredItems(request: StructuredRequest) {
     ]);
     return [...culture, ...careers];
   }
+  if (request.attribute === "company_location") {
+    const [about, contact] = await Promise.all([
+      fetchSuccessive("/pages/about-us"),
+      fetchSuccessive("/pages/contact"),
+    ]);
+    return [...about, ...contact];
+  }
   const pageSlug = request.attribute === "capabilities" || request.attribute === "technologies"
     ? "global-capabilities"
     : request.attribute === "partners"

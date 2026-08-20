@@ -31,15 +31,19 @@ const corpus: WordPressItem[] = [
 describe("structured API knowledge", () => {
   it("does not mistake a short office-location phrase for a person name", () => {
     expect(understandStructuredRequest("Office locations")).toMatchObject({
-      attribute: "global_presence",
+      attribute: "company_location",
     });
   });
 
   it.each([
     "office location",
     "office locations",
+    "India location",
+    "India office",
     "Where are your offices?",
+    "Where is your India office?",
     "Where is Successive located?",
+    "Where is Successive?",
     "Where are you based?",
     "Successive locations",
     "company address",
@@ -49,20 +53,36 @@ describe("structured API knowledge", () => {
     "HQ",
     "branches",
     "Do you have an office in India?",
+    "Do you operate in India?",
+    "US office",
     "What is your presence outside the US?",
+    "Global presence",
+    "Which countries do you operate in?",
+    "Which country?",
     "offcie loaction",
   ])("recognizes company-location phrasing: %s", (query) => {
-    expect(understandStructuredRequest(query)).toMatchObject({ attribute: "global_presence" });
+    expect(understandStructuredRequest(query)).toMatchObject({ attribute: "company_location" });
+  });
+
+  it.each([
+    "location intelligence services",
+    "Location Intelligence",
+    "Location Intelligence services",
+    "Location analytics",
+    "market location strategy",
+    "GIS site selection",
+    "GIS solutions",
+    "Geospatial services",
+    "geospatial capabilities",
+  ])("leaves location-related capability phrasing to service retrieval: %s", (query) => {
+    expect(understandStructuredRequest(query)).toBeNull();
   });
 
   it.each([
     "jobs by location",
     "office jobs in Noida",
-    "location intelligence services",
-    "GIS site selection",
-    "geospatial capabilities",
-  ])("does not route non-office location intent as company presence: %s", (query) => {
-    expect(understandStructuredRequest(query)?.attribute).not.toBe("global_presence");
+  ])("does not route job-location phrasing as company presence: %s", (query) => {
+    expect(understandStructuredRequest(query)?.attribute).not.toBe("company_location");
   });
   it.each([
     ["What are your core values?", "values"],
@@ -232,6 +252,37 @@ describe("structured API knowledge", () => {
 
     expect(result?.answer).toContain("operates from offices");
     expect(result?.answer).not.toMatch(/founded|2012|technologists/i);
+  });
+
+  it("directly answers a combined limited-scope and named-location question", () => {
+    const about = page(20, "about-us", "About Us", {
+      worldwide_footprint: "Successive operates across seven strategic locations, including India, London, Dallas (HQ), and Johannesburg, serving 150+ enterprise clients worldwide.",
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("US-only? India offices?")!);
+    const lines = result?.answer.split(/\n\n/) ?? [];
+
+    expect(lines[0]).toMatch(/^No—/);
+    expect(lines[1]).toMatch(/^Yes—.*India/);
+    expect(result?.answer).toContain("seven strategic locations");
+    expect(result?.answer).not.toContain("150+ enterprise clients");
+    expect(lines.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("prefers a matching structured office address over a general footprint", () => {
+    const about = page(21, "about-us", "About Us", {
+      worldwide_footprint: "Successive operates across several global locations, including India, London, and Dallas (HQ).",
+    });
+    const contact = page(22, "contact", "Contact Us", {
+      india_office_address: "Noida, Uttar Pradesh, India",
+    });
+    const result = answerStructuredRequest(
+      [about, contact],
+      understandStructuredRequest("Where is your India office?")!,
+    );
+
+    expect(result?.document.slug).toBe("contact");
+    expect(result?.answer).toContain("Noida, Uttar Pradesh, India");
+    expect(result?.answer).not.toMatch(/location intelligence|gis|geospatial/i);
   });
 
   it.each([

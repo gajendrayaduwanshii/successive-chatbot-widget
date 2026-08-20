@@ -4,7 +4,7 @@ import type { WordPressItem } from "@/types/wordpress";
 
 export type StructuredAttribute =
   | "company_overview" | "founded" | "values" | "leadership" | "executives" | "board"
-  | "advisors" | "certifications" | "global_presence" | "capabilities"
+  | "advisors" | "certifications" | "company_location" | "global_presence" | "capabilities"
   | "technologies" | "culture" | "career_benefits" | "partners" | "awards"
   | "employee_policy" | "person";
 
@@ -50,14 +50,18 @@ export function normalizeVisitorQuery(message: string): string {
 function isCompanyLocationQuery(query: string): boolean {
   if (/\b(?:job|jobs|career|careers|opening|openings|vacancy|vacancies|hiring|apply)\b/.test(query))
     return false;
-  if (/\b(?:gis|arcgis|location intelligence|site selection|spatial|geospatial)\b/.test(query))
+  if (/\b(?:gis|arcgis|location intelligence|location analytics|location strategy|market location|site selection|spatial|geospatial)\b/.test(query))
     return false;
   return (
     /\b(?:headquarters?|hq|head office|main office|corporate office|offices?|branches?|office address|company address|global footprint|worldwide footprint|global presence)\b/.test(query) ||
     /\b(?:company|successive|your|our) locations?\b/.test(query) ||
-    /\bwhere (?:is|are) (?:successive(?: digital)?|the company|your company|you|your offices?|your branches?) (?:located|based)?\b/.test(query) ||
+    /^(?:[a-z][a-z .'-]{1,60})\s+(?:location|office|branch|address)$/.test(query) ||
+    /\bwhere (?:is|are) (?:successive(?: digital)?|the company|your company|you|your offices?|your branches?)(?:\s+(?:located|based))?\b/.test(query) ||
+    /\bwhere can (?:i|we) visit\b/.test(query) ||
+    /\bwhich (?:city|cities|country|countries)\b.*\b(?:located|based|operate|offices?|presence)\b/.test(query) ||
+    /\bdo (?:you|successive) (?:have offices?|operate) in\b/.test(query) ||
     /\b(?:located|based|operate|operates|presence) (?:in|at|outside)\b/.test(query) ||
-    /^(?:location|locations|address|presence)$/.test(query)
+    /^(?:location|locations|address|presence|which (?:city|country|cities|countries))$/.test(query)
   );
 }
 
@@ -78,7 +82,7 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     bareNameCandidate;
   const personTokens = personCandidate?.split(" ").filter(Boolean) ?? [];
   const person = personTokens.length >= 2 && personTokens.length <= 5 &&
-    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?)\b/.test(personCandidate ?? "")
+    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|solutions?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?|gis|geospatial|site selection)\b/.test(personCandidate ?? "")
     ? personCandidate
     : undefined;
   let attribute: StructuredAttribute | undefined;
@@ -91,7 +95,8 @@ export function understandStructuredRequest(message: string): StructuredRequest 
   else if (/\b(?:advisors?|partners and advisors)\b/.test(q)) attribute = "advisors";
   else if (q === "owner" || /\b(?:ceo|chief executive(?: officer)?|founder|who owns(?: successive| the company)?|owner(?:ship)? of (?:successive|the company)|who founded|founded by|who runs|company head|head of (?:successive|the company)|managing partner|cro|chief revenue officer|cto|chief technology officer|coo|chief operating officer|cfo|chief financial officer|leadership|leaders?|who leads)\b/.test(q)) attribute = "leadership";
   else if (/\b(?:how old|founded|founding year|established|started|company age|company history|history of successive|get started)\b/.test(q)) attribute = "founded";
-  else if (isCompanyLocationQuery(q) || /\b(?:global enterprises?|global clients?|international clients?|support global|team in india|india (?:operations?|contact)|us only|only (?:in )?(?:the )?us)\b/.test(q)) attribute = "global_presence";
+  else if (isCompanyLocationQuery(q)) attribute = "company_location";
+  else if (/\b(?:global enterprises?|global clients?|international clients?|support global)\b/.test(q)) attribute = "global_presence";
   else if (/\b(?:work culture|workplace|life at successive|employee culture|inclusive workplace|continuous learning|employee growth)\b/.test(q)) attribute = "culture";
   else if (/\b(?:employee benefits?|career benefits?|perks?|rewards and recognitions?|learning and development|why (?:join|work at) successive|successive careers|career page)\b/.test(q) && !/\b(?:job|opening|vacancy|hiring|apply)\b/.test(q)) attribute = "career_benefits";
   else if (/\b(?:partners?|partnerships?|alliances?|partner ecosystem)\b/.test(q)) attribute = "partners";
@@ -167,7 +172,7 @@ function sectionCompanionText(value: unknown, headingPattern: RegExp): string[] 
 function globalPresenceFacts(values: string[], request: StructuredRequest): string[] {
   const asksForOfficeLocation = isCompanyLocationQuery(request.normalizedQuery);
   if (!asksForOfficeLocation) return values;
-  const locationTerms = /\b(?:headquarters?|hq|office|offices|location|locations|based|operate|operates|presence)\b/i;
+  const locationTerms = /\b(?:headquarters?|hq|office|offices|location|locations|address|city|country|based|operate|operates|presence)\b/i;
   return values.flatMap((value) => {
     const sentences = value.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((sentence) => sentence.trim()) ?? [];
     return sentences
@@ -179,18 +184,32 @@ function globalPresenceFacts(values: string[], request: StructuredRequest): stri
   });
 }
 
-function officeLocationAnswer(facts: string[]): string {
+function officeLocationAnswer(facts: string[], request: StructuredRequest): string {
   const evidence = facts.join(" ").replace(/\s+/g, " ").trim();
   const lines: string[] = [];
+  const specificFacts = facts.filter((fact) => /^[^:]*\b(?:office|location|address|city|country|headquarter)[^:]*:/i.test(fact));
+  lines.push(...specificFacts);
   const footprint = evidence.match(/\boperate(?:s)? across ([^.!?;,]*?locations?)\b/i)?.[1];
-  if (footprint) lines.push(`Successive operates across ${footprint} worldwide.`);
   const locations = evidence.match(/\b(?:such as|including)\s+(.+?)(?=,?\s+(?:serving|supporting)\b|[.!?]|$)/i)?.[1];
+  const locationNames = locations?.split(/,|\band\b/i).map((name) => name.trim()).filter(Boolean) ?? [];
+  const requestedLocations = locationNames.filter((name) =>
+    request.normalizedQuery.includes(normalizeSearchText(name.replace(/\((?:hq|headquarters?)\)/i, ""))),
+  );
+  const headquarters = locations?.match(/(?:^|,|\band\b)\s*([^,]+?)\s*\((?:HQ|headquarters?)\)/i)?.[1]
+    ?.replace(/^and\s+/i, "")
+    .trim();
+  const asksLimitedScope = /\bonly\b/.test(request.normalizedQuery);
+  if (asksLimitedScope)
+    lines.push("No—Successive’s published footprint is not limited to the location named in your question.");
+  if (requestedLocations.length)
+    lines.push(`Yes—Successive’s published footprint includes ${requestedLocations.join(" and ")}.`);
+  if (footprint) lines.push(`Successive operates across ${footprint} worldwide.`);
   if (locations) lines.push(`Its published locations include ${locations.replace(/,?\s+and\s+/i, ", and ")}.`);
-  const headquarters = locations?.match(/(?:^|,|\band\b)\s*([^,]+?)\s*\((?:HQ|headquarters?)\)/i)?.[1]?.trim();
   if (headquarters) lines.push(`${headquarters} is identified as Successive’s headquarters.`);
   const reach = evidence.match(/\bserving\s+(.+?worldwide)\b/i)?.[1];
-  if (reach) lines.push(`From its global presence, Successive serves ${reach}.`);
-  if (lines.length >= 3) return lines.slice(0, 4).join("\n\n");
+  if (reach && !asksLimitedScope && !requestedLocations.length)
+    lines.push(`From its global presence, Successive serves ${reach}.`);
+  if (lines.length >= 3) return [...new Set(lines)].slice(0, 4).join("\n\n");
   return facts.join("\n\n");
 }
 
@@ -267,7 +286,7 @@ export function answerStructuredRequest(
   request: StructuredRequest,
 ): StructuredAnswer | null {
   const company = roleDocument(items, "company");
-  if (["company_overview", "founded", "values", "leadership", "executives", "board", "advisors", "certifications", "global_presence", "person"].includes(request.attribute)) {
+  if (["company_overview", "founded", "values", "leadership", "executives", "board", "advisors", "certifications", "company_location", "global_presence", "person"].includes(request.attribute)) {
     if (!company) return null;
     const { item, document } = company;
     if (request.attribute === "company_overview") {
@@ -390,19 +409,40 @@ export function answerStructuredRequest(
         : `I couldn’t confirm specific certification labels from the current published About content.`;
       return pageAnswer(document, answer, ["certifications"], ["Tell me about Successive’s company standards", "Show Successive’s leadership"]);
     }
-    const sectionFacts = sectionCompanionText(item.acf, /worldwide footprint|global presence|office locations?|headquarters?/i);
-    const footprint = document.structuredFields.filter((field) => /footprint|office|location|headquarter/i.test(`${field.path} ${field.label}`));
+    const locationSources = request.attribute === "company_location"
+      ? items.map((sourceItem) => ({ item: sourceItem, document: buildSearchDocument(sourceItem) }))
+      : [{ item, document }];
+    const evidence = locationSources.flatMap((source) => [
+      ...sectionCompanionText(source.item.acf, /worldwide footprint|global presence|office locations?|headquarters?|contact|address/i)
+        .map((value) => ({ source, value, path: "location_section", label: "Location" })),
+      ...source.document.structuredFields
+        .filter((field) => /footprint|office|location|headquarter|address|city|country/i.test(`${field.path} ${field.label}`))
+        .map((field) => ({ source, value: field.value, path: field.path, label: field.label })),
+    ]).filter(({ value }) => value.length > 3 && !/https?:|\.(?:png|jpe?g|webp|svg|avif)|global map|chief revenue officer/i.test(value));
+    const subjectTerms = normalizeSearchText(request.subject).split(" ")
+      .filter((term) => term.length > 2 && !/^(?:office|offices|location|locations|address|branch|branches)$/.test(term));
+    evidence.sort((left, right) => {
+      const score = (entry: typeof left) => {
+        const identity = normalizeSearchText(`${entry.path} ${entry.value}`);
+        const subjectMatch = subjectTerms.some((term) => identity.includes(term)) ? 100 : 0;
+        const specificity = /address|street|city|country|office|headquarter/i.test(entry.path) ? 30 : 0;
+        const canonical = /contact/i.test(entry.source.document.slug) ? 10 : 0;
+        return subjectMatch + specificity + canonical;
+      };
+      return score(right) - score(left);
+    });
     const factual = [...new Set([
-      ...sectionFacts,
-      ...footprint.map((field) => field.value),
-    ].filter((value) => value.length > 25 && !/https?:|\.(?:png|jpe?g|webp|svg|avif)|global map|chief revenue officer/i.test(value)))];
+      ...evidence.map(({ value, path, label }) =>
+        /address|city|country|office|headquarter/i.test(path) ? `${label}: ${value}` : value),
+    ].filter((value) => value.length > 3))];
     const relevantFacts = globalPresenceFacts(factual, request);
     const answer = relevantFacts.length
       ? isCompanyLocationQuery(request.normalizedQuery)
-        ? officeLocationAnswer(relevantFacts.slice(0, 5))
+        ? officeLocationAnswer(relevantFacts.slice(0, 5), request)
         : relevantFacts.slice(0, 5).join("\n\n")
       : `Successive’s About content includes a worldwide-footprint section, but the available API text does not provide enough explicit location details to confirm office names or a location count.`;
-    return pageAnswer(document, answer, ["worldwide_footprint"], ["Tell me about Successive Digital", "How does Successive support global enterprises?"]);
+    const primaryDocument = evidence[0]?.source.document ?? document;
+    return pageAnswer(primaryDocument, answer, evidence.map(({ path }) => path), ["Tell me about Successive Digital", "How does Successive support global enterprises?"]);
   }
 
   if (["capabilities", "technologies"].includes(request.attribute)) {
