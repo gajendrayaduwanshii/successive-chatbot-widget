@@ -49,6 +49,7 @@ import {
   contentIdentity,
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
+  resolveOfferedResourceFollowUp,
 } from "@/lib/conversation-context";
 import {
   buildDeterministicUnderstanding,
@@ -224,7 +225,10 @@ export async function POST(request: NextRequest) {
       );
     }
   }
-  const effectiveMessage = preparedQuery.englishQuery;
+  const effectiveMessage = resolveOfferedResourceFollowUp(
+    preparedQuery.englishQuery,
+    parsed.data.history,
+  ) ?? preparedQuery.englishQuery;
   // Do not let a vague help request inherit an old topic and surface an
   // unrelated document title. Ask for the missing need before retrieval.
   if (isGenericHelpRequest(effectiveMessage)) {
@@ -869,6 +873,9 @@ export async function POST(request: NextRequest) {
       understanding,
     );
     retrievalDurationMs = performance.now() - retrievalStartedAt;
+    const namedResourceSubject = extractNamedResourceSummarySubject(
+      effectiveMessage,
+    );
     if (!retrieval.reliableMatchFound) {
       if (shouldDeduplicate && seenContentKeys.size) {
         return NextResponse.json(
@@ -885,7 +892,9 @@ export async function POST(request: NextRequest) {
         {
           success: true,
           data: {
-            answer: requestedTypeLabel
+            answer: namedResourceSubject
+              ? "I couldn't find that exact published item in the available Successive content."
+              : requestedTypeLabel
               ? `I couldn't find a strongly matching Successive ${requestedTypeLabel} for this topic. I don't want to present a generic or weakly related item as direct evidence. You can broaden the content type or ask for related Successive services and resources.`
               : buildHelpfulFallback(preparedQuery.fallbackAnswer),
             cards: [],
@@ -912,9 +921,6 @@ export async function POST(request: NextRequest) {
             !previouslyPresented.includes(document.title.toLowerCase()),
         )
       : retrieval.matches;
-    const namedResourceSubject = extractNamedResourceSummarySubject(
-      effectiveMessage,
-    );
     const exactNamedResource = namedResourceSubject
       ? initiallySelectedMatches.find(({ document }) => {
           const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
@@ -931,25 +937,20 @@ export async function POST(request: NextRequest) {
         })
       : undefined;
     if (namedResourceSubject && !exactNamedResource) {
-      const related = initiallySelectedMatches.slice(0, 2);
+      const relatedPool = retrieval.candidates ?? initiallySelectedMatches;
+      const closest = selectRelatedNamedResource(namedResourceSubject, relatedPool);
+      const related = closest ? [closest] : initiallySelectedMatches.slice(0, 1);
       const alternatives = related.length
-        ? ` Related published items include: ${related.map(({ document }) => `[${document.title}](${document.url})`).join("; ")}.`
+        ? ` I found a related ${related[0]!.document.role.replace(/_/g, " ")}, ${related.map(({ document }) => `'[${document.title}](${document.url})'`).join("; ")}. Would you like me to summarize that instead?`
         : "";
       return NextResponse.json(
         {
           success: true,
           data: {
             answer: `I couldn't find that exact published item in the available Successive content.${alternatives}`,
-            cards: related.map(({ document, selectedPassages }) => ({
-              type: cardType(document.type),
-              title: document.title,
-              description: bestStoryDescription(document, selectedPassages),
-              url: document.url,
-              image: document.image,
-              badge: document.type,
-            })),
-            sources: related.map(({ document }) => ({ title: document.title, url: document.url })),
-            suggestions: buildRelatedSuggestions("general"),
+            cards: [],
+            sources: [],
+            suggestions: related.length ? [`Summarize '${related[0]!.document.title}'`] : buildRelatedSuggestions("general"),
             confidence: "low",
             insufficientContext: true,
           },
@@ -1334,21 +1335,72 @@ function buildUseCaseHeading(message: string): string {
 }
 
 function extractNamedResourceSummarySubject(message: string): string | null {
+  if (/\b(?:latest|newest|most recent|recent)\b/i.test(message) && !/[‘’'“"]/.test(message))
+    return null;
+  const successiveUrl = message.match(/https?:\/\/(?:www\.)?successive\.tech\/[^\s)]+/i)?.[0];
+  if (successiveUrl) {
+    try {
+      const slug = new URL(successiveUrl).pathname.split("/").filter(Boolean).at(-1);
+      if (slug) return normalizeSearchText(slug.replace(/-/g, " "));
+    } catch {
+      // Continue with title parsing for malformed visitor input.
+    }
+  }
   const quoted = message.match(/['“"]([^'”"]{3,200})['”"]/i)?.[1];
   if (quoted) return normalizeSearchText(quoted);
   const explicitlyNamed = message.match(
-    /\b(?:called|named|titled)\s+(.+?)(?:\s+(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology))?[?.!]*$/i,
+    /\b(?:called|named|titled)\s+(.+?)(?:\s+(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource))?[?.!]*$/i,
   )?.[1];
   if (explicitlyNamed) return normalizeSearchText(explicitlyNamed);
-  if (!/^(?:summarize|summarise|give me a summary of)\b/i.test(message.trim())) return null;
+  if (!/^(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is|what does)\b/i.test(message.trim())) return null;
   const prefixType = message.match(
-    /^(?:(?:summarize|summarise|give me a summary of|tell me about|show me)\s+)?(?:the\s+)?(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology)\s+(?:called|named|titled)?\s*['“\"]?(.+?)['”\"]?[?.!]*$/i,
+    /^(?:(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is)\s+)?(?:the\s+|an?\s+)?(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource)\s+(?:called|named|titled)?\s*['“\"]?(.+?)['”\"]?[?.!]*$/i,
   );
   const suffixType = message.match(
-    /^(?:(?:summarize|summarise|give me a summary of|tell me about|show me)\s+)?['“\"]?(.+?)['”\"]?\s+(?:blog|article|post|case study|white ?paper|e-?book|webinar|event|product|platform|partner(?:ship)?|service|technology)[?.!]*$/i,
+    /^(?:(?:summarize|summarise|explain|open|show|find|give me|tell me about|do you have|is there|can you find|where is)\s+)?(?:the\s+|an?\s+)?['“\"]?(.+?)['”\"]?\s+(?:blog|article|post|case study|white ?paper|e-?book|report|webinar|event|press release|media coverage|product|platform|partner page|service page|industry page|guide|downloadable resource|resource)[?.!]*$/i,
   );
   const subject = prefixType?.[1] ?? suffixType?.[1];
   return subject ? normalizeSearchText(subject) : null;
+}
+
+function selectRelatedNamedResource(
+  subject: string,
+  candidates: SearchMatch[],
+): SearchMatch | undefined {
+  const glue = new Set([
+    "what", "who", "where", "when", "why", "how", "is", "are", "a", "an",
+    "the", "of", "and", "or", "in", "to", "for", "blog", "article", "post",
+    "resource", "report", "guide", "webinar", "event", "published", "item",
+  ]);
+  const normalizedSubject = normalizeSearchText(subject);
+  const subjectTerms = normalizedSubject
+    .split(" ")
+    .filter((term) => term.length > 1 && !glue.has(term));
+  if (!subjectTerms.length) return candidates[0];
+  const definitionEntity = /^(?:what|who)\s+(?:is|are)\b/.test(normalizedSubject)
+    ? subjectTerms.join(" ")
+    : "";
+  return candidates
+    .map((candidate) => {
+      const identity = ` ${candidate.document.normalizedTitle} ${candidate.document.slug.replace(/-/g, " ")} `;
+      const body = ` ${candidate.document.combinedText} `;
+      const titleHits = subjectTerms.filter((term) => identity.includes(` ${term} `)).length;
+      const bodyHits = subjectTerms.filter((term) => body.includes(` ${term} `)).length;
+      const definitionEvidence = definitionEntity && (
+        body.includes(`what ${definitionEntity} is`) ||
+        body.includes(`what an ${definitionEntity} is`) ||
+        body.includes(`${definitionEntity} is an`) ||
+        body.includes(`${definitionEntity} is a`)
+      );
+      return {
+        candidate,
+        identityQualified: titleHits / subjectTerms.length >= 0.5 || Boolean(definitionEvidence),
+        score: titleHits * 30 + bodyHits * 8 + (definitionEvidence ? 80 : 0) +
+          Math.min(20, Math.max(0, candidate.score) / 20),
+      };
+    })
+    .filter(({ score, identityQualified }) => identityQualified && score >= 25)
+    .sort((a, b) => b.score - a.score)[0]?.candidate;
 }
 
 function exhaustedResultsData() {

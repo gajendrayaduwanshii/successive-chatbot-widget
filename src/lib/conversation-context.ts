@@ -41,6 +41,30 @@ export function contentIdentitiesFromAssistantHistory(
   return [...identities];
 }
 
+export function resolveOfferedResourceFollowUp(
+  message: string,
+  history: HistoryMessage[],
+): string | undefined {
+  const normalized = normalizeSearchText(message);
+  const affirmative = /^(?:yes|yes please|sure|okay|ok|please do|go ahead)$/.test(normalized);
+  const ordinal = normalized.match(/(?:summarize |show |open |tell me about )?(?:the )?(first|second|third)(?: one| item| article| resource)?/i)?.[1];
+  if (!affirmative && !ordinal) return undefined;
+  const prior = history.findLast((item) => item.role === "assistant")?.content ?? "";
+  const links = [...prior.matchAll(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g)]
+    .map((match) => ({ title: match[1]!.trim(), url: match[2]! }))
+    .filter(({ title }) => title.length >= 3);
+  if (!links.length) return undefined;
+  if (affirmative && !/would you like me to summarize|related (?:article|resource|case study|alternative)/i.test(prior))
+    return undefined;
+  const index = ordinal === "second" ? 1 : ordinal === "third" ? 2 : 0;
+  const selected = links[index];
+  const offeredTypeRaw = prior.match(/related (blogs?|articles?|case stud(?:y|ies)|white ?papers?|e-?books?|webinars?|events?|press releases?|media coverage|products?|partner pages?|service pages?|industry pages?|guides?|resources?)/i)?.[1] ?? "resource";
+  const offeredType = offeredTypeRaw
+    .replace(/case studies/i, "case study")
+    .replace(/s$/i, "");
+  return selected ? `Summarize '${selected.title}' ${offeredType}` : undefined;
+}
+
 export function buildRelatedServiceRetrievalQuery(
   message: string,
   history: HistoryMessage[],

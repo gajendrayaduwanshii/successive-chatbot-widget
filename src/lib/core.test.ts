@@ -63,12 +63,33 @@ import {
   contentIdentity,
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
+  resolveOfferedResourceFollowUp,
 } from "./conversation-context";
 import { buildDeterministicUnderstanding } from "./query-understanding";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+});
+
+describe("named resource follow-ups", () => {
+  const offered = "I couldn't find that exact published item. I found a related blog, '[API Testing](https://successive.tech/blog/api-testing/)'. Would you like me to summarize that instead?";
+
+  it("resolves an affirmative reply to the explicitly offered resource and type", () => {
+    expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: offered }]))
+      .toBe("Summarize 'API Testing' blog");
+  });
+
+  it("resolves ordinal selection without searching for the ordinal text", () => {
+    const prior = "Related articles: [First](https://successive.tech/blog/first/) and [Second](https://successive.tech/blog/second/).";
+    expect(resolveOfferedResourceFollowUp("the second one", [{ role: "assistant", content: prior }]))
+      .toBe("Summarize 'Second' article");
+  });
+
+  it("does not let a generic yes inherit an arbitrary old link", () => {
+    expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: "See [About](https://successive.tech/about-us/)." }]))
+      .toBeUndefined();
+  });
 });
 
 describe("intent detection", () => {
