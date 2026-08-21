@@ -175,7 +175,74 @@ const COMPANY_NAVIGATION_ROLES = new Set<SuccessiveSearchDocument["role"]>([
   "global_capabilities", "contact", "leadership", "location",
 ]);
 
-function navigationRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument):
+type PageSemanticGroup =
+  | "COMPANY_OVERVIEW"
+  | "CULTURE_AND_PEOPLE"
+  | "LEADERSHIP"
+  | "CAREERS"
+  | "AWARDS_AND_RECOGNITION"
+  | "PARTNERS_AND_ALLIANCES"
+  | "GLOBAL_CAPABILITIES"
+  | "OTHER";
+
+const COMPLEMENTARY_GROUPS: Record<PageSemanticGroup, PageSemanticGroup[]> = {
+  COMPANY_OVERVIEW: ["CULTURE_AND_PEOPLE", "LEADERSHIP", "CAREERS"],
+  CULTURE_AND_PEOPLE: ["COMPANY_OVERVIEW", "LEADERSHIP", "CAREERS"],
+  LEADERSHIP: ["COMPANY_OVERVIEW", "CULTURE_AND_PEOPLE"],
+  CAREERS: ["CULTURE_AND_PEOPLE", "COMPANY_OVERVIEW"],
+  GLOBAL_CAPABILITIES: ["COMPANY_OVERVIEW"],
+  AWARDS_AND_RECOGNITION: [],
+  PARTNERS_AND_ALLIANCES: [],
+  OTHER: [],
+};
+
+const PERSON_NAVIGATION_GROUPS = new Set<PageSemanticGroup>([
+  "LEADERSHIP", "CULTURE_AND_PEOPLE", "COMPANY_OVERVIEW",
+]);
+
+function pageSemanticGroup(document: SuccessiveSearchDocument): PageSemanticGroup {
+  const identity = normalizeSearchText(`${document.title} ${document.slug.replace(/-/g, " ")} ${document.role}`);
+  const section = normalizeSearchText(document.sectionKey ?? "");
+  if (document.role === "awards" || document.type === "award" ||
+      /\b(?:awards?|recognitions?|accreditations?)\b/.test(`${identity} ${section}`))
+    return "AWARDS_AND_RECOGNITION";
+  if (document.role === "partners" || document.role === "partner" ||
+      /\b(?:partners?|partnerships?|alliances?)\b/.test(`${identity} ${section}`))
+    return "PARTNERS_AND_ALLIANCES";
+  if (document.role === "global_capabilities" || /\bglobal capabilities\b/.test(identity) ||
+      section === "global capabilities")
+    return "GLOBAL_CAPABILITIES";
+  if (document.role === "culture" || /\b(?:culture|core values?|workplace)\b/.test(identity))
+    return "CULTURE_AND_PEOPLE";
+  if (document.role === "leadership" ||
+      /\b(?:leadership|executive|management team|board of directors)\b/.test(identity))
+    return "LEADERSHIP";
+  if (document.role === "careers" || document.role === "career" || document.role === "job_listing" ||
+      /\b(?:careers?|job listings?|open roles?)\b/.test(identity))
+    return "CAREERS";
+  if (document.role === "company" || document.role === "contact" || document.role === "location" ||
+      /\b(?:about(?: us)?|company overview)\b/.test(identity))
+    return "COMPANY_OVERVIEW";
+  return "OTHER";
+}
+
+function isPersonPrimarySubject(userSubject: string | undefined, source: SuccessiveSearchDocument): boolean {
+  const subject = normalizeSearchText(userSubject ?? "");
+  if (!subject || subject === source.normalizedTitle || subject === normalizeSearchText(source.slug.replace(/-/g, " ")))
+    return false;
+  const tokens = subject.split(" ").filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 5) return false;
+  return !/\b(?:about|culture|career|partner|alliance|capabilities?|awards?|service|contact|company|successive|overview)\b/.test(subject);
+}
+
+function candidateMentionsSubject(candidate: SuccessiveSearchDocument, userSubject: string): boolean {
+  const tokens = normalizeSearchText(userSubject).split(" ").filter((token) => token.length > 1);
+  if (tokens.length < 2) return false;
+  const haystack = normalizeSearchText(`${candidate.title} ${candidate.headings.join(" ")} ${candidate.combinedText}`);
+  return tokens.every((token) => haystack.includes(token));
+}
+
+function structuralRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument):
   "PARENT" | "CHILD" | "SIBLING" | "SAME_SECTION" | "SAME_PAGE_GROUP" | "DIRECTLY_CONNECTED" | undefined {
   if (source.parentId === candidate.id) return "PARENT";
   if (candidate.parentId === source.id) return "CHILD";
@@ -191,13 +258,57 @@ function navigationRelation(source: SuccessiveSearchDocument, candidate: Success
     candidate.relatedCapabilities.find((item) => item.documentId === source.id);
   if (relationship?.evidence.some((value) => ["explicit-reference", "internal-link", "taxonomy"].includes(value)))
     return source.role === candidate.role ? "SAME_PAGE_GROUP" : "SAME_SECTION";
+  return undefined;
+}
+
+function navigationRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument):
+  "PARENT" | "CHILD" | "SIBLING" | "SAME_SECTION" | "SAME_PAGE_GROUP" | "DIRECTLY_CONNECTED" | undefined {
+  const relation = structuralRelation(source, candidate);
+  if (relation) return relation;
   if (COMPANY_NAVIGATION_ROLES.has(source.role) && COMPANY_NAVIGATION_ROLES.has(candidate.role) &&
       candidate.type === "page") return "SAME_SECTION";
   return undefined;
 }
 
+function individualPageRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument):
+  "PARENT" | "CHILD" | "SIBLING" | "SAME_SECTION" | "SAME_PAGE_GROUP" | "DIRECTLY_CONNECTED" | undefined {
+  const structural = structuralRelation(source, candidate);
+  if (structural === "PARENT" || structural === "CHILD" || structural === "SIBLING" ||
+      structural === "DIRECTLY_CONNECTED") return structural;
+  if (structural === "SAME_SECTION" && source.sectionKey && source.sectionKey === candidate.sectionKey)
+    return "SAME_SECTION";
+  if (structural && source.role === candidate.role) return structural;
+  const sourceGroup = pageSemanticGroup(source);
+  const candidateGroup = pageSemanticGroup(candidate);
+  if (sourceGroup !== "OTHER" && sourceGroup === candidateGroup) return "SAME_PAGE_GROUP";
+  if (COMPLEMENTARY_GROUPS[sourceGroup].includes(candidateGroup)) return "SAME_SECTION";
+  return undefined;
+}
+
+const INDIVIDUAL_RELATION_PRIORITY: Record<NonNullable<SuggestionAction["relationType"]>, number> = {
+  PARENT: 8, CHILD: 7, SIBLING: 6, DIRECTLY_CONNECTED: 5, SAME_SECTION: 4, SAME_PAGE_GROUP: 3,
+};
+
+function individualRelationStrength(
+  source: SuccessiveSearchDocument,
+  target: SuccessiveSearchDocument,
+  relationType: NonNullable<SuggestionAction["relationType"]>,
+  userSubject?: string,
+): number {
+  const sourceGroup = pageSemanticGroup(source);
+  const targetGroup = pageSemanticGroup(target);
+  let score = ({ PARENT: 100, CHILD: 90, SIBLING: 80, DIRECTLY_CONNECTED: 85,
+    SAME_SECTION: source.sectionKey && source.sectionKey === target.sectionKey ? 75
+      : COMPLEMENTARY_GROUPS[sourceGroup].includes(targetGroup) ? 55 : 20,
+    SAME_PAGE_GROUP: sourceGroup !== "OTHER" && sourceGroup === targetGroup ? 60 : 35,
+  }[relationType] ?? 0);
+  if (userSubject && candidateMentionsSubject(target, userSubject)) score += 25;
+  return score;
+}
+
 /** Structural navigation for a resolved individual page; semantic similarity
- * alone is deliberately insufficient and cross-category topic feeds are excluded. */
+ * alone is deliberately insufficient and cross-category topic feeds are excluded.
+ * Broad COMPANY_INFORMATION membership is not enough to render a suggestion. */
 export function buildIndividualPageNavigationActions({ source, corpus, userSubject, excludedResultKeys = [], limit = 3 }: {
   source: SuccessiveSearchDocument;
   corpus: SuccessiveSearchDocument[];
@@ -206,15 +317,26 @@ export function buildIndividualPageNavigationActions({ source, corpus, userSubje
   limit?: number;
 }): SuggestionAction[] {
   const excluded = new Set([documentActionKey(source), ...excludedResultKeys]);
-  return corpus.flatMap((target): Array<{ target: SuccessiveSearchDocument; relationType: NonNullable<SuggestionAction["relationType"]> }> => {
+  const personSubject = isPersonPrimarySubject(userSubject, source);
+  const MIN_RELATION_SCORE = 50;
+  return corpus.flatMap((target): Array<{ target: SuccessiveSearchDocument; relationType: NonNullable<SuggestionAction["relationType"]>; score: number }> => {
     if (excluded.has(documentActionKey(target))) return [];
-    const relationType = navigationRelation(source, target);
-    return relationType ? [{ target, relationType }] : [];
+    const mentionsSubject = Boolean(userSubject && candidateMentionsSubject(target, userSubject));
+    const relationType = individualPageRelation(source, target) ??
+      (personSubject && mentionsSubject ? "DIRECTLY_CONNECTED" : undefined);
+    if (!relationType) return [];
+    const targetGroup = pageSemanticGroup(target);
+    if (personSubject && !mentionsSubject && (!PERSON_NAVIGATION_GROUPS.has(targetGroup) ||
+        target.role === "contact" || target.role === "location")) return [];
+    if (targetGroup === "AWARDS_AND_RECOGNITION" && pageSemanticGroup(source) !== "AWARDS_AND_RECOGNITION" &&
+        !mentionsSubject) return [];
+    const score = individualRelationStrength(source, target, relationType, userSubject);
+    return score >= MIN_RELATION_SCORE ? [{ target, relationType, score }] : [];
   }).sort((left, right) => {
-    const priority = (value: typeof left) => ({ PARENT: 8, CHILD: 7, SIBLING: 6, SAME_SECTION: 5,
-      SAME_PAGE_GROUP: 4, DIRECTLY_CONNECTED: 3 }[value.relationType] ?? 0);
     const pagePriority = (value: typeof left) => value.target.type === "page" ? 1 : 0;
-    return priority(right) - priority(left) || pagePriority(right) - pagePriority(left) ||
+    return right.score - left.score ||
+      INDIVIDUAL_RELATION_PRIORITY[right.relationType] - INDIVIDUAL_RELATION_PRIORITY[left.relationType] ||
+      pagePriority(right) - pagePriority(left) ||
       right.target.contentQuality - left.target.contentQuality;
   }).flatMap(({ target, relationType }): SuggestionAction[] => {
     const resultKey = documentActionKey(target);
