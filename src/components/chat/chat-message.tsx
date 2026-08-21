@@ -23,14 +23,10 @@ export function ChatMessage({
 }) {
   const assistant = message.role === "assistant";
   const answer = message.response?.answer ?? message.content;
-  const suggestionActions = message.response?.suggestionActions?.length
-    ? message.response.suggestionActions
-    : (message.response?.suggestions ?? []).map((label, index): SuggestionAction => ({
-        id: `follow-up-${index}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 48)}`,
-        label,
-        intent: "FOLLOW_UP_QUERY",
-        query: label,
-      }));
+  // Legacy strings are display-ineligible: only server-validated structured
+  // actions carry the result identities required for deterministic execution.
+  const suggestionActions = (message.response?.suggestionActions ?? []).filter((action) =>
+    action.intent === "CONTENT_DISCOVERY" && Boolean(action.resultKeys?.length));
   const [visibleAnswer, setVisibleAnswer] = useState(animate ? "" : answer);
 
   useEffect(() => {

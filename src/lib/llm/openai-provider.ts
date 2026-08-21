@@ -4,6 +4,7 @@ import { getEnv } from "../env";
 import { assistantResponseSchema } from "./schemas";
 import type { LLMInput, LLMProvider } from "./types";
 import { normalizeQueryUnderstanding } from "../query-understanding";
+import { compactRelatedContext } from "../related-context";
 
 const preparedQuerySchema = z.object({
   englishQuery: z.string().trim().min(2).max(1000),
@@ -121,18 +122,7 @@ Preserve official Successive names and quoted text. Do not answer the question.`
       timeout: 15000,
       maxRetries: 0,
     });
-    const context = input.context.map(
-      ({ id, type, title, excerpt, plainText, url, image, modified }) => ({
-        id,
-        type,
-        title,
-        excerpt,
-        content: plainText,
-        url,
-        image,
-        modified,
-      }),
-    );
+    const context = compactRelatedContext(input.context);
     const result = await client.chat.completions.create({
       model: env.AI_MODEL,
       response_format: { type: "json_object" },

@@ -15,6 +15,12 @@ export interface WordPressItem {
   featured_image?: string | { url?: string; source_url?: string };
   author?: number;
   author_name?: string;
+  parent?: number;
+  menu_order?: number;
+  categories?: number[];
+  tags?: number[];
+  taxonomy?: Record<string, Array<number | string>>;
+  _links?: Record<string, Array<{ href?: string; taxonomy?: string; embeddable?: boolean }>>;
   avatar_urls?: Record<string, string>;
   description?: string;
   url?: string;

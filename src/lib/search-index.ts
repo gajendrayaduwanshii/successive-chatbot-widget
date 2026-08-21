@@ -33,6 +33,10 @@ export interface SuccessiveSearchDocument {
   url: string;
   image?: string;
   modified?: string;
+  parentId?: number;
+  menuOrder?: number;
+  taxonomyTerms: string[];
+  sectionKey?: string;
   contentQuality: number;
   productLike: boolean;
   service_type?: string;
@@ -55,6 +59,14 @@ export interface SuccessiveSearchDocument {
     | "career"
     | "job_listing"
     | "product"
+    | "accelerator"
+    | "leadership"
+    | "location"
+    | "event"
+    | "webinar"
+    | "whitepaper"
+    | "report"
+    | "media"
     | "contact"
     | "page";
   capabilityProfile: {
@@ -164,12 +176,20 @@ function documentRole(item: WordPressItem, slug: string, serviceType?: string): 
   if (slug === "contact") return "contact";
   if (type.includes("case")) return "case_study";
   if (type === "post") return "blog";
+  if (type.includes("accelerator")) return "accelerator";
+  if (type.includes("media")) return "media";
+  if (type.includes("whitepaper") || /\bwhitepaper\b/.test(identity)) return "whitepaper";
+  if (type.includes("webinar") || /\bwebinar\b/.test(identity)) return "webinar";
+  if (type.includes("event") || /\bevent\b/.test(identity)) return "event";
+  if (type.includes("report") || /\breport\b/.test(identity)) return "report";
   if (type === "page" && /\b(?:partner|partnership|alliance)\b/.test(identity)) return "partner";
   if (type === "press-release") return "press_release";
   if (type === "product") return "product";
   if (type === "award") return "awards";
   if (type === "industries") return "industry";
   if (type === "partners") return "partner";
+  if (/\b(?:leadership|executive|management team|board of directors)\b/.test(identity)) return "leadership";
+  if (/\b(?:location|office|headquarters|hq)\b/.test(identity)) return "location";
   if (type === "careers" || slug === "careers") return "career";
   if (["post", "thought-leadership", "employee-perspective", "press-release", "media-coverage"].includes(type))
     return "editorial";
@@ -427,15 +447,15 @@ export function buildSearchDocument(
   const combinedText = normalizeSearchText(
     [title, item.slug, ...headings, ...descriptions, ...textSegments].join(" "),
   );
-  const internalLinks = deepAnalysis
-    ? [rendered(item.content), JSON.stringify(item.acf ?? {})]
-        .flatMap((value) => value.match(/https?:\/\/[^\s"'<>\\]+/g) ?? [])
-        .map((value) => {
-          try { return new URL(value.replace(/&amp;/g, "&")).pathname.replace(/\/$/, ""); }
-          catch { return ""; }
-        })
-        .filter(Boolean)
-    : [];
+  // Structural navigation links remain necessary even when expensive semantic
+  // cross-document analysis is disabled for the full corpus.
+  const internalLinks = [rendered(item.content), JSON.stringify(item.acf ?? {})]
+    .flatMap((value) => value.match(/https?:\/\/[^\s"'<>\\]+/g) ?? [])
+    .map((value) => {
+      try { return new URL(value.replace(/&amp;/g, "&")).pathname.replace(/\/$/, ""); }
+      catch { return ""; }
+    })
+    .filter(Boolean);
   // Title/headings lead the first chunk, while every editor and recursive ACF
   // text segment remains searchable in the subsequent overlapping chunks.
   const chunks = buildSearchChunks(item.id, [
@@ -469,6 +489,16 @@ export function buildSearchDocument(
       : (item.featured_image?.url ?? item.featured_image?.source_url);
   const serviceType = extractServiceType(item.acf);
   const role = documentRole(item, item.slug ?? "", serviceType);
+  const taxonomyTerms = [...new Set([
+    ...(item.categories ?? []).map(String), ...(item.tags ?? []).map(String),
+    ...Object.entries(item.taxonomy ?? {}).flatMap(([name, values]) => [name, ...values.map(String)]),
+  ])];
+  const sectionKey = (() => {
+    try {
+      const parts = new URL(item.link ?? item.url ?? "").pathname.split("/").filter(Boolean);
+      return parts.length > 1 ? parts[0] : undefined;
+    } catch { return undefined; }
+  })();
   const structured = deepAnalysis
     ? structuredProfileTerms(item)
     : {
@@ -496,6 +526,10 @@ export function buildSearchDocument(
       normalizeWordPressUrl(featured ?? extracted.images[0]?.url ?? "") ||
       undefined,
     modified: item.date ?? item.modified,
+    parentId: typeof item.parent === "number" && item.parent > 0 ? item.parent : undefined,
+    menuOrder: typeof item.menu_order === "number" ? item.menu_order : undefined,
+    taxonomyTerms,
+    sectionKey,
     contentQuality,
     productLike,
     service_type: serviceType,

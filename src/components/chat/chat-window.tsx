@@ -139,6 +139,11 @@ export function ChatWindow({
               suggestionAction: suggestionAction ? {
                 id: suggestionAction.id, intent: suggestionAction.intent,
                 contentType: suggestionAction.contentType, sourceContext: suggestionAction.sourceContext,
+                targetContentType: suggestionAction.targetContentType,
+                subject: suggestionAction.subject,
+                contextType: suggestionAction.contextType, sourcePageRole: suggestionAction.sourcePageRole,
+                targetResourceId: suggestionAction.targetResourceId, targetUrl: suggestionAction.targetUrl,
+                relationType: suggestionAction.relationType,
                 topic: suggestionAction.topic, entity: suggestionAction.entity,
                 relation: suggestionAction.relation, resultKeys: suggestionAction.resultKeys,
                 sourceResource: suggestionAction.sourceResource,

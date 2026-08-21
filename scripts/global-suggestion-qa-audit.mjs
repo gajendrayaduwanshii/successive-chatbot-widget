@@ -112,7 +112,8 @@ const firstTurns = await mapLimit(testCases, 3, async (testCase, index) => {
     cardUrls: (response.cards || []).map((card) => card.url),
     cards: response.cards || [],
     legacySuggestions: response.suggestions || [],
-    visibleSuggestions: response.suggestionActions || [],
+    visibleSuggestions: (response.suggestionActions || []).filter((action) =>
+      action?.intent === "CONTENT_DISCOVERY" && Array.isArray(action.resultKeys) && action.resultKeys.length),
     apiError: response.apiError,
   };
 });
@@ -125,6 +126,11 @@ function grade(action, response, previousAnswer) {
   if (!answer.trim() || response.statusCode !== 200) failureClasses.push("DEAD_END_SUGGESTION", "SUGGESTION_WITHOUT_FULFILLABLE_CONTENT");
   if (action.resultKeys?.length && !(response.cards || []).length) failureClasses.push("NO_MATCHING_CONTENT", "SUGGESTION_WITHOUT_FULFILLABLE_CONTENT");
   if (action.contentType === "case-study" && !(response.cards || []).some((card) => card.type === "case-study")) failureClasses.push("WRONG_CONTENT_TYPE");
+  if (/\brelated\s+related\b/i.test(action.label || "")) failureClasses.push("MALFORMED_SUGGESTION_LABEL");
+  if (action.targetContentType && !(response.cards || []).every((card) =>
+    String(card.badge || "").replaceAll(" ", "_") === action.targetContentType ||
+    (action.targetContentType === "case_study" && card.type === "case-study") ||
+    (["blog", "editorial"].includes(action.targetContentType) && card.type === "blog"))) failureClasses.push("WRONG_CONTENT_TYPE");
   if (action.intent === "CUSTOMER_WORK_DISCOVERY" && !/customer|client|case stud|published work/i.test(`${answer} ${(response.cards || []).map((card) => card.badge).join(" ")}`)) failureClasses.push("WRONG_RELATION");
   if (previousAnswer && answer.replace(/\s+/g, " ").trim() === previousAnswer.replace(/\s+/g, " ").trim()) failureClasses.push("SUGGESTION_LOOP");
   const unique = [...new Set(failureClasses)];
@@ -147,7 +153,8 @@ for (const [firstIndex, first] of firstTurns.entries()) {
       sourceUrls: (clicked.sources || []).map((source) => source.url), cardUrls: (clicked.cards || []).map((card) => card.url),
       responseSummary: (clicked.answer || "").replace(/\s+/g, " ").slice(0, 500), notes: "Each visible action was clicked from an independent copy of its matching first-turn state.",
     });
-    for (const [level2Index, nextAction] of (clicked.suggestionActions || []).entries()) {
+    for (const [level2Index, nextAction] of (clicked.suggestionActions || []).filter((candidate) =>
+      candidate?.intent === "CONTENT_DISCOVERY" && candidate.resultKeys?.length).entries()) {
       const secondHistory = [...history, { role: "user", content: action.label }, { role: "assistant", content: clicked.answer || "" }];
       const next = await ask(nextAction.label, secondHistory, nextAction, `level2-${firstIndex}-${actionIndex}-${level2Index}`);
       const nextAssessed = grade(nextAction, next, clicked.answer || "");
@@ -209,7 +216,7 @@ const metrics = {
   transportErrors: firstTurns.filter((row) => row.statusCode === 0).length,
   legacySuggestionStringsReturned: firstTurns.reduce((sum, row) => sum + row.legacySuggestions.length, 0),
   labelOnlySuggestionsRenderedByBundledUi: 0,
-  failureClassCounts: Object.fromEntries(["SUGGESTION_WITHOUT_FULFILLABLE_CONTENT", "NO_MATCHING_CONTENT", "WEAK_MATCH_ONLY", "DEAD_END_SUGGESTION", "UNSUPPORTED_SUGGESTION_OFFERED", "LABEL_REPARSED_AS_QUERY", "CONTEXT_LOSS", "WRONG_TOPIC", "WRONG_ENTITY", "WRONG_CONTENT_TYPE", "WRONG_RELATION", "UNRELATED_SOURCE", "UNRELATED_CARD", "SUGGESTION_LOOP", "DUPLICATE_ACTION", "GENERIC_FALLBACK_AFTER_CLICK"].map((name) => [name, suggestionTests.filter((row) => row.failureClasses.includes(name)).length])),
+  failureClassCounts: Object.fromEntries(["SOURCE_TITLE_CONTEXT_LEAK", "INVALID_PAGE_ROLE_SUGGESTION", "SUGGESTION_WITHOUT_FULFILLABLE_CONTENT", "MALFORMED_SUGGESTION_LABEL", "NO_MATCHING_CONTENT", "WEAK_MATCH_ONLY", "DEAD_END_SUGGESTION", "UNSUPPORTED_SUGGESTION_OFFERED", "LABEL_REPARSED_AS_QUERY", "CONTEXT_LOSS", "WRONG_TOPIC", "WRONG_ENTITY", "WRONG_CONTENT_TYPE", "WRONG_RELATION", "UNRELATED_SOURCE", "UNRELATED_CARD", "SUGGESTION_LOOP", "DUPLICATE_ACTION", "GENERIC_FALLBACK_AFTER_CLICK"].map((name) => [name, suggestionTests.filter((row) => row.failureClasses.includes(name)).length])),
 };
 const results = { generatedAt: new Date().toISOString(), auditType: "read-only production-behavior QA", inventory, metrics, categoryScorecard, firstTurns, suggestionTests, manualComparisons };
 writeFileSync("GLOBAL_SUGGESTION_QA_RESULTS.json", JSON.stringify(results, null, 2));

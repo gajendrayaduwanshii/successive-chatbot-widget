@@ -345,12 +345,10 @@
   };
   var executableSuggestions = function (response) {
     if (Array.isArray(response && response.suggestionActions) && response.suggestionActions.length)
-      return response.suggestionActions;
-    return (Array.isArray(response && response.suggestions) ? response.suggestions : []).map(function (label, index) {
-      var value = safeText(label, "", 160);
-      return { id: "follow-up-" + index + "-" + value.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 48),
-        label: value, intent: "FOLLOW_UP_QUERY", query: value };
-    });
+      return response.suggestionActions.filter(function (action) {
+        return action && action.intent === "CONTENT_DISCOVERY" && Array.isArray(action.resultKeys) && action.resultKeys.length;
+      });
+    return [];
   };
   var renderMessage = function (message) {
     var assistant = message.role === "assistant";
@@ -548,6 +546,13 @@
           id: suggestionAction.id,
           intent: suggestionAction.intent,
           contentType: suggestionAction.contentType,
+          targetContentType: suggestionAction.targetContentType,
+          subject: suggestionAction.subject,
+          contextType: suggestionAction.contextType,
+          sourcePageRole: suggestionAction.sourcePageRole,
+          targetResourceId: suggestionAction.targetResourceId,
+          targetUrl: suggestionAction.targetUrl,
+          relationType: suggestionAction.relationType,
           sourceContext: suggestionAction.sourceContext,
           topic: suggestionAction.topic,
           entity: suggestionAction.entity,

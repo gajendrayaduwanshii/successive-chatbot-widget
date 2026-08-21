@@ -19,6 +19,7 @@ import {
 } from "@/lib/query-language";
 import {
   buildSearchDocument,
+  buildSearchIndex,
   normalizeSearchText,
   type SuccessiveSearchDocument,
 } from "@/lib/search-index";
@@ -77,7 +78,7 @@ import {
 } from "@/lib/structured-knowledge";
 import { recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
 import { alignedCta, selectAlignedSecondaryMatches } from "@/lib/response-alignment";
-import { buildEvidenceBackedSuggestionActions, buildFollowUpQueryActions, resolveEligibleActionDocuments, resolveSuggestionAction } from "@/lib/suggestion-actions";
+import { buildCategoryNavigationActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, buildFollowUpQueryActions, classifySuggestionContext, resolveEligibleActionDocuments, resolveSuggestionAction, type SuggestionContextType } from "@/lib/suggestion-actions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -102,6 +103,13 @@ const requestSchema = z.object({
     id: z.string().min(1).max(80),
     intent: z.enum(["CUSTOMER_WORK_DISCOVERY", "CONTENT_DISCOVERY", "PUBLIC_ORGANIZATION_OVERVIEW", "FOLLOW_UP_QUERY"]),
     contentType: z.enum(["case-study", "customer-work"]).optional(),
+    targetContentType: z.string().min(1).max(80).optional(),
+    subject: z.string().min(1).max(200).optional(),
+    contextType: z.enum(["TOPIC_CONTEXT", "INDIVIDUAL_PAGE_CONTEXT", "CATEGORY_LISTING_CONTEXT"]).optional(),
+    sourcePageRole: z.string().min(1).max(80).optional(),
+    targetResourceId: z.string().min(3).max(100).optional(),
+    targetUrl: z.string().url().optional(),
+    relationType: z.enum(["PARENT", "CHILD", "SIBLING", "SAME_SECTION", "SAME_PAGE_GROUP", "DIRECTLY_CONNECTED"]).optional(),
     sourceContext: z.string().max(80).optional(),
     topic: z.string().max(200).optional(),
     entity: z.string().max(200).optional(),
@@ -131,6 +139,30 @@ const error = (
     { success: false, error: { code, message } },
     { status, headers },
   );
+
+let suggestionCorpusCache: { loadedAt: number; documents: SuccessiveSearchDocument[] } | undefined;
+async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]> {
+  if (suggestionCorpusCache && Date.now() - suggestionCorpusCache.loadedAt < 5 * 60_000)
+    return suggestionCorpusCache.documents;
+  const documents = buildSearchIndex(await fetchAllPublishedContent());
+  suggestionCorpusCache = { loadedAt: Date.now(), documents };
+  return documents;
+}
+
+async function buildResolvedNavigationActions({ document, subject, contextType, excludedResultKeys = [] }: {
+  document: SuccessiveSearchDocument;
+  subject?: string;
+  contextType: Exclude<SuggestionContextType, "TOPIC_CONTEXT" | "OTHER_CONTEXT">;
+  excludedResultKeys?: string[];
+}) {
+  const corpus = await getSuggestionCorpus();
+  const source = corpus.find((candidate) => candidate.id === document.id && candidate.type === document.type) ??
+    corpus.find((candidate) => candidate.url.replace(/\/$/, "") === document.url.replace(/\/$/, "")) ?? document;
+  return contextType === "CATEGORY_LISTING_CONTEXT"
+    ? buildCategoryNavigationActions({ source, corpus, excludedResultKeys, limit: 3 })
+    : buildIndividualPageNavigationActions({ source, corpus, userSubject: subject ?? source.title,
+        excludedResultKeys, limit: 3 });
+}
 
 async function fetchStructuredItems(request: StructuredRequest) {
   if (request.attribute === "employee_policy") {
@@ -286,10 +318,20 @@ export async function POST(request: NextRequest) {
 
   if (parsed.data.suggestionAction?.intent === "CONTENT_DISCOVERY" && parsed.data.suggestionAction.resultKeys?.length) {
     try {
-      const documents = (await fetchAllPublishedContent()).map((item) => buildSearchDocument(item));
+      const documents = await getSuggestionCorpus();
       const eligible = resolveEligibleActionDocuments(parsed.data.suggestionAction, documents);
       if (eligible.length) {
         const presented = eligible.slice(0, 3);
+        const nextActions = parsed.data.suggestionAction.contextType === "INDIVIDUAL_PAGE_CONTEXT"
+          ? buildIndividualPageNavigationActions({ source: presented[0]!, corpus: documents,
+              userSubject: parsed.data.suggestionAction.subject ?? parsed.data.suggestionAction.topic,
+              excludedResultKeys: [parsed.data.suggestionAction.sourceContext ?? ""], limit: 3 })
+          : parsed.data.suggestionAction.contextType === "CATEGORY_LISTING_CONTEXT"
+            ? buildCategoryNavigationActions({ source: presented[0]!, corpus: documents,
+                excludedResultKeys: [parsed.data.suggestionAction.sourceContext ?? ""], limit: 3 })
+          : buildGlobalRelatedContentActions({ source: presented[0]!, corpus: documents,
+              userSubject: parsed.data.suggestionAction.subject ?? parsed.data.suggestionAction.topic ?? presented[0]!.title,
+              recentActionIds: [parsed.data.suggestionAction.id], limit: 3 });
         const answer = presented.map((document) => {
           const details = [...new Set([...document.descriptions, ...document.textSegments])]
             .filter((value) => normalizeSearchText(value) !== document.normalizedTitle)
@@ -302,7 +344,8 @@ export async function POST(request: NextRequest) {
             description: document.descriptions[0] ?? document.textSegments[0] ?? document.title,
             url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
           sources: presented.map((document) => ({ title: document.title, url: document.url })),
-          suggestions: [], suggestionActions: [], confidence: "high", insufficientContext: false,
+          suggestions: nextActions.map((action) => action.label), suggestionActions: nextActions,
+          confidence: "high", insufficientContext: false,
         }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
       }
     } catch {
@@ -579,6 +622,10 @@ export async function POST(request: NextRequest) {
       if (structuredAnswer) {
         const { document } = structuredAnswer;
         const suppressUnsupportedCard = structuredAnswer.evidencePaths.length === 0;
+        const suggestionActions = suppressUnsupportedCard ? [] : await buildResolvedNavigationActions({
+          document, subject: structuredRequest.subject || effectiveMessage,
+          contextType: "INDIVIDUAL_PAGE_CONTEXT",
+        });
         return NextResponse.json(
           {
             success: true,
@@ -597,8 +644,8 @@ export async function POST(request: NextRequest) {
                 badge: document.role.replace(/_/g, " "),
               }],
               sources: suppressUnsupportedCard ? [] : [{ title: document.title, url: document.url }],
-              suggestions: structuredAnswer.suggestions,
-              suggestionActions: suppressUnsupportedCard ? [] : followUpActions(buildRelatedSuggestions("general", document.title)),
+              suggestions: suggestionActions.map((action) => action.label),
+              suggestionActions,
               confidence: "high",
               insufficientContext: suppressUnsupportedCard,
               ...(process.env.NODE_ENV !== "production" ? {
@@ -606,6 +653,7 @@ export async function POST(request: NextRequest) {
                   route: "structured_api",
                   companyAttribute: structuredRequest.attribute,
                   evidencePaths: structuredAnswer.evidencePaths,
+                  suggestionContextType: "INDIVIDUAL_PAGE_CONTEXT",
                 },
               } : {}),
             },
@@ -832,6 +880,9 @@ export async function POST(request: NextRequest) {
         document.textSegments.find(
           (segment) => segment.toLowerCase() !== document.title.toLowerCase(),
         ) ?? "Open the official Successive Contact Us page.";
+      const suggestionActions = await buildResolvedNavigationActions({
+        document, subject: effectiveMessage, contextType: "INDIVIDUAL_PAGE_CONTEXT",
+      });
       return NextResponse.json(
         {
           success: true,
@@ -854,8 +905,8 @@ export async function POST(request: NextRequest) {
               },
             ],
             sources: [{ title: document.title, url: document.url }],
-            suggestions: buildRelatedSuggestions("contact", document.title),
-            suggestionActions: followUpActions(buildRelatedSuggestions("contact", document.title)),
+            suggestions: suggestionActions.map((action) => action.label),
+            suggestionActions,
             confidence: "high",
             insufficientContext: false,
           },
@@ -905,6 +956,9 @@ export async function POST(request: NextRequest) {
       const description = cleanStoryDescription(
         passages[0] ?? "Open the official Successive About page.",
       );
+      const suggestionActions = await buildResolvedNavigationActions({
+        document, subject: effectiveMessage, contextType: "INDIVIDUAL_PAGE_CONTEXT",
+      });
       return NextResponse.json(
         {
           success: true,
@@ -919,8 +973,8 @@ export async function POST(request: NextRequest) {
               badge: "company",
             }],
             sources: [{ title: document.title, url: document.url }],
-            suggestions: buildRelatedSuggestions("about", document.title),
-            suggestionActions: followUpActions(buildRelatedSuggestions("about", document.title)),
+            suggestions: suggestionActions.map((action) => action.label),
+            suggestionActions,
             confidence: "high",
             insufficientContext: false,
           },
@@ -982,6 +1036,9 @@ export async function POST(request: NextRequest) {
           cors.headers,
         );
       const documents = [listing, ...caseStudies];
+      const suggestionActions = await buildResolvedNavigationActions({
+        document: listing, contextType: "CATEGORY_LISTING_CONTEXT",
+      });
       return NextResponse.json(
         {
           success: true,
@@ -1011,11 +1068,8 @@ export async function POST(request: NextRequest) {
               title: document.title,
               url: document.url,
             })),
-            suggestions: buildRelatedSuggestions(
-              "case_studies",
-              caseStudies[0]?.title,
-            ),
-            suggestionActions: followUpActions(buildCollectionSuggestions("case studies", caseStudies.length)),
+            suggestions: suggestionActions.map((action) => action.label),
+            suggestionActions,
             confidence: "high",
             insufficientContext: false,
           },
@@ -1101,6 +1155,11 @@ export async function POST(request: NextRequest) {
             url: `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/blogs-and-insights/`,
             badge: "blogs",
           };
+      const listingDocument = listing ?? buildSearchDocument({ id: -1, type: "page", slug: "blogs",
+        link: listingCard.url, title: { rendered: listingCard.title }, content: { rendered: listingCard.description } });
+      const suggestionActions = await buildResolvedNavigationActions({
+        document: listingDocument, contextType: "CATEGORY_LISTING_CONTEXT",
+      });
       return NextResponse.json(
         {
           success: true,
@@ -1136,8 +1195,8 @@ export async function POST(request: NextRequest) {
                 url: document.url,
               })),
             ],
-            suggestions: buildRelatedSuggestions("blogs", posts[0]?.title),
-            suggestionActions: followUpActions(buildCollectionSuggestions("blogs and insights", posts.length)),
+            suggestions: suggestionActions.map((action) => action.label),
+            suggestionActions,
             confidence: "high",
             insufficientContext: false,
           },
@@ -1370,6 +1429,11 @@ export async function POST(request: NextRequest) {
       const presented = retrieval.matches.slice(0, 15);
       const total = retrieval.collectionTotal;
       const label = retrieval.collectionLabel ?? "items";
+      const listingSource = presented.find(({ document }) => document.role === "global_capabilities" ||
+        document.role === "partners" || document.role === "page")?.document ?? presented[0]?.document;
+      const suggestionActions = listingSource ? await buildResolvedNavigationActions({
+        document: listingSource, contextType: "CATEGORY_LISTING_CONTEXT",
+      }) : [];
       return NextResponse.json(
         {
           success: true,
@@ -1388,8 +1452,8 @@ export async function POST(request: NextRequest) {
               title: document.title,
               url: document.url,
             })),
-            suggestions: buildCollectionSuggestions(label, total),
-            suggestionActions: followUpActions(buildCollectionSuggestions(label, total)),
+            suggestions: suggestionActions.map((action) => action.label),
+            suggestionActions,
             confidence: "high",
             insufficientContext: false,
           },
@@ -1652,36 +1716,28 @@ export async function POST(request: NextRequest) {
     const sourceMatches = presentedMatches.length
       ? presentedMatches
       : alignedMatches.slice(0, 2);
-    const fallbackSuggestions = isWhitepaperQuery
-      ? buildCollectionSuggestions("whitepapers", retrieval.collectionTotal ?? presentedMatches.length)
-      : buildRelatedSuggestions(intent, presentedMatches[0]?.document.title);
-    const generatedSuggestions = generatedData?.suggestions?.length ? generatedData.suggestions : [];
-    const displayedTitles = presentedMatches.map(({ document }) => normalizeSearchText(document.title));
-    const suggestionLabels = [...generatedSuggestions, ...fallbackSuggestions]
-      .filter((label, index, all) => all.findIndex((candidate) =>
-        normalizeSearchText(candidate) === normalizeSearchText(label)) === index)
-      .filter((label) => {
-        const normalized = normalizeSearchText(label);
-        const isConversationalFollowUp = /^(?:what|how|which|show|tell|compare|find)\b/.test(normalized);
-        const promisesUnvalidatedRelatedContent = /\b(?:case stud|customer stor|another related (?:resource|webinar|article)|which successive services? (?:are related|support)|related successive services?)\b/.test(normalized);
-        const isNavigationCta = /\b(?:faq|reach out|get in touch|contact (?:us|successive)|visit (?:the )?(?:successive )?website|book (?:a )?(?:call|consultation)|request (?:a )?consultation)\b/.test(normalized) ||
-          /^(?:consider|review|visit|contact|reach out|get in touch|learn more|if you|you may)\b/.test(normalized);
-        const merelyReopensCard = /^(?:tell me more about|learn more about|explore service|read article|view case study)/.test(normalized) &&
-          displayedTitles.some((title) => title.length > 4 && normalized.includes(title));
-        return isConversationalFollowUp && !promisesUnvalidatedRelatedContent && !isNavigationCta && !merelyReopensCard;
-      })
-      .slice(0, 3);
-    const semanticSuggestionActions = followUpActions(suggestionLabels, presentedMatches[0]?.document.title);
+    // Labels proposed by an LLM or legacy templates are not executable contracts.
+    // Discover and validate real corpus items first, then create structured actions.
+    const suggestionContextType = classifySuggestionContext({
+      source: alignment.primary?.document,
+      exactResource: Boolean(exactNamedResource),
+      personEntity: isNamedSuccessivePersonQuery && alignment.primary?.document.role === "company",
+    });
     const relatedEvidenceActions = alignment.primary
-      ? buildEvidenceBackedSuggestionActions({
+      ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
-          acceptedRelated: alignment.related.map((match) => match.document).filter((document) =>
-            !presentedMatches.some((presented) => presented.document.id === document.id && presented.document.type === document.type)),
+          corpus: await getSuggestionCorpus(),
+          userSubject: understanding.entities[0] ?? understanding.topics[0] ?? alignment.primary.document.title,
+          limit: 3,
+        }) : buildGlobalRelatedContentActions({
+          source: alignment.primary.document,
+          corpus: await getSuggestionCorpus(),
+          userSubject: understanding.entities[0] ?? understanding.topics[0] ?? alignment.primary.document.title,
           recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
-          limit: 2,
+          limit: 3,
         })
       : [];
-    const suggestionActions = [...semanticSuggestionActions, ...relatedEvidenceActions]
+    const suggestionActions = relatedEvidenceActions
       .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
       .slice(0, 3);
     const response = {
@@ -1983,23 +2039,6 @@ function buildCollectionListAnswer(
     )
     .join("\n");
   return `## ${label.replace(/\b\w/g, (letter) => letter.toUpperCase())}\n\n${summary}\n\n${items}`;
-}
-
-function buildCollectionSuggestions(label: string, total: number): string[] {
-  const singular = label
-    .replace("blogs and insights", "resource")
-    .replace("webinars and events", "webinar")
-    .replace("case studies", "case study")
-    .replace("whitepapers", "whitepaper")
-    .replace(/ies$/, "y")
-    .replace(/s$/, "");
-  return [
-    "Tell me more about the first one",
-    `Show me the latest ${singular}`,
-    total > 1
-      ? `Help me choose from these ${label}`
-      : `How can this ${singular} help my business?`,
-  ];
 }
 
 function buildRelatedSuggestions(
