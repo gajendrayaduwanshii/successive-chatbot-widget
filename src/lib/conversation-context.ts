@@ -123,6 +123,17 @@ export function resolveOfferedResourceFollowUp(
   return selected ? `Summarize '${selected.title}' ${offeredType}` : undefined;
 }
 
+export function resolveUnsupportedAlternativeFollowUp(
+  message: string,
+  history: HistoryMessage[],
+): string | undefined {
+  if (!/^(?:yes|yes please|sure|okay|ok|please do|go ahead|show me)$/i.test(message.trim())) return undefined;
+  const prior = history.findLast((item) => item.role === "assistant")?.content ?? "";
+  return /published case studies or publicly announced (?:customer )?work/i.test(prior)
+    ? "Show me Successive published case studies"
+    : undefined;
+}
+
 export function buildRelatedServiceRetrievalQuery(
   message: string,
   history: HistoryMessage[],

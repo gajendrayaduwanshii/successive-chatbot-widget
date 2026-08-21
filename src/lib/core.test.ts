@@ -64,6 +64,7 @@ import {
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
   resolveOfferedResourceFollowUp,
+  resolveUnsupportedAlternativeFollowUp,
 } from "./conversation-context";
 import { buildDeterministicUnderstanding, resolveConversationUnderstanding } from "./query-understanding";
 
@@ -89,6 +90,12 @@ describe("named resource follow-ups", () => {
   it("does not let a generic yes inherit an arbitrary old link", () => {
     expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: "See [About](https://successive.tech/about-us/)." }]))
       .toBeUndefined();
+  });
+
+  it("turns acceptance of an unsupported-query alternative into public case-study discovery", () => {
+    const prior = "I couldn’t confirm Successive’s current internal projects from the available public content. I can instead show you Successive’s published case studies or publicly announced customer work.";
+    expect(resolveUnsupportedAlternativeFollowUp("yes", [{ role: "assistant", content: prior }]))
+      .toBe("Show me Successive published case studies");
   });
 });
 
@@ -193,6 +200,16 @@ describe("multi-turn conversation context", () => {
     ]);
     expect(resolved.understanding.topics).toContain("retail");
     expect(resolved.understanding.requestedContentType).toBe("case-study");
+  });
+  it("does not inherit a previous resource type when a new explicit subject contains a pronoun", () => {
+    const current = buildDeterministicUnderstanding("What is React? Does Successive use it?");
+    const resolved = resolveConversationUnderstanding(current, [
+      { role: "user", content: "Read article: Corent ComPaaS Guide" },
+      { role: "assistant", content: "A published Corent article." },
+    ]);
+    expect(resolved.understanding.topics).toContain("react");
+    expect(resolved.understanding.topics.join(" ")).not.toContain("corent");
+    expect(resolved.understanding.requestedContentType).toBeNull();
   });
   it("grounds related-service follow-ups in the latest assistant sources", () => {
     const history = [

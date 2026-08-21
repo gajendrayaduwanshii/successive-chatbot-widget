@@ -84,6 +84,16 @@ describe("generic query understanding", () => {
     expect(isExplicitListRequest("What industries do you serve?")).toBe(true);
     expect(isExplicitListRequest("Which technologies are available?")).toBe(true);
     expect(isExplicitListRequest("Tell me about retail services")).toBe(false);
+    expect(isExplicitListRequest("Explore Successive industries")).toBe(true);
+    expect(applyStructuralBroadQueryRules(
+      buildDeterministicUnderstanding("Explore Successive industries"),
+      "Explore Successive industries",
+    )).toMatchObject({
+      requestedContentType: "industry",
+      topics: [],
+      targetScope: "portfolio",
+      isBroadQuery: true,
+    });
   });
 
   it("does not flatten a short explicit technology service query into the broad portfolio", () => {

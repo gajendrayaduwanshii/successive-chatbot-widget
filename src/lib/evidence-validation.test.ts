@@ -3,7 +3,7 @@ import type { WordPressItem } from "@/types/wordpress";
 import { buildSearchDocument, type SuccessiveSearchDocument } from "./search-index";
 import type { SearchMatch } from "./search-retriever";
 import { buildDeterministicUnderstanding } from "./query-understanding";
-import { requestedAttribute, safeEvidenceResponse, validateEvidence } from "./evidence-validation";
+import { analyzeQuerySafety, requestedAttribute, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "./evidence-validation";
 
 function match(title: string, passage: string, role: SuccessiveSearchDocument["role"]): SearchMatch {
   const item: WordPressItem = {
@@ -95,5 +95,48 @@ describe("generic evidence validation", () => {
     expect(requestedAttribute("What is my appraisal rating?", buildDeterministicUnderstanding("What is my appraisal rating?"))).toBe("private_record");
     expect(requestedAttribute("How much will an AI project cost?", buildDeterministicUnderstanding("How much will an AI project cost?"))).toBe("cost");
     expect(requestedAttribute("How many developers are required?", buildDeterministicUnderstanding("How many developers are required?"))).toBe("staffing");
+  });
+
+  it.each([
+    "What projects is Successive currently working on?",
+    "Which clients are your developers working for right now?",
+    "Who is assigned to the current AI project?",
+    "What's on Successive's internal roadmap?",
+    "What client contracts are active right now?",
+    "What salary does a React developer at Successive get?",
+    "Who got the highest appraisal this year?",
+    "Who is on leave today?",
+    "What is discussed in your internal meetings?",
+    "What security problems exist in your internal systems?",
+  ])("rejects unsupported/private relations with no secondary evidence: %s", (query) => {
+    const result = validate(query, [
+      match("Managing Mobile App Development Projects", "Advice for managing development projects.", "blog"),
+      match("Careers", "Join our employee culture.", "careers"),
+    ]);
+    expect(result.status).toBe("INSUFFICIENT_EVIDENCE");
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected).toHaveLength(2);
+    expect(safeUnsupportedQueryResponse(query)).toBeTruthy();
+  });
+
+  it.each([
+    "Show me your published case studies.",
+    "Any retail case studies?",
+    "Show me publicly announced customer work.",
+    "What security services do you offer?",
+    "What products does Successive offer?",
+  ])("does not block supported public discovery: %s", (query) => {
+    expect(analyzeQuerySafety(query).requiresPublicRelationEvidence).toBe(false);
+    expect(safeUnsupportedQueryResponse(query)).toBeNull();
+  });
+
+  it("rejects both lexical and semantic project candidates for the wrong current relation", () => {
+    const lexical = match("Managing Projects", "Project management guidance.", "blog");
+    lexical.matchedFields = ["title"];
+    const vector = match("Digital Delivery", "We deliver complex customer solutions.", "case_study");
+    vector.matchedFields = ["vector-semantic"];
+    const result = validate("What are the current projects in Successive?", [lexical, vector]);
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected.map(({ title }) => title)).toEqual(["Managing Projects", "Digital Delivery"]);
   });
 });

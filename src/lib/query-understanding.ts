@@ -329,8 +329,9 @@ export function resolveConversationUnderstanding(
       lastExplicitTopicTurn = index;
     }
   });
-  const shouldInherit = current.isFollowUp || current.topics.length === 0 ||
-    /\b(?:this|that|it|its|these|those|them)\b/i.test(current.normalizedQuery);
+  const hasExplicitCurrentSubject = current.topics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
+  const shouldInherit = !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 ||
+    /\b(?:this|that|it|its|these|those|them)\b/i.test(current.normalizedQuery));
   const preserveTypeForTopicSwitch = /^what about\b/.test(current.normalizedQuery);
   const topics = current.topics.length
     ? current.topics
@@ -412,7 +413,7 @@ export function applyStructuralBroadQueryRules(
       confidence: Math.max(understanding.confidence, 0.95),
     };
   }
-  if (/^(?:industries focus|industry focus|what industries|which industries|list industries|show all industries|industries)$/.test(normalized)) {
+  if (/^(?:industries focus|industry focus|what industries|which industries|list industries|show all industries|show (?:me )?(?:successive )?industries|explore (?:successive )?industries|industries)$/.test(normalized)) {
     return {
       ...understanding,
       intent: "discovery",
@@ -457,6 +458,7 @@ export function isExplicitListRequest(message: string): boolean {
     /\b(?:show|give|provide)\s+(?:me\s+)?(?:all|every|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+are\s+(?:all|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+(?:industries|categories|technologies|services|offerings)\b.*\b(?:serve|served|cover|covered|available|offer|offered|provide|provided|use|used)\b/.test(normalized) ||
+    /^(?:show (?:me )?|explore )(?:successive )?industries$/.test(normalized) ||
     /^(?:all|every)\s+\S+/.test(normalized)
   );
 }

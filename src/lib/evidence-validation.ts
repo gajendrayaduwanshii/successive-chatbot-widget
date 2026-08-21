@@ -24,6 +24,52 @@ export interface EvidenceValidation {
   reason: string;
 }
 
+export type SafetyRelation =
+  | "CURRENT_PROJECTS" | "EMPLOYEE_WORKS_ON" | "EMPLOYEE_COMPENSATION"
+  | "EMPLOYEE_PRIVATE_RECORD" | "INTERNAL_ROADMAP" | "PRIVATE_CONTRACT"
+  | "PRIVATE_PRICING" | "INTERNAL_MEETING" | "INTERNAL_SECURITY"
+  | "PUBLIC_INFORMATION" | "UNSPECIFIED";
+
+export interface QuerySafetyProfile {
+  relation: SafetyRelation;
+  timeScope: "CURRENT" | "FUTURE" | "RECENT" | "UNSPECIFIED";
+  visibility: "PUBLIC" | "PRIVATE_OR_UNPUBLISHED" | "UNSPECIFIED";
+  requiresPublicRelationEvidence: boolean;
+}
+
+/**
+ * Classifies the information relationship, rather than blocking individual
+ * words. Explicit requests for published material remain public discovery.
+ */
+export function analyzeQuerySafety(message: string): QuerySafetyProfile {
+  const q = normalizeSearchText(message);
+  const publicScope = /\b(?:public|publicly|published|announced|case stud(?:y|ies)|customer stor(?:y|ies)|press release|media coverage)\b/.test(q);
+  const privateScope = /\b(?:internal|private|confidential|secret|unreleased|unpublished)\b/.test(q);
+  const current = /\b(?:current|currently|ongoing|active|right now|today|working on|assigned to|on leave|delayed)\b/.test(q);
+  const future = /\b(?:upcoming|future|next year|will launch|roadmap)\b/.test(q);
+  const recent = /\b(?:latest|recent|newest)\b/.test(q);
+
+  let relation: SafetyRelation = "UNSPECIFIED";
+  if (/\b(?:salary|compensation|pay|appraisal|performance rating|bonus|hike)\b/.test(q)) relation = "EMPLOYEE_COMPENSATION";
+  else if (/\b(?:leave|attendance|employee record|employee id|who is absent)\b/.test(q)) relation = "EMPLOYEE_PRIVATE_RECORD";
+  else if (/\b(?:who|which (?:employee|developer|client)|team members?|assigned)\b.*\b(?:working|projects?|assigned|clients?)\b|\b(?:employees?|developers?)\b.*\b(?:working for|assigned to|clients?|projects?)\b|\bwho is on (?:the )?.*project\b/.test(q)) relation = "EMPLOYEE_WORKS_ON";
+  else if (/\b(?:contracts?|contract value|client billing|billing rate|minimum contract)\b/.test(q)) relation = /\b(?:private|confidential|active|current|billing|value)\b/.test(q) ? "PRIVATE_CONTRACT" : "PRIVATE_PRICING";
+  else if (/\b(?:price|pricing|hourly rate|project worth|project cost|free trial)\b/.test(q)) relation = "PRIVATE_PRICING";
+  else if (/\b(?:roadmap|future launch|upcoming .*launch)\b/.test(q)) relation = "INTERNAL_ROADMAP";
+  else if (/\b(?:internal meetings?|meeting notes?|meeting minutes?)\b/.test(q)) relation = "INTERNAL_MEETING";
+  else if (/\b(?:vulnerabilit|security (?:problems?|incidents?|weakness(?:es)?)|internal (?:systems?|infrastructure)|credentials|source code)\b/.test(q)) relation = "INTERNAL_SECURITY";
+  else if (/\b(?:projects?|client engagements?|client work|customer project|what are you working on)\b/.test(q) && (current || future || privateScope)) relation = "CURRENT_PROJECTS";
+  else if (publicScope) relation = "PUBLIC_INFORMATION";
+
+  const inherentlyPrivate = !publicScope && relation !== "UNSPECIFIED" && relation !== "PUBLIC_INFORMATION";
+  return {
+    relation,
+    timeScope: future ? "FUTURE" : current ? "CURRENT" : recent ? "RECENT" : "UNSPECIFIED",
+    visibility: publicScope ? "PUBLIC" : privateScope || inherentlyPrivate ? "PRIVATE_OR_UNPUBLISHED" : "UNSPECIFIED",
+    requiresPublicRelationEvidence: inherentlyPrivate,
+  };
+}
+
 const AUTHORITATIVE_ROLES = new Set([
   "service", "company", "global_capabilities", "partner", "partners",
   "product", "press_release", "culture", "careers", "awards",
@@ -184,6 +230,7 @@ export function validateEvidence(args: {
   hasConversationSubject: boolean;
 }): EvidenceValidation {
   const { message, understanding, matches } = args;
+  const safety = analyzeQuerySafety(message);
   const attribute = requestedAttribute(message, understanding);
   const queryTerms = terms(message).filter((term) => !attributeWords.has(term));
   const contextTerms = args.contextMessage &&
@@ -198,6 +245,20 @@ export function validateEvidence(args: {
   const ambiguous = /^(?:how long|how much|when|where|who|what about that|can you do it|tell me more|what will it cost|how quickly can you finish)[?.!\s]*$/i.test(message.trim());
   if (ambiguous && !args.hasConversationSubject) {
     return { status: "AMBIGUOUS", confidence: "none", subject, requestedAttribute: attribute, accepted: [], rejected: [], reason: "The requested subject is unresolved." };
+  }
+
+  if (safety.requiresPublicRelationEvidence) {
+    return {
+      status: "INSUFFICIENT_EVIDENCE", confidence: "none", subject,
+      requestedAttribute: attribute, accepted: [],
+      rejected: matches.map((match) => ({
+        title: match.document.title,
+        reason: safety.visibility === "PRIVATE_OR_UNPUBLISHED"
+          ? "private or unpublished relation is not supported by public evidence"
+          : "semantically related content does not support the requested relation and time scope",
+      })),
+      reason: `The requested ${safety.relation.toLowerCase().replace(/_/g, " ")} relation is private, unpublished, or not established by authoritative public evidence.`,
+    };
   }
 
   const evaluated = matches.map((match) => {
@@ -286,4 +347,26 @@ export function safeEvidenceResponse(validation: EvidenceValidation): string {
       ? "A reliable estimate would require the project scope, integrations, constraints, and delivery requirements."
       : "You can clarify the subject or ask about a related published Successive capability.";
   return `I couldn’t confirm the ${labels[validation.requestedAttribute]} for ${validation.subject} from the available Successive content. ${nextStep}`;
+}
+
+export function safeUnsupportedQueryResponse(message: string): string | null {
+  const profile = analyzeQuerySafety(message);
+  if (!profile.requiresPublicRelationEvidence) return null;
+  const subject = profile.relation === "EMPLOYEE_COMPENSATION" || profile.relation === "EMPLOYEE_PRIVATE_RECORD" || profile.relation === "EMPLOYEE_WORKS_ON"
+    ? "that employee-specific information"
+    : profile.relation === "PRIVATE_PRICING" || profile.relation === "PRIVATE_CONTRACT"
+      ? "those commercial or contract details"
+      : profile.relation === "INTERNAL_SECURITY"
+        ? "that internal security information"
+        : profile.relation === "INTERNAL_ROADMAP"
+          ? "that internal roadmap information"
+          : profile.relation === "INTERNAL_MEETING"
+            ? "those internal meeting details"
+            : "Successive’s current internal projects or active confidential engagements";
+  const alternative = profile.relation === "CURRENT_PROJECTS" || profile.relation === "EMPLOYEE_WORKS_ON"
+    ? " I can instead show you Successive’s published case studies or publicly announced customer work."
+    : profile.relation === "PRIVATE_PRICING" || profile.relation === "PRIVATE_CONTRACT"
+      ? " You can contact Successive for authoritative commercial information."
+      : "";
+  return `I couldn’t confirm ${subject} from the available public content. This information is not published in the available evidence.${alternative}`;
 }

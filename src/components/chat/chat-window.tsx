@@ -1,7 +1,7 @@
 "use client";
 import { RotateCcw, Sparkles, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AssistantResponse } from "@/lib/llm/schemas";
+import type { AssistantResponse, SuggestionAction } from "@/lib/llm/schemas";
 import type { ChatMessage, HistoryMessage, SeenContent } from "@/types/chat";
 import { ChatInput } from "./chat-input";
 import { ChatMessage as Message } from "./chat-message";
@@ -91,7 +91,7 @@ export function ChatWindow({
     end.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, suggestionAction?: SuggestionAction) => {
       if (loading) return;
       const user: ChatMessage = {
         id: crypto.randomUUID(),
@@ -136,6 +136,14 @@ export function ChatWindow({
               history,
               seenContent,
               sessionId: sessionId.current,
+              suggestionAction: suggestionAction ? {
+                id: suggestionAction.id, intent: suggestionAction.intent,
+                contentType: suggestionAction.contentType, sourceContext: suggestionAction.sourceContext,
+                topic: suggestionAction.topic, entity: suggestionAction.entity,
+                relation: suggestionAction.relation, resultKeys: suggestionAction.resultKeys,
+                sourceResource: suggestionAction.sourceResource,
+                query: suggestionAction.query,
+              } : undefined,
             }),
           },
         );

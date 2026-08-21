@@ -325,22 +325,32 @@
     details.appendChild(links);
     wrap.appendChild(details);
   };
-  var renderSuggestions = function (wrap, suggestions) {
-    if (!Array.isArray(suggestions) || !suggestions.length) return;
+  var renderSuggestions = function (wrap, actions) {
+    if (!Array.isArray(actions) || !actions.length) return;
     var box = create("div", "suggestions");
-    suggestions.forEach(function (suggestion) {
-      var value = safeText(suggestion, "", 160);
+    actions.forEach(function (action) {
+      if (!action || typeof action !== "object" || !action.id || !action.intent) return;
+      var value = safeText(action.label, "", 160);
       if (!value) return;
       var button = create("button");
       button.type = "button";
       button.appendChild(create("span", "", value));
       button.insertAdjacentHTML("beforeend", icon("m9 18 6-6-6-6", 16));
       button.addEventListener("click", function () {
-        sendMessage(value);
+        sendMessage(value, action);
       });
       box.appendChild(button);
     });
     wrap.appendChild(box);
+  };
+  var executableSuggestions = function (response) {
+    if (Array.isArray(response && response.suggestionActions) && response.suggestionActions.length)
+      return response.suggestionActions;
+    return (Array.isArray(response && response.suggestions) ? response.suggestions : []).map(function (label, index) {
+      var value = safeText(label, "", 160);
+      return { id: "follow-up-" + index + "-" + value.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 48),
+        label: value, intent: "FOLLOW_UP_QUERY", query: value };
+    });
   };
   var renderMessage = function (message) {
     var assistant = message.role === "assistant";
@@ -398,7 +408,7 @@
             if (message.response) {
               renderCards(wrap, message.response.cards);
               renderSources(wrap, message.response.sources);
-              renderSuggestions(wrap, message.response.suggestions);
+              renderSuggestions(wrap, executableSuggestions(message.response));
             }
             if (conversation) {
               var scrollToBottom = function () {
@@ -426,7 +436,7 @@
     if (assistant && message.response && message !== typewritingMessage) {
       renderCards(wrap, message.response.cards);
       renderSources(wrap, message.response.sources);
-      renderSuggestions(wrap, message.response.suggestions);
+      renderSuggestions(wrap, executableSuggestions(message.response));
     }
     row.appendChild(wrap);
     return row;
@@ -508,7 +518,7 @@
         if (status) status.textContent = "Preparing your response…";
       }, 2200);
   };
-  var sendMessage = function (value) {
+  var sendMessage = function (value, suggestionAction) {
     var message = typeof value === "string" ? value.trim() : "";
     if (loading || message.length < 2 || message.length > 1000) return false;
     var requestHistory = history();
@@ -534,6 +544,18 @@
         history: requestHistory,
         seenContent: requestSeenContent,
         sessionId: sessionId,
+        suggestionAction: suggestionAction ? {
+          id: suggestionAction.id,
+          intent: suggestionAction.intent,
+          contentType: suggestionAction.contentType,
+          sourceContext: suggestionAction.sourceContext,
+          topic: suggestionAction.topic,
+          entity: suggestionAction.entity,
+          relation: suggestionAction.relation,
+          resultKeys: suggestionAction.resultKeys,
+          sourceResource: suggestionAction.sourceResource,
+          query: suggestionAction.query,
+        } : undefined,
       }),
     })
       .then(function (response) {

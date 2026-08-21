@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as Message } from "@/types/chat";
+import type { SuggestionAction } from "@/lib/llm/schemas";
 import { ResultCard } from "./result-card";
 export function ChatMessage({
   message,
@@ -14,7 +15,7 @@ export function ChatMessage({
   onAnimationComplete,
 }: {
   message: Message;
-  onSuggestion: (value: string) => void;
+  onSuggestion: (value: string, action?: SuggestionAction) => void;
   onRetry: (value: string) => void;
   animate?: boolean;
   onAnimationProgress?: () => void;
@@ -22,6 +23,14 @@ export function ChatMessage({
 }) {
   const assistant = message.role === "assistant";
   const answer = message.response?.answer ?? message.content;
+  const suggestionActions = message.response?.suggestionActions?.length
+    ? message.response.suggestionActions
+    : (message.response?.suggestions ?? []).map((label, index): SuggestionAction => ({
+        id: `follow-up-${index}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 48)}`,
+        label,
+        intent: "FOLLOW_UP_QUERY",
+        query: label,
+      }));
   const [visibleAnswer, setVisibleAnswer] = useState(animate ? "" : answer);
 
   useEffect(() => {
@@ -115,11 +124,11 @@ export function ChatMessage({
             </div>
           </details>
         ) : null}
-        {!animate && message.response?.suggestions.length ? (
+        {!animate && suggestionActions.length ? (
           <div className="suggestions">
-            {message.response.suggestions.map((s) => (
-              <button key={s} onClick={() => onSuggestion(s)}>
-                <span>{s}</span>
+            {suggestionActions.map((action) => (
+              <button key={action.id} onClick={() => onSuggestion(action.label, action)}>
+                <span>{action.label}</span>
                 <ArrowRight size={16} aria-hidden="true" />
               </button>
             ))}

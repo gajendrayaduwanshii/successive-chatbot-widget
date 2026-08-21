@@ -8,7 +8,7 @@ import {
 } from "@/lib/conversation";
 import { detectIntent } from "@/lib/intent-detector";
 import { getEnv } from "@/lib/env";
-import { fetchSuccessive } from "@/lib/successive-api";
+import { fetchAllPublishedContent, fetchSuccessive } from "@/lib/successive-api";
 import { getContentLoadDiagnostics } from "@/lib/successive-api";
 import { getLLMProvider } from "@/lib/llm";
 import { assistantResponseSchema } from "@/lib/llm/schemas";
@@ -50,6 +50,7 @@ import {
   isVagueBusinessDiscovery,
   shouldDeduplicateDiscoveryResults,
   resolveOfferedResourceFollowUp,
+  resolveUnsupportedAlternativeFollowUp,
   rejectsPendingAlternative,
   resolveStructuredFollowUpMessage,
 } from "@/lib/conversation-context";
@@ -66,11 +67,17 @@ import {
 import { extractQueryFacets, inferQueryRelation } from "@/lib/query-facets";
 import {
   answerStructuredRequest,
+  availableClientSuggestionActions,
+  classifyClientIntent,
+  clientOverviewFallback,
+  extractPublishedClientTotal,
+  extractTrustedOrganizations,
   understandStructuredRequest,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
-import { recoverAuthoritativeEvidence, safeEvidenceResponse, validateEvidence } from "@/lib/evidence-validation";
+import { recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
 import { alignedCta, selectAlignedSecondaryMatches } from "@/lib/response-alignment";
+import { buildEvidenceBackedSuggestionActions, buildFollowUpQueryActions, resolveEligibleActionDocuments, resolveSuggestionAction } from "@/lib/suggestion-actions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -91,6 +98,18 @@ const requestSchema = z.object({
     .optional()
     .default([]),
   sessionId: z.string().max(100).optional(),
+  suggestionAction: z.object({
+    id: z.string().min(1).max(80),
+    intent: z.enum(["CUSTOMER_WORK_DISCOVERY", "CONTENT_DISCOVERY", "PUBLIC_ORGANIZATION_OVERVIEW", "FOLLOW_UP_QUERY"]),
+    contentType: z.enum(["case-study", "customer-work"]).optional(),
+    sourceContext: z.string().max(80).optional(),
+    topic: z.string().max(200).optional(),
+    entity: z.string().max(200).optional(),
+    relation: z.enum(["ANSWER_EVIDENCE", "RELATED_TO_SOURCE", "COLLECTION_MEMBER", "CUSTOMER_WORK", "PUBLIC_ORGANIZATIONS"]).optional(),
+    resultKeys: z.array(z.string().min(3).max(100)).max(6).optional(),
+    sourceResource: z.string().url().optional(),
+    query: z.string().min(2).max(300).optional(),
+  }).optional(),
   seenContent: z
     .array(
       z.object({
@@ -236,11 +255,250 @@ export async function POST(request: NextRequest) {
       );
     }
   }
-  const effectiveMessage = resolveOfferedResourceFollowUp(
+  const lastAssistantContent = [...parsed.data.history].reverse()
+    .find((item) => item.role === "assistant")?.content ?? "";
+  const groundedTitleFromHistory = lastAssistantContent.match(
+    /\[([^\]]{2,200})\]\(https?:\/\/[^)]+\)\s+provides additional context/i,
+  )?.[1]?.trim();
+  const legacyActionTopic = parsed.data.suggestionAction?.intent === "FOLLOW_UP_QUERY" &&
+    !parsed.data.suggestionAction.topic
+    ? groundedTitleFromHistory ?? parsed.data.seenContent.at(-1)?.title
+    : undefined;
+  const resolvedSuggestionAction = parsed.data.suggestionAction
+    ? { ...parsed.data.suggestionAction, topic: parsed.data.suggestionAction.topic ?? legacyActionTopic }
+    : undefined;
+  const actionMessage = resolveSuggestionAction(resolvedSuggestionAction);
+  const effectiveMessage = actionMessage ?? resolveUnsupportedAlternativeFollowUp(
+    preparedQuery.englishQuery,
+    parsed.data.history,
+  ) ?? resolveOfferedResourceFollowUp(
     preparedQuery.englishQuery,
     parsed.data.history,
   ) ?? resolveStructuredFollowUpMessage(preparedQuery.englishQuery, parsed.data.history)
     ?? preparedQuery.englishQuery;
+  const followUpActions = (labels: string[], topic?: string) => {
+    const excluded = new Set([
+      normalizeSearchText(effectiveMessage),
+      normalizeSearchText(parsed.data.suggestionAction?.query ?? ""),
+    ].filter(Boolean));
+    return buildFollowUpQueryActions(labels.filter((label) => !excluded.has(normalizeSearchText(label))), 3, topic);
+  };
+
+  if (parsed.data.suggestionAction?.intent === "CONTENT_DISCOVERY" && parsed.data.suggestionAction.resultKeys?.length) {
+    try {
+      const documents = (await fetchAllPublishedContent()).map((item) => buildSearchDocument(item));
+      const eligible = resolveEligibleActionDocuments(parsed.data.suggestionAction, documents);
+      if (eligible.length) {
+        const presented = eligible.slice(0, 3);
+        const answer = presented.map((document) => {
+          const details = [...new Set([...document.descriptions, ...document.textSegments])]
+            .filter((value) => normalizeSearchText(value) !== document.normalizedTitle)
+            .slice(0, 3).join("\n\n") || document.title;
+          return `## ${document.title}\n\n${details}\n\n[Read more](${document.url})`;
+        }).join("\n\n");
+        return NextResponse.json({ success: true, data: {
+          answer,
+          cards: presented.map((document) => ({ type: cardType(document.type), title: document.title,
+            description: document.descriptions[0] ?? document.textSegments[0] ?? document.title,
+            url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
+          sources: presented.map((document) => ({ title: document.title, url: document.url })),
+          suggestions: [], suggestionActions: [], confidence: "high", insufficientContext: false,
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      // A changed/unavailable corpus must never fall through to raw label search.
+    }
+    return NextResponse.json({ success: true, data: {
+      answer: "That published item is no longer available in the current Successive content collection.",
+      cards: [], sources: [], suggestions: [], suggestionActions: [], confidence: "low", insufficientContext: true,
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
+
+  const clientIntent = classifyClientIntent(effectiveMessage);
+  if (clientIntent === "public_work") {
+    try {
+      const documents = (await fetchAllPublishedContent()).map((item) => buildSearchDocument(item));
+      const directCustomerWork = documents.filter((document) => {
+        if (parsed.data.suggestionAction?.contentType === "case-study") return document.role === "case_study";
+        if (document.role === "case_study") return true;
+        if (!["blog", "editorial", "press_release", "resource", "product"].includes(document.role)) return false;
+        const identity = normalizeSearchText(`${document.title} ${document.headings.slice(0, 4).join(" ")}`);
+        return /\b(?:customer|client)\b.*\b(?:story|success|project|work|case study|collaborat)|\b(?:story|success|project|work|case study|collaborat)\b.*\b(?:customer|client)\b/.test(identity);
+      }).sort((left, right) => {
+        const rolePriority = (role: SuccessiveSearchDocument["role"]) => role === "case_study" ? 3 : role === "press_release" ? 2 : 1;
+        return rolePriority(right.role) - rolePriority(left.role) || right.contentQuality - left.contentQuality;
+      });
+      const presented = directCustomerWork.slice(0, 3);
+      if (presented.length) {
+        const answer = [
+          "Here are published examples of Successive’s customer work. These are public case studies or customer stories; they do not establish that the organizations involved are current active clients.",
+          ...presented.map((document) => `- [${document.title}](${document.url}) — ${document.descriptions[0] ?? document.textSegments[0] ?? "Published customer evidence."}`),
+        ].join("\n\n");
+        return NextResponse.json({ success: true, data: {
+          answer,
+          cards: presented.map((document) => ({ type: cardType(document.type), title: document.title,
+            description: document.descriptions[0] ?? document.textSegments[0] ?? document.title,
+            url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
+          sources: presented.map((document) => ({ title: document.title, url: document.url })),
+          suggestions: [], suggestionActions: [],
+          confidence: "high", insufficientContext: false,
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      // Continue through shared evidence retrieval if the corpus is unavailable.
+    }
+  }
+  if (["overview", "current", "count", "confidential"].includes(clientIntent ?? "")) {
+    if (clientIntent === "confidential") {
+      return NextResponse.json({ success: true, data: {
+        answer: "I can’t verify or disclose confidential, NDA-covered, or unannounced client relationships. I can instead show publicly showcased organizations or published customer work.",
+        cards: [], sources: [], suggestions: [], suggestionActions: [],
+        confidence: "high", insufficientContext: true,
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    }
+    try {
+      const items = await fetchAllPublishedContent();
+      const trusted = extractTrustedOrganizations(items);
+      if (trusted?.organizations.length) {
+        const visible = trusted.organizations;
+        const shown = visible.slice(0, /\b(?:all|complete|full)\b/i.test(effectiveMessage) ? visible.length : 10);
+        const list = shown.map((name) => `- ${name}`).join("\n");
+        const homepageUrl = trusted.source.link ?? getEnv().SUCCESSIVE_PUBLIC_SITE_URL;
+        const remainingLink = shown.length < visible.length
+          ? `\n\n[View all publicly showcased organizations on the Successive homepage](${homepageUrl})`
+          : "";
+        const total = extractPublishedClientTotal(items);
+        const deterministicAnswer = clientIntent === "current"
+          ? `Successive’s public website currently showcases these organizations, but it does not confirm which are current active clients:\n\n${list}${shown.length < visible.length ? `\n\nShowing ${shown.length} of ${visible.length} publicly showcased organizations.${remainingLink}` : ""}`
+          : clientIntent === "count"
+            ? total
+              ? `Successive’s published company information states that it serves **${total} enterprise clients worldwide**. Separately, the homepage currently showcases **${visible.length} organizations** in its trusted-logo collection; that logo count is not the total client count.`
+              : `The homepage currently showcases **${visible.length} organizations**, but that logo count is not identified as Successive’s total client count.`
+            : `${clientOverviewFallback(effectiveMessage)}\n\n${list}${shown.length < visible.length ? `\n\nShowing ${shown.length} of ${visible.length} publicly showcased organizations.${remainingLink}` : ""}`;
+        let answer = deterministicAnswer;
+        const suggestionActions = availableClientSuggestionActions(items);
+        if (clientIntent === "overview" && getEnv().AI_API_KEY) {
+          try {
+            const generated = await getLLMProvider().generateStructuredResponse({
+              message: `Answer this visitor question: ${effectiveMessage}\nWrite a natural, positive 2-4 sentence introduction before the organization list. Adapt the wording to the exact question and validated organization evidence. For a generic client/customer question, answer directly and do not introduce current/active-status limitations the visitor did not ask about. Do not mention the homepage, website, source, or link in the introduction because the source link is presented separately. Do not write the list, links, headings, sources, or unsupported relationship claims.`,
+              responseLanguage: preparedQuery.responseLanguage,
+              fallbackAnswer: clientOverviewFallback(effectiveMessage),
+              history: parsed.data.history.slice(-6),
+              context: [{ id: trusted.source.id, type: trusted.source.type ?? "page", slug: trusted.source.slug ?? "",
+                title: typeof trusted.source.title === "string" ? trusted.source.title : trusted.source.title?.rendered ?? "Successive Digital",
+                excerpt: "Structured trusted-organization evidence from the canonical public homepage.",
+                plainText: `The canonical public homepage structured trusted-logo collection currently showcases: ${visible.join(", ")}. This proves only that these organizations are publicly showcased. It does not prove current active-client status, a project, contract, service usage, or partnership.`,
+                url: trusted.source.link ?? getEnv().SUCCESSIVE_PUBLIC_SITE_URL, acfText: "", extractedUrls: [] }],
+              understanding: buildDeterministicUnderstanding(effectiveMessage),
+            });
+            const intro = generated.answer.trim()
+              .replace(/^#{1,6}\s+.*$/gm, "")
+              .split(/\n\s*(?:[-*]|\d+\.)\s+/)[0]!
+              .trim();
+            const mentionedOrganizations = visible.filter((name) =>
+              ` ${normalizeSearchText(intro)} `.includes(` ${normalizeSearchText(name)} `),
+            ).length;
+            if (intro.length >= 40 && mentionedOrganizations <= 2 &&
+                !/\b(?:public )?(?:home ?page|website|source link)\b/i.test(intro) &&
+                !/\b(?:does not (?:establish|confirm|prove)|cannot (?:establish|confirm|verify)|not every organization|current active.client status|available evidence is limited)\b/i.test(intro) &&
+                !/\b(?:partner\w*|affiliat\w*|collaborat\w*|chosen successive|chosen us|leaders? in|work(?:s|ing)? (?:with|alongside) (?:these|those|several|the following)|current active clients? (?:are|include)|currently works with all)\b/i.test(intro)) {
+              answer = `${intro}\n\n${list}${shown.length < visible.length ? `\n\nShowing ${shown.length} of ${visible.length} publicly showcased organizations.${remainingLink}` : ""}`;
+            }
+          } catch {
+            // Keep the concise evidence-safe fallback when generation is unavailable.
+          }
+        }
+        const homepageIsLinkedInAnswer = answer.includes(homepageUrl) ||
+          answer.includes(homepageUrl.replace(/\/$/, ""));
+        return NextResponse.json({ success: true, data: {
+          answer,
+          cards: homepageIsLinkedInAnswer ? [{
+            type: "page",
+            title: "Successive Digital",
+            description: "Explore the complete trusted-organizations collection on Successive’s homepage.",
+            url: homepageUrl,
+          }] : [],
+          sources: [{ title: "Successive Digital", url: homepageUrl }],
+          suggestions: suggestionActions.map((action) => action.label), suggestionActions,
+          confidence: "high", insufficientContext: clientIntent === "current",
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      // Continue through normal retrieval when the homepage source is unavailable.
+    }
+  }
+
+  if (/\b(?:client|customer|partner|work did|did you do|tell me about)\b/i.test(effectiveMessage)) {
+    try {
+      const items = await fetchAllPublishedContent();
+      const trusted = extractTrustedOrganizations(items);
+      const normalizedMessage = normalizeSearchText(effectiveMessage);
+      const organization = trusted?.organizations.find((name) => {
+        const normalizedName = normalizeSearchText(name);
+        return normalizedName.length >= 2 && ` ${normalizedMessage} `.includes(` ${normalizedName} `);
+      });
+      if (trusted && organization) {
+        const organizationKey = normalizeSearchText(organization);
+        const related = items
+          .filter((item) => item.id !== trusted.source.id)
+          .map((item) => buildSearchDocument(item))
+          .filter((document) => ` ${normalizeSearchText(document.combinedText)} `.includes(` ${organizationKey} `));
+        const partnerEvidence = related.filter((document) => document.role === "partners" || document.role === "partner");
+        const customerEvidence = related.filter((document) => {
+          if (!["case_study", "press_release", "blog", "editorial", "resource", "product"].includes(document.role)) return false;
+          const title = normalizeSearchText(document.title);
+          const structuredCustomerField = document.structuredFields.some((field) =>
+            /\b(?:client|customer)\b/i.test(field.label) &&
+            ` ${normalizeSearchText(field.value)} `.includes(` ${organizationKey} `),
+          );
+          if (document.role === "case_study") return structuredCustomerField || ` ${title} `.includes(` ${organizationKey} `);
+          const text = normalizeSearchText(document.combinedText);
+          const escaped = organizationKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const explicitRelation = new RegExp(
+            `(?:successive.{0,100}(?:client|customer|worked with|collaborat(?:ed|ion) with).{0,80}${escaped}|${escaped}.{0,80}(?:is a client of successive|worked with successive|collaborat(?:ed|ion) with successive))`,
+            "i",
+          ).test(text);
+          return structuredCustomerField || (` ${title} `.includes(` ${organizationKey} `) && explicitRelation);
+        });
+        const asksPartner = /\bpartner\b/i.test(effectiveMessage);
+        const asksWork = /\b(?:what .*work|did you do|case stud|customer stor|client work|project)\b/i.test(effectiveMessage);
+        const lines = [`Successive publicly showcases **${organization}** in its homepage trusted-organizations collection.`];
+        if (asksPartner) lines.push(partnerEvidence.length
+          ? `Successive’s published partner content separately lists **${organization}** as a formal partner.`
+          : `I couldn’t confirm a formal partner relationship for **${organization}** from the published partner content. Trusted-logo presence alone does not establish a partnership.`);
+        if (asksWork || customerEvidence.length) lines.push(customerEvidence.length
+          ? `Related published customer evidence was found in ${[...new Set(customerEvidence.slice(0, 3).map((document) => document.role.replace(/_/g, " ")))].join(", ")} content.`
+          : `I couldn’t confirm specific published customer work for **${organization}**. The trusted logo alone does not establish a project, service, or current active-client relationship.`);
+        const presented = (asksPartner ? partnerEvidence : customerEvidence).slice(0, 3);
+        return NextResponse.json({ success: true, data: {
+          answer: lines.join("\n\n"),
+          cards: presented.map((document) => ({ type: cardType(document.type), title: document.title,
+            description: document.descriptions[0] ?? document.textSegments[0] ?? document.title,
+            url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
+          sources: [{ title: "Successive Digital", url: trusted.source.link ?? "https://successive.tech/" },
+            ...presented.map((document) => ({ title: document.title, url: document.url }))],
+          suggestions: [], suggestionActions: [],
+          confidence: "high", insufficientContext: asksWork && !customerEvidence.length,
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      // Continue through shared retrieval if the current corpus is unavailable.
+    }
+  }
+
+  const unsupportedAnswer = safeUnsupportedQueryResponse(effectiveMessage);
+  if (unsupportedAnswer) {
+    return NextResponse.json({
+      success: true,
+      data: {
+        answer: unsupportedAnswer,
+        cards: [], sources: [],
+        suggestions: /published case studies/i.test(unsupportedAnswer)
+          ? ["Show me published case studies"] : [],
+        confidence: "high", insufficientContext: true,
+      },
+    }, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
   if (rejectsPendingAlternative(preparedQuery.englishQuery, parsed.data.history)) {
     return NextResponse.json({
       success: true,
@@ -303,6 +561,7 @@ export async function POST(request: NextRequest) {
           cards: [],
           sources: [],
           suggestions: buildRelatedSuggestions("general"),
+          suggestionActions: followUpActions(buildRelatedSuggestions("general")),
           confidence: "low",
           insufficientContext: true,
         },
@@ -339,6 +598,7 @@ export async function POST(request: NextRequest) {
               }],
               sources: suppressUnsupportedCard ? [] : [{ title: document.title, url: document.url }],
               suggestions: structuredAnswer.suggestions,
+              suggestionActions: suppressUnsupportedCard ? [] : followUpActions(buildRelatedSuggestions("general", document.title)),
               confidence: "high",
               insufficientContext: suppressUnsupportedCard,
               ...(process.env.NODE_ENV !== "production" ? {
@@ -360,6 +620,8 @@ export async function POST(request: NextRequest) {
   }
   const deterministicUnderstanding =
     buildDeterministicUnderstanding(effectiveMessage);
+  const hasExplicitCurrentSubject = deterministicUnderstanding.topics.length > 0 ||
+    deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry);
   const deterministicWithContext = resolveConversationUnderstanding(
     deterministicUnderstanding,
     parsed.data.history.slice(-8),
@@ -376,7 +638,7 @@ export async function POST(request: NextRequest) {
     try {
       understanding = await getLLMProvider().understandQuery(
         effectiveMessage,
-        parsed.data.history.slice(-8),
+        hasExplicitCurrentSubject ? [] : parsed.data.history.slice(-8),
       );
     } catch {
       // Deterministic interpretation still supports lexical retrieval if the
@@ -390,40 +652,40 @@ export async function POST(request: NextRequest) {
   // thought-leadership, service, or case-study-only search.
   understanding = {
     ...understanding,
-    intent: deterministicUnderstanding.containsPremise || ["solve_problem", "recommendation"].includes(deterministicUnderstanding.intent)
+    intent: hasExplicitCurrentSubject || deterministicUnderstanding.containsPremise || ["solve_problem", "recommendation"].includes(deterministicUnderstanding.intent)
       ? deterministicUnderstanding.intent
       : understanding.intent,
-    businessProblem: deterministicUnderstanding.businessProblem ?? understanding.businessProblem,
-    topics: deterministicUnderstanding.topics.length === 0 && parsed.data.history.length
-      ? deterministicWithContext.topics
-      : [...new Set([
-          ...deterministicUnderstanding.topics,
-          ...understanding.topics,
-        ])].slice(0, 8),
-    desiredOutcomes: [...new Set([
-      ...deterministicWithContext.desiredOutcomes,
-      ...understanding.desiredOutcomes,
+    businessProblem: hasExplicitCurrentSubject
+      ? deterministicUnderstanding.businessProblem
+      : deterministicUnderstanding.businessProblem ?? understanding.businessProblem,
+    // An explicit new subject is a topic switch. Semantic planning may use
+    // history for vague follow-ups, but it must not reintroduce the previous
+    // resource/topic into a clear current question.
+    topics: hasExplicitCurrentSubject
+      ? deterministicUnderstanding.topics
+      : parsed.data.history.length ? deterministicWithContext.topics : understanding.topics,
+    desiredOutcomes: hasExplicitCurrentSubject ? deterministicUnderstanding.desiredOutcomes : [...new Set([
+      ...deterministicWithContext.desiredOutcomes, ...understanding.desiredOutcomes,
     ])].slice(0, 8),
-    domains: [...new Set([
-      ...deterministicWithContext.domains,
-      ...understanding.domains,
+    domains: hasExplicitCurrentSubject ? deterministicUnderstanding.domains : [...new Set([
+      ...deterministicWithContext.domains, ...understanding.domains,
     ])].slice(0, 8),
-    technicalSignals: [...new Set([
-      ...deterministicWithContext.technicalSignals,
-      ...understanding.technicalSignals,
+    technicalSignals: hasExplicitCurrentSubject ? deterministicUnderstanding.technicalSignals : [...new Set([
+      ...deterministicWithContext.technicalSignals, ...understanding.technicalSignals,
     ])].slice(0, 10),
-    retrievalConcepts: [...new Set([
-      ...deterministicWithContext.retrievalConcepts,
-      ...understanding.retrievalConcepts,
+    retrievalConcepts: hasExplicitCurrentSubject ? deterministicUnderstanding.retrievalConcepts : [...new Set([
+      ...deterministicWithContext.retrievalConcepts, ...understanding.retrievalConcepts,
     ])].slice(0, 12),
-    industry: deterministicUnderstanding.industry ?? understanding.industry,
+    industry: hasExplicitCurrentSubject
+      ? deterministicUnderstanding.industry
+      : deterministicUnderstanding.industry ?? understanding.industry,
     requestedContentType: deterministicUnderstanding.requestedContentType,
-    targetScope: deterministicUnderstanding.targetScope !== "topic"
+    targetScope: hasExplicitCurrentSubject || deterministicUnderstanding.targetScope !== "topic"
       ? deterministicUnderstanding.targetScope
       : understanding.targetScope,
-    entities: deterministicUnderstanding.entities.length
+    entities: hasExplicitCurrentSubject
       ? deterministicUnderstanding.entities
-      : understanding.entities,
+      : deterministicUnderstanding.entities.length ? deterministicUnderstanding.entities : understanding.entities,
   };
   understanding = applyStructuralBroadQueryRules(resolveConversationUnderstanding(
     understanding,
@@ -593,6 +855,7 @@ export async function POST(request: NextRequest) {
             ],
             sources: [{ title: document.title, url: document.url }],
             suggestions: buildRelatedSuggestions("contact", document.title),
+            suggestionActions: followUpActions(buildRelatedSuggestions("contact", document.title)),
             confidence: "high",
             insufficientContext: false,
           },
@@ -618,6 +881,7 @@ export async function POST(request: NextRequest) {
             ],
             sources: [{ title: "Get In Touch", url: canonicalContactUrl }],
             suggestions: buildRelatedSuggestions("contact", "Get In Touch"),
+            suggestionActions: followUpActions(buildRelatedSuggestions("contact", "Get In Touch")),
             confidence: "high",
             insufficientContext: false,
           },
@@ -656,6 +920,7 @@ export async function POST(request: NextRequest) {
             }],
             sources: [{ title: document.title, url: document.url }],
             suggestions: buildRelatedSuggestions("about", document.title),
+            suggestionActions: followUpActions(buildRelatedSuggestions("about", document.title)),
             confidence: "high",
             insufficientContext: false,
           },
@@ -750,6 +1015,7 @@ export async function POST(request: NextRequest) {
               "case_studies",
               caseStudies[0]?.title,
             ),
+            suggestionActions: followUpActions(buildCollectionSuggestions("case studies", caseStudies.length)),
             confidence: "high",
             insufficientContext: false,
           },
@@ -871,6 +1137,7 @@ export async function POST(request: NextRequest) {
               })),
             ],
             suggestions: buildRelatedSuggestions("blogs", posts[0]?.title),
+            suggestionActions: followUpActions(buildCollectionSuggestions("blogs and insights", posts.length)),
             confidence: "high",
             insufficientContext: false,
           },
@@ -895,6 +1162,34 @@ export async function POST(request: NextRequest) {
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       understanding,
     );
+    // Semantic expansion can occasionally over-constrain a short, valid
+    // visitor query. Always run a deterministic literal plan against the same
+    // cached corpus and merge it, making cold/warm answers independent of a
+    // single interpretation without adding another WordPress request.
+    const literalUnderstanding = applyStructuralBroadQueryRules(
+      buildDeterministicUnderstanding(effectiveMessage),
+      effectiveMessage,
+    );
+    const literalRetrieval = await retrieveFromIndex(
+      effectiveMessage,
+      isNamedSuccessivePersonQuery ? "general" : intent,
+      effectiveMessage,
+      shouldDeduplicate ? seenContentKeys : new Set<string>(),
+      literalUnderstanding,
+    );
+    const mergedBaseMatches = [...retrieval.matches, ...literalRetrieval.matches]
+      .filter((match, index, all) => all.findIndex((candidate) =>
+        candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index)
+      .slice(0, 8);
+    const mergedBaseCandidates = [...(retrieval.candidates ?? []), ...(literalRetrieval.candidates ?? [])]
+      .filter((match, index, all) => all.findIndex((candidate) =>
+        candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
+    retrieval = {
+      ...retrieval,
+      reliableMatchFound: mergedBaseMatches.length > 0,
+      matches: mergedBaseMatches,
+      candidates: mergedBaseCandidates,
+    };
     const facets = extractQueryFacets(effectiveMessage);
     const facetResults = facets.length > 1
       ? await Promise.all(facets.map(async (facet) => {
@@ -948,9 +1243,10 @@ export async function POST(request: NextRequest) {
       };
     }
     retrievalDurationMs = performance.now() - retrievalStartedAt;
-    const namedResourceSubject = extractNamedResourceSummarySubject(
-      effectiveMessage,
-    );
+    const namedResourceSubject = parsed.data.suggestionAction?.intent === "FOLLOW_UP_QUERY" &&
+      resolvedSuggestionAction?.topic
+      ? normalizeSearchText(resolvedSuggestionAction.topic)
+      : extractNamedResourceSummarySubject(effectiveMessage);
     if (!retrieval.reliableMatchFound) {
       if (shouldDeduplicate && seenContentKeys.size) {
         return NextResponse.json(
@@ -975,6 +1271,7 @@ export async function POST(request: NextRequest) {
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
+            suggestionActions: followUpActions(buildRelatedSuggestions("general")),
             confidence: "low",
             insufficientContext: true,
           },
@@ -1092,6 +1389,7 @@ export async function POST(request: NextRequest) {
               url: document.url,
             })),
             suggestions: buildCollectionSuggestions(label, total),
+            suggestionActions: followUpActions(buildCollectionSuggestions(label, total)),
             confidence: "high",
             insufficientContext: false,
           },
@@ -1106,6 +1404,26 @@ export async function POST(request: NextRequest) {
       matches: selectedMatches,
       hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
     });
+    const hasGroundedFollowUpTarget = parsed.data.suggestionAction?.intent === "FOLLOW_UP_QUERY" &&
+      Boolean(exactNamedResource) &&
+      /\b(?:help (?:my|our|a) business|business outcomes?|benefits?|value|implement|implementation|apply|adopt)\b/i.test(
+        parsed.data.suggestionAction.query ?? effectiveMessage,
+      );
+    if (["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status) && literalRetrieval.matches.length) {
+      const literalValidation = validateEvidence({
+        message: effectiveMessage,
+        contextMessage: effectiveMessage,
+        understanding: literalUnderstanding,
+        matches: literalRetrieval.matches,
+        hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
+      });
+      if (literalValidation.status === "SUPPORTED" || literalValidation.status === "PARTIALLY_SUPPORTED") {
+        selectedMatches = literalValidation.accepted.length
+          ? literalValidation.accepted
+          : literalRetrieval.matches;
+        evidenceValidation = literalValidation;
+      }
+    }
     if (
       facets.length === 1 &&
       ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)
@@ -1129,7 +1447,7 @@ export async function POST(request: NextRequest) {
         }
       }
     }
-    if (facets.length === 1 && ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
+    if (!hasGroundedFollowUpTarget && facets.length === 1 && ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
       return NextResponse.json(
         {
           success: true,
@@ -1138,6 +1456,7 @@ export async function POST(request: NextRequest) {
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
+            suggestionActions: followUpActions(buildRelatedSuggestions("general")),
             confidence: "low",
             insufficientContext: true,
           },
@@ -1145,7 +1464,7 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
-    if (facets.length === 1 && evidenceValidation.status === "PARTIALLY_SUPPORTED") {
+    if (!hasGroundedFollowUpTarget && facets.length === 1 && evidenceValidation.status === "PARTIALLY_SUPPORTED") {
       const related = evidenceValidation.accepted[0];
       return NextResponse.json(
         {
@@ -1162,6 +1481,7 @@ export async function POST(request: NextRequest) {
             }] : [],
             sources: related ? [{ title: related.document.title, url: related.document.url }] : [],
             suggestions: buildRelatedSuggestions("general", related?.document.title),
+            suggestionActions: followUpActions(buildRelatedSuggestions("general", related?.document.title)),
             confidence: "medium",
             insufficientContext: true,
           },
@@ -1227,7 +1547,7 @@ export async function POST(request: NextRequest) {
         message: effectiveMessage,
         responseLanguage: preparedQuery.responseLanguage,
         fallbackAnswer: preparedQuery.fallbackAnswer,
-        history: parsed.data.history.slice(-10),
+        history: hasExplicitCurrentSubject ? [] : parsed.data.history.slice(-10),
         context,
         understanding,
       });
@@ -1263,6 +1583,7 @@ export async function POST(request: NextRequest) {
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
+            suggestionActions: followUpActions(buildRelatedSuggestions("general")),
             confidence: "low",
             insufficientContext: true,
           },
@@ -1313,15 +1634,56 @@ export async function POST(request: NextRequest) {
     const cardMatches = alignedMatches.filter((match) =>
       cardEligibility(match, understanding, topScore).accepted,
     );
+    // If the grounded answer explicitly cites an accepted context document,
+    // keep its card consistent with that visible link even when the optional
+    // secondary-card score is below the normal discovery threshold.
+    const answerReferencedMatches = contextMatches.filter(({ document }) =>
+      finalAnswer.includes(document.url) || finalAnswer.includes(document.url.replace(/\/$/, "")),
+    );
+    const referencedAndEligibleCards = [...answerReferencedMatches, ...cardMatches]
+      .filter((match, index, all) => all.findIndex((candidate) =>
+        candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
     const presentedMatches =
       exactNamedResource
         ? [exactNamedResource]
         : isWhitepaperCollectionQuery && selectedMatches.length <= 15
         ? selectedMatches
-        : cardMatches.slice(0, 3);
+        : referencedAndEligibleCards.slice(0, 3);
     const sourceMatches = presentedMatches.length
       ? presentedMatches
       : alignedMatches.slice(0, 2);
+    const fallbackSuggestions = isWhitepaperQuery
+      ? buildCollectionSuggestions("whitepapers", retrieval.collectionTotal ?? presentedMatches.length)
+      : buildRelatedSuggestions(intent, presentedMatches[0]?.document.title);
+    const generatedSuggestions = generatedData?.suggestions?.length ? generatedData.suggestions : [];
+    const displayedTitles = presentedMatches.map(({ document }) => normalizeSearchText(document.title));
+    const suggestionLabels = [...generatedSuggestions, ...fallbackSuggestions]
+      .filter((label, index, all) => all.findIndex((candidate) =>
+        normalizeSearchText(candidate) === normalizeSearchText(label)) === index)
+      .filter((label) => {
+        const normalized = normalizeSearchText(label);
+        const isConversationalFollowUp = /^(?:what|how|which|show|tell|compare|find)\b/.test(normalized);
+        const promisesUnvalidatedRelatedContent = /\b(?:case stud|customer stor|another related (?:resource|webinar|article)|which successive services? (?:are related|support)|related successive services?)\b/.test(normalized);
+        const isNavigationCta = /\b(?:faq|reach out|get in touch|contact (?:us|successive)|visit (?:the )?(?:successive )?website|book (?:a )?(?:call|consultation)|request (?:a )?consultation)\b/.test(normalized) ||
+          /^(?:consider|review|visit|contact|reach out|get in touch|learn more|if you|you may)\b/.test(normalized);
+        const merelyReopensCard = /^(?:tell me more about|learn more about|explore service|read article|view case study)/.test(normalized) &&
+          displayedTitles.some((title) => title.length > 4 && normalized.includes(title));
+        return isConversationalFollowUp && !promisesUnvalidatedRelatedContent && !isNavigationCta && !merelyReopensCard;
+      })
+      .slice(0, 3);
+    const semanticSuggestionActions = followUpActions(suggestionLabels, presentedMatches[0]?.document.title);
+    const relatedEvidenceActions = alignment.primary
+      ? buildEvidenceBackedSuggestionActions({
+          source: alignment.primary.document,
+          acceptedRelated: alignment.related.map((match) => match.document).filter((document) =>
+            !presentedMatches.some((presented) => presented.document.id === document.id && presented.document.type === document.type)),
+          recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
+          limit: 2,
+        })
+      : [];
+    const suggestionActions = [...semanticSuggestionActions, ...relatedEvidenceActions]
+      .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
+      .slice(0, 3);
     const response = {
       ...(generatedData ?? {
         answer: groundedAnswer,
@@ -1345,17 +1707,8 @@ export async function POST(request: NextRequest) {
         title: document.title,
         url: document.url,
       })),
-      suggestions: isWhitepaperQuery
-        ? buildCollectionSuggestions(
-            "whitepapers",
-            retrieval.collectionTotal ?? presentedMatches.length,
-          )
-        : generatedData?.suggestions?.length
-          ? generatedData.suggestions
-          : buildRelatedSuggestions(
-              intent,
-              presentedMatches[0]?.document.title,
-            ),
+      suggestions: suggestionActions.map((action) => action.label),
+      suggestionActions,
       confidence: topScore >= 100 ? "high" : "medium",
       insufficientContext: false,
     };
@@ -1654,31 +2007,35 @@ function buildRelatedSuggestions(
   primaryTitle?: string,
 ): string[] {
   const title = primaryTitle?.replace(/\s+/g, " ").trim().slice(0, 90);
-  const learnMore = title
-    ? `Tell me more about ${title}`
-    : "Show me relevant Successive services";
+  const learnMore = title ? `How can ${title} help my business?` : "Show me relevant Successive services";
+  const outcomes = title
+    ? `What business outcomes can ${title} support?`
+    : "What business outcomes can Successive support?";
+  const implementation = title
+    ? `How can Successive implement ${title} for my business?`
+    : "How can Successive implement this for my business?";
   if (intent === "products" || intent === "product_detail")
     return [
       learnMore,
-      "Show me a related case study",
-      "How can Successive implement this for my business?",
+      outcomes,
+      implementation,
     ];
   if (intent === "case_studies")
     return [
       learnMore,
-      "Show me another related case study",
+      "What business outcomes does this customer work demonstrate?",
       "Which Successive service supports this?",
     ];
   if (intent === "blogs" || intent === "resources")
     return [
       learnMore,
-      "Show me another related resource",
+      "What are the key business takeaways from this resource?",
       "Which Successive service is related to this?",
     ];
   if (intent === "events")
     return [
       learnMore,
-      "Show me another related webinar",
+      "What topics does this event cover?",
       "Which Successive service is related to this topic?",
     ];
   if (intent === "contact")
@@ -1689,8 +2046,8 @@ function buildRelatedSuggestions(
     ];
   return [
     learnMore,
-    "Show me a related case study",
-    "Explore Successive industries",
+    outcomes,
+    implementation,
   ];
 }
 

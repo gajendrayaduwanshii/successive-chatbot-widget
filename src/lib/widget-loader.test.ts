@@ -37,6 +37,43 @@ function createWidget(markup = "", scriptAttributes = "") {
 }
 
 describe("public direct-DOM widget loader", () => {
+  it("upgrades a useful label-only suggestion into an executable follow-up action", async () => {
+    const dom = createWidget();
+    const fetchMock = vi.mocked(dom.window.fetch);
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: {
+      answer: "Security response", cards: [], sources: [],
+      suggestions: ["Show me a related case study"], suggestionActions: [],
+    } }) } as Response);
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: {
+      answer: "Follow-up response", cards: [], sources: [], suggestions: [], suggestionActions: [],
+    } }) } as Response);
+    (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat.sendMessage("Security approach");
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".conversation")?.textContent).toContain("Security response"));
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".suggestions button")).not.toBeNull());
+    dom.window.document.querySelector<HTMLButtonElement>(".suggestions button")!.click();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
+    expect(body.suggestionAction).toMatchObject({ intent: "FOLLOW_UP_QUERY", query: "Show me a related case study" });
+  });
+
+  it("renders and submits only the structured action payload", async () => {
+    const dom = createWidget();
+    const fetchMock = vi.mocked(dom.window.fetch);
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: {
+      answer: "Service response", cards: [], sources: [], suggestions: ["Unsafe legacy label"], suggestionActions: [{
+        id: "content-page-42", label: "Explore published detail", intent: "CONTENT_DISCOVERY",
+        relation: "RELATED_TO_SOURCE", resultKeys: ["page:42"], topic: "Published detail",
+      }],
+    } }) } as Response);
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: { answer: "Exact detail", cards: [], sources: [], suggestions: [], suggestionActions: [] } }) } as Response);
+    (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat.sendMessage("service overview");
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLButtonElement>(".suggestions button")?.textContent).toContain("Explore published detail"));
+    expect(dom.window.document.querySelector(".suggestions")?.textContent).not.toContain("Unsafe legacy label");
+    dom.window.document.querySelector<HTMLButtonElement>(".suggestions button")!.click();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
+    expect(body.suggestionAction).toMatchObject({ id: "content-page-42", intent: "CONTENT_DISCOVERY", resultKeys: ["page:42"] });
+  });
   it("renders the chat UI directly without an iframe", () => {
     const dom = createWidget();
     const launcher = dom.window.document.querySelector<HTMLButtonElement>(

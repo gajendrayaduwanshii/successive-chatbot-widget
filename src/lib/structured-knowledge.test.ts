@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WordPressItem } from "@/types/wordpress";
-import { answerStructuredRequest, cleanMediaLabel, understandStructuredRequest } from "./structured-knowledge";
+import { answerStructuredRequest, availableClientSuggestionActions, classifyClientIntent, clientOverviewFallback, cleanMediaLabel, extractTrustedOrganizations, understandStructuredRequest } from "./structured-knowledge";
 import { buildSearchDocument } from "./search-index";
 
 const page = (id: number, slug: string, title: string, acf: Record<string, unknown>): WordPressItem => ({
@@ -27,6 +27,73 @@ const corpus: WordPressItem[] = [
     culture_content: "We support employee learning and workplace inclusion.",
   }),
 ];
+
+const trustedLabel = (suffix: string) => `Fixture Organization ${suffix}`;
+const trustedHomepage = (names: string[], heading = "Completely revised marketing copy"): WordPressItem => ({
+  id: 901, type: "page", slug: "cms-internal-home-record", link: "https://successive.tech/",
+  title: { rendered: "Home" }, content: { rendered: "" }, acf: {
+    trusted_heading: heading,
+    trusted_logos: names.map((name) => ({ logo: { alt: name, url: `https://cdn.test/${name.length}.svg` } })),
+    partner_logos: [{ logo: { alt: trustedLabel("Partner"), url: "https://cdn.test/partner.svg" } }],
+    certification_logos: [{ logo: { alt: trustedLabel("Certification"), url: "https://cdn.test/cert.svg" } }],
+    technology_logos: [{ logo: { alt: trustedLabel("Technology"), url: "https://cdn.test/tech.svg" } }],
+  } as WordPressItem["acf"],
+});
+
+describe("dynamic homepage trusted organizations", () => {
+  it("uses the root homepage structured repeater without depending on heading text", () => {
+    const names = [trustedLabel("Alpha"), trustedLabel("Beta"), trustedLabel("Gamma")];
+    const result = extractTrustedOrganizations([trustedHomepage(names, "A heading with no trust words")]);
+    expect(result?.organizations).toEqual(names);
+    expect(result?.sourcePath).toContain("trusted_logos");
+  });
+  it("reflects content changes and excludes false logo collections", () => {
+    const initial = [trustedLabel("Alpha"), trustedLabel("Beta"), trustedLabel("Gamma")];
+    const updated = [initial[0]!, initial[2]!, trustedLabel("Delta")];
+    expect(extractTrustedOrganizations([trustedHomepage(initial)])?.organizations).toEqual(initial);
+    const result = extractTrustedOrganizations([trustedHomepage(updated)])?.organizations ?? [];
+    expect(result).toEqual(updated);
+    expect(result.join(" ")).not.toMatch(/Partner|Certification|Technology/);
+  });
+  it("deduplicates and rejects noisy labels and non-root pages", () => {
+    const valid = trustedLabel("Alpha");
+    expect(extractTrustedOrganizations([trustedHomepage([valid, valid, "logo", "asset 123", "client-logo.svg", ""])])?.organizations).toEqual([valid]);
+    const nonRoot = trustedHomepage([valid]); nonRoot.link = "https://successive.tech/other/";
+    expect(extractTrustedOrganizations([nonRoot])).toBeNull();
+  });
+  it.each(["client", "clients", "our clients", "your clients", "customer", "customers", "Who are your clients?", "Show your clients", "show me your customers", "companies you work with", "Which companies work with you?", "Tell me about your customers"])(
+    "recognizes client overview grammar: %s", (query) => expect(classifyClientIntent(query)).toBe("overview"),
+  );
+  it.each(["current clients", "active clients", "who are your clients right now?", "which of these are current?"])(
+    "applies current-status intent only when explicitly requested: %s",
+    (query) => expect(classifyClientIntent(query)).toBe("current"),
+  );
+  it.each(["customer experience services", "customer support automation", "multi-client Strapi", "client-side development", "customer data platform", "customer journey personalization", "client-server architecture"])(
+    "rejects client-list terminology collisions: %s", (query) => expect(classifyClientIntent(query)).toBeNull(),
+  );
+  it("keeps safe generation fallbacks query-sensitive", () => {
+    const answers = ["client", "clients", "who are your clients?", "which companies work with you?", "tell me about your customers"].map(clientOverviewFallback);
+    expect(new Set(answers).size).toBe(5);
+  });
+  it.each(["client", "clients", "our clients", "your clients", "who are your clients?", "show me your customers", "companies you work with"])(
+    "keeps generic client wording positive without an unsolicited current-status disclaimer: %s",
+    (query) => {
+      const answer = clientOverviewFallback(query);
+      expect(answer).toMatch(/^## /);
+      expect(answer).not.toMatch(/does not|cannot confirm|current active|not every/i);
+      expect(answer).not.toMatch(/home ?page|website/i);
+    },
+  );
+  it("emits only collection-backed client suggestion actions", () => {
+    expect(availableClientSuggestionActions([])).toEqual([]);
+    const item: WordPressItem = { id: 902, type: "case_study", slug: "published-story", link: "https://example.test/case-studies/published-story/",
+      title: { rendered: "Published Customer Story" }, content: { rendered: "A published customer outcome." } };
+    const actions = availableClientSuggestionActions([item]);
+    expect(actions.map((action) => action.intent)).toEqual(["CUSTOMER_WORK_DISCOVERY"]);
+    expect(actions[0]?.contentType).toBe("case-study");
+    expect(actions.every((action) => action.sourceContext === "CLIENT_OVERVIEW")).toBe(true);
+  });
+});
 
 describe("structured API knowledge", () => {
   it("does not mistake a short office-location phrase for a person name", () => {

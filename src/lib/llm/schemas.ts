@@ -9,10 +9,25 @@ export const cardSchema = z.object({
   badge: z.string().max(50).optional(),
   service_type: z.string().min(1).max(50).optional(),
 });
+export const suggestionActionSchema = z.object({
+  id: z.string().min(1).max(80),
+  label: z.string().min(2).max(160),
+  intent: z.enum(["CUSTOMER_WORK_DISCOVERY", "CONTENT_DISCOVERY", "PUBLIC_ORGANIZATION_OVERVIEW", "FOLLOW_UP_QUERY"]),
+  contentType: z.enum(["case-study", "customer-work"]).optional(),
+  sourceContext: z.string().max(80).optional(),
+  topic: z.string().max(200).optional(),
+  entity: z.string().max(200).optional(),
+  relation: z.enum(["ANSWER_EVIDENCE", "RELATED_TO_SOURCE", "COLLECTION_MEMBER", "CUSTOMER_WORK", "PUBLIC_ORGANIZATIONS"]).optional(),
+  resultKeys: z.array(z.string().min(3).max(100)).max(6).optional(),
+  sourceResource: z.string().url().optional(),
+  query: z.string().min(2).max(300).optional(),
+});
+export type SuggestionAction = z.infer<typeof suggestionActionSchema>;
 export const assistantResponseSchema = z.object({
   answer: z.string().min(1).max(8000),
   cards: z.array(cardSchema).max(6).default([]),
   suggestions: z.array(z.string().min(2).max(160)).max(4).default([]),
+  suggestionActions: z.array(suggestionActionSchema).max(4).optional(),
   sources: z
     .array(
       z.object({ title: z.string().min(1).max(200), url: z.string().url() }),
@@ -91,6 +106,7 @@ export function normalizeAssistantResponse(value: unknown) {
           .filter((value) => value.trim().length >= 2)
           .slice(0, 4)
       : [],
+    suggestionActions: Array.isArray(input.suggestionActions) ? input.suggestionActions : [],
     sources: sources.slice(0, 6),
   });
 }

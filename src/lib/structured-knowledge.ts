@@ -1,6 +1,7 @@
 import { decodeEntities, htmlToText } from "./html-utils";
 import { buildSearchDocument, normalizeSearchText, type SuccessiveSearchDocument } from "./search-index";
 import type { WordPressItem } from "@/types/wordpress";
+import type { SuggestionAction } from "./llm/schemas";
 
 export type StructuredAttribute =
   | "company_overview" | "founded" | "values" | "leadership" | "executives" | "board"
@@ -22,10 +23,176 @@ export interface StructuredAnswer {
   suggestions: string[];
 }
 
+export interface TrustedOrganizationCollection {
+  organizations: string[];
+  source: WordPressItem;
+  sourcePath: string;
+}
+
+export function cleanOrganizationLabel(value: string): string {
+  const decoded = decodeEntities(value).trim();
+  if (!decoded || /(?:https?:\/\/|[/\\]|\.(?:svg|png|webp|jpe?g|gif)(?:\?|$))/i.test(decoded)) return "";
+  const cleaned = decoded
+    .replace(/\b(?:company|brand|client|customer)?\s*logo\b/gi, " ")
+    .replace(/\b(?:image|asset|placeholder|untitled)(?:\s*\d+)?\b/gi, " ")
+    .replace(/\b(?:id|attachment)[-_ ]?\d+\b/gi, " ")
+    .replace(/\s+/g, " ").trim();
+  if (!cleaned || cleaned.length > 100 || !/[a-z]{2}/i.test(cleaned)) return "";
+  return /^(?:logo|image|brand|company|client|customer|icon)\s*\d*$/i.test(cleaned) ? "" : cleaned;
+}
+
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+
+function trustedLabelFromLogoEntry(value: unknown): string {
+  const entry = record(value);
+  if (!entry) return "";
+  const media = record(entry.logo) ?? record(entry.image) ?? record(entry.media) ?? entry;
+  const candidates = [entry.organization_name, entry.organisation_name, entry.company_name,
+    entry.brand_name, entry.label, entry.alt_text, media.alt, media.caption, media.title];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const cleaned = cleanOrganizationLabel(candidate);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function trustedLabelsFromCollection(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.map(trustedLabelFromLogoEntry).filter(Boolean).filter((name) => {
+    const key = normalizeSearchText(name);
+    if (!key || seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+
+function isCanonicalHomepage(item: WordPressItem): boolean {
+  try { const url = new URL(item.link ?? item.url ?? ""); return url.pathname === "/" || url.pathname === ""; }
+  catch { return false; }
+}
+
+function findTrustedStructuralCollection(node: unknown, path = "acf"): { names: string[]; path: string } | null {
+  const source = record(node);
+  if (!source) return null;
+  for (const [key, value] of Object.entries(source)) {
+    if (/^(?:trusted|customer|client|brands?)[_-].*logos?$|^(?:trusted|customer|client)_logos?$/i.test(key) &&
+        !/(?:partner|certif|award|technolog)/i.test(key)) {
+      const names = trustedLabelsFromCollection(value);
+      if (names.length) return { names, path: `${path}.${key}` };
+    }
+  }
+  for (const [key, value] of Object.entries(source)) {
+    const nested = findTrustedStructuralCollection(value, `${path}.${key}`);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function findTrustedSemanticFallback(node: unknown, path = "acf"): { names: string[]; path: string } | null {
+  const source = record(node);
+  if (!source) return null;
+  const semantics = Object.entries(source)
+    .filter(([key, value]) => /heading|title|label|name/i.test(key) && typeof value === "string")
+    .map(([, value]) => normalizeSearchText(String(value))).join(" ");
+  if (/\b(?:trusted|customers?|clients?|brands?|organizations?|companies|enterprises?)\b/.test(semantics) &&
+      !/\b(?:partners?|certifications?|awards?|technologies|social)\b/.test(semantics)) {
+    for (const [key, value] of Object.entries(source)) {
+      if (!/logo|brand|customer|client|organization|company|marquee|carousel/i.test(key)) continue;
+      const names = trustedLabelsFromCollection(value);
+      if (names.length >= 3) return { names, path: `${path}.${key}` };
+    }
+  }
+  for (const [key, value] of Object.entries(source)) {
+    const nested = findTrustedSemanticFallback(value, `${path}.${key}`);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+export function extractTrustedOrganizations(items: WordPressItem[]): TrustedOrganizationCollection | null {
+  for (const item of items.filter(isCanonicalHomepage)) {
+    const found = findTrustedStructuralCollection(item.acf) ?? findTrustedSemanticFallback(item.acf);
+    if (found) return { organizations: found.names, source: item, sourcePath: found.path };
+  }
+  return null;
+}
+
+export function extractPublishedClientTotal(items: WordPressItem[]): string | null {
+  for (const item of items) {
+    if (!isCanonicalHomepage(item) && !/\babout\b/i.test(item.slug ?? "")) continue;
+    const match = JSON.stringify(item.acf ?? {}).match(/\b(\d[\d,]*\+?)\s+(?:enterprise\s+)?clients?\b/i);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+export type ClientIntent = "overview" | "current" | "count" | "public_work" | "blog" | "news" | "confidential" | null;
+export function classifyClientIntent(message: string): ClientIntent {
+  const q = normalizeSearchText(message);
+  if (/\b(?:secret|confidential|unannounced|nda|undisclosed)\b.*\b(?:clients?|customers?|companies|organizations?)\b|\b(?:clients?|customers?)\b.*\b(?:secret|confidential|unannounced|nda|undisclosed)\b/.test(q)) return "confidential";
+  if (/\b(?:clients?|customers?)\b.*\b(?:right now|current|currently|active|today|working with)\b|\b(?:current|active)\s+(?:clients?|customers?)\b/.test(q)) return "current";
+  if (/^which (?:of )?(?:these|those) (?:ones )?(?:are )?current\??$/.test(q)) return "current";
+  if (/\b(?:how many|count|total|number of)\b.*\b(?:clients?|customers?|trusted organizations?)\b/.test(q)) return "count";
+  if (/\b(?:client|customer)\b.*\b(?:blogs?|articles?)\b|\b(?:blogs?|articles?)\b.*\b(?:client|customer)\b/.test(q)) return "blog";
+  if (/\b(?:client|customer)\b.*\b(?:announcements?|news|press releases?|media)\b|\b(?:announcements?|news|press releases?|media)\b.*\b(?:client|customer)\b/.test(q)) return "news";
+  if (/\b(?:client|customer)\b.*\b(?:case stud(?:y|ies)|stories|examples|projects?|success|published work)\b|\b(?:case stud(?:y|ies)|stories|examples|published work)\b.*\b(?:client|customer)\b/.test(q)) return "public_work";
+  if (/\b(?:customer experience|customer support|customer data|customer journey|client side|client server|multi client)\b/.test(q)) return null;
+  if (/^(?:our|your)\s+(?:clients?|customers?)\??$/.test(q) ||
+      /^(?:show (?:me )?)?(?:our|your)\s+(?:clients?|customers?)\??$/.test(q) ||
+      /^(?:show (?:me )?)?(?:clients?|customers?)\??$/.test(q) ||
+      /^companies (?:you|successive) (?:work|works) with\??$/.test(q)) return "overview";
+  if (/^(?:show (?:me )?|who are your |which (?:organizations|companies) (?:trust|are showcased).*)?(?:clients?|customers?)\??$/.test(q) ||
+      /^(?:who are your clients|show your clients|which organizations trust successive|which companies are showcased|which companies (?:work with you|do you work with)|tell me about your customers)$/.test(q)) return "overview";
+  return null;
+}
+
+export function clientOverviewFallback(message: string): string {
+  const q = normalizeSearchText(message);
+  if (/customers?/.test(q)) {
+    return "## Customers\n\nSuccessive highlights a broad selection of trusted organizations. Here are some of them:";
+  }
+  if (/who are your clients/.test(q)) {
+    return "## Our Clients\n\nSuccessive works across a range of industries and highlights the following trusted organizations:";
+  }
+  if (/which companies|companies you work with/.test(q)) {
+    return "## Organizations We Work With\n\nHere are some of the trusted organizations highlighted by Successive:";
+  }
+  if (/^(?:our|your) clients?$/.test(q)) {
+    return "## Our Clients\n\nSuccessive highlights organizations across different industries and business domains. A selection appears below.";
+  }
+  if (/^clients$/.test(q)) {
+    return "## Trusted Organizations\n\nSuccessive highlights organizations representing a variety of industries and technology needs. Some of them are listed below.";
+  }
+  return "## Clients\n\nSuccessive highlights a diverse group of trusted organizations. Here are some of them:";
+}
+
+export function availableClientSuggestionActions(items: WordPressItem[]): SuggestionAction[] {
+  const documents = items.map((item) => buildSearchDocument(item));
+  const caseStudies = documents.filter((document) => document.role === "case_study");
+  const otherCustomerWork = documents.filter((document) =>
+    ["blog", "editorial", "press_release", "resource", "product"].includes(document.role) &&
+    /\b(?:customer|client)\b.*\b(?:story|success|project|work|collaborat)|\b(?:story|success|project|work|collaborat)\b.*\b(?:customer|client)\b/i.test(
+      `${document.title} ${document.headings.slice(0, 4).join(" ")}`,
+    ),
+  );
+  const actions: SuggestionAction[] = [];
+  const broadKeys = new Set([...caseStudies, ...otherCustomerWork].map((document) => `${document.type}:${document.id}`));
+  const caseKeys = new Set(caseStudies.map((document) => `${document.type}:${document.id}`));
+  const broaderIsDistinct = broadKeys.size !== caseKeys.size || [...broadKeys].some((key) => !caseKeys.has(key));
+  if (broaderIsDistinct && !caseStudies.length) actions.push({
+    id: "customer-work-discovery", label: "Show published customer work",
+    intent: "CUSTOMER_WORK_DISCOVERY", contentType: "customer-work", relation: "CUSTOMER_WORK", sourceContext: "CLIENT_OVERVIEW",
+  });
+  if (caseStudies.length) actions.push({
+    id: "customer-case-study-discovery", label: "Show customer case studies",
+    intent: "CUSTOMER_WORK_DISCOVERY", contentType: "case-study", relation: "CUSTOMER_WORK", sourceContext: "CLIENT_OVERVIEW",
+  });
+  return actions;
+}
 
 const text = (value: unknown): string => typeof value === "string"
   ? htmlToText(decodeEntities(value)).replace(/\s+/g, " ").trim()
