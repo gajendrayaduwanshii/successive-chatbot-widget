@@ -40,6 +40,16 @@ export function isCareerOpeningQuery(message: string): boolean {
     ));
 }
 
+export function shouldUseCareerOpeningRoute(
+  message: string,
+  requestedContentType: string | null,
+  followUpScope: string,
+): boolean {
+  return isCareerOpeningQuery(message) ||
+    (requestedContentType === "career" &&
+      ["CONTINUE_SAME_SCOPE", "REFINE_SCOPE", "AMBIGUOUS_FOLLOW_UP"].includes(followUpScope));
+}
+
 export async function fetchActiveCareerJobs(): Promise<CareerJob[]> {
   if (jobsCache && jobsCache.expiresAt > Date.now()) return jobsCache.jobs;
   const controller = new AbortController();
@@ -76,7 +86,9 @@ const QUERY_NOISE = new Set([
   "hiring", "how", "i", "in", "is", "job", "jobs", "many", "me", "of",
   "open", "opening", "openings", "position", "positions", "role", "roles",
   "show", "successive", "the", "there", "to", "vacancies", "vacancy", "what",
-  "which", "with", "you", "your",
+  "which", "with", "you", "your", "could", "can", "please", "plz",
+  "find", "give", "get", "provide", "tell", "looking", "lookin", "only",
+  "hey", "hirings", "details", "information",
 ]);
 
 function strongJobSkillText(job: CareerJob): string {
@@ -99,6 +111,9 @@ function searchableJobText(job: CareerJob): string {
 
 export function filterCareerJobs(jobs: CareerJob[], message: string): CareerJob[] {
   const normalized = normalizeSearchText(message);
+  const genericItJob = /\bit jobs?\b/.test(normalized);
+  const requestsHiringInformation =
+    /\b(?:give|provide)\b.*\b(?:data|details|information)\b.*\b(?:hiring|hirings|jobs?|openings?)\b/.test(normalized);
   const requestedYears = Number(
     normalized.match(/\b(\d{1,2})\s*(?:plus\s*)?(?:years?|yrs?)\b/)?.[1],
   );
@@ -134,6 +149,8 @@ export function filterCareerJobs(jobs: CareerJob[], message: string): CareerJob[
 
   const terms = normalized.split(" ").filter(
     (term) => term.length > 1 && !QUERY_NOISE.has(term) &&
+      !(term === "it" && genericItJob) &&
+      !(term === "data" && requestsHiringInformation) &&
       !requestedLocations.includes(term) && !/^\d+$/.test(term) &&
       !["year", "years", "yr", "yrs", "experience"].includes(term),
   );

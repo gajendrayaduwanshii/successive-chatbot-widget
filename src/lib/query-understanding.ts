@@ -205,7 +205,7 @@ export function buildDeterministicUnderstanding(
           ? "partner"
           : explicitTypeRequest(message, /\bindustr(?:y|ies)\b/)
             ? "industry"
-            : /\b(?:career|careers|jobs?)\b/i.test(message)
+            : /\b(?:career|careers|jobs?|openings?|vacanc(?:y|ies)|hiring)\b/i.test(message)
               ? "career"
       : explicitTypeRequest(message, /\b(?:blogs?|articles?)\b/)
         ? "blog"
@@ -260,11 +260,16 @@ export function buildDeterministicUnderstanding(
     "whitepapers", "ebook", "ebooks", "blog", "blogs", "article", "articles",
     "webinar", "webinars", "event", "events", "news", "announcement", "announcements", "thought", "leadership", "partner",
     "partnership", "industry", "industries", "career", "careers", "job", "jobs",
+    "opening", "openings", "vacancy", "vacancies", "hiring",
     "service", "services", "serivce", "serivces", "capability", "capabilities", "offerings",
     "product", "products", "platform", "platforms", "solution", "solutions",
     "provide", "specialize", "specialise",
   ]);
-  const topics = [...new Set(tokens.filter((token) => !contentTypeTerms.has(token)))].slice(0, 6);
+  const relationshipWords = new Set(["related", "relevant", "matching", "associated"]);
+  const topics = [...new Set(tokens.filter((token) =>
+    !contentTypeTerms.has(token) &&
+    !(requestedContentType && relationshipWords.has(token)),
+  ))].slice(0, 6);
   const offTopic = /\b(?:weather|forecast|movie|film|poem|song|joke|capital of|president of|prime minister|sports? score|recipe|horoscope|sorting code)\b/i.test(message);
   const industryMatch = normalizedQuery.match(
     /\b(?:for|in|with|about) ([a-z][a-z ]{1,50}?) (?:companies|businesses|organizations|organisations|industry|sector)\b/,
@@ -315,6 +320,39 @@ export interface ConversationState {
   activePartner: string | null;
 }
 
+export type FollowUpScope =
+  | "CONTINUE_SAME_SCOPE"
+  | "REFINE_SCOPE"
+  | "BROADEN_SCOPE"
+  | "SWITCH_TOPIC"
+  | "AMBIGUOUS_FOLLOW_UP";
+
+/** Classifies only context ownership; it does not alter retrieval or ranking. */
+export function classifyFollowUpScope(
+  current: QueryUnderstanding,
+  message: string,
+): FollowUpScope {
+  const normalized = normalizeSearchText(message);
+  const collection = /\b(?:openings?|jobs?|careers?|services?|offerings?|capabilities|case studies?|customer stories|blogs?|articles?|insights?|partners?|partnerships?|industries|locations?|offices?|products?|platforms?)\b/;
+  const explicitBroad =
+    /\b(?:all|every|complete|full list|entire)\b/.test(normalized) ||
+    /^(?:what|which)\b.*\b(?:do you (?:have|offer|provide)|are available|work with|serve)\b/.test(normalized) ||
+    /^(?:where are|show|list|explore)\b.*\b(?:offices?|locations?|industries|partners?|products?|services?)\b/.test(normalized) ||
+    /^(?:current|currently available|latest|newest|most recent)\s+(?:openings?|jobs?|articles?|blogs?|case studies?|products?)$/.test(normalized);
+  if (collection.test(normalized) && explicitBroad) return "BROADEN_SCOPE";
+  if (/^(?:any more|more|another|next|anything else)(?:\s+(?:one|ones|results?|items?))?$/.test(normalized))
+    return "CONTINUE_SAME_SCOPE";
+  if (/\b(?:only|instead|specifically)\b/.test(normalized) ||
+      /^(?:in|for|with|from|any)\b/.test(normalized) ||
+      (current.requestedContentType && /\b(?:related|relevant|matching|associated)\b/.test(normalized)) ||
+      /\b(?:one|ones)\b/.test(normalized)) return "REFINE_SCOPE";
+  if (current.topics.length || current.entities.length || current.industry || current.requestedContentType)
+    return "SWITCH_TOPIC";
+  if (/\b(?:this|that|these|those|them|it|its)\b/.test(normalized))
+    return "AMBIGUOUS_FOLLOW_UP";
+  return current.isFollowUp ? "AMBIGUOUS_FOLLOW_UP" : "SWITCH_TOPIC";
+}
+
 export function resolveConversationUnderstanding(
   current: QueryUnderstanding,
   history: Array<{ role: "user" | "assistant"; content: string }>,
@@ -324,17 +362,25 @@ export function resolveConversationUnderstanding(
   let lastExplicitTopicTurn: number | null = null;
   priorUsers.forEach((item, index) => {
     const candidate = buildDeterministicUnderstanding(item.content);
-    if (candidate.topics.length) {
+    if (candidate.topics.length || candidate.entities.length || candidate.industry || candidate.requestedContentType)
       prior = candidate;
+    if (candidate.topics.length) {
       lastExplicitTopicTurn = index;
     }
   });
-  const hasExplicitCurrentSubject = current.topics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
-  const shouldInherit = !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 ||
+  const scope = classifyFollowUpScope(current, current.normalizedQuery);
+  const broadensScope = scope === "BROADEN_SCOPE";
+  const refinesScope = scope === "REFINE_SCOPE";
+  const continuesScope = scope === "CONTINUE_SAME_SCOPE" || scope === "AMBIGUOUS_FOLLOW_UP";
+  const currentTopics = current.topics.filter((topic) => !/^(?:one|ones|item|items|result|results)$/.test(topic));
+  const hasExplicitCurrentSubject = currentTopics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
+  const shouldInherit = !broadensScope && !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 ||
     /\b(?:this|that|it|its|these|those|them)\b/i.test(current.normalizedQuery));
   const preserveTypeForTopicSwitch = /^what about\b/.test(current.normalizedQuery);
-  const topics = current.topics.length
-    ? current.topics
+  const topics = refinesScope && prior
+    ? [...new Set([...prior.topics, ...currentTopics])]
+    : currentTopics.length
+    ? currentTopics
     : shouldInherit
       ? prior?.topics ?? []
       : [];
@@ -368,7 +414,10 @@ export function resolveConversationUnderstanding(
       current.existingPlatform ??
       (shouldInherit ? prior?.existingPlatform ?? null : null),
     requestedContentType:
-      current.requestedContentType ?? (shouldInherit || preserveTypeForTopicSwitch ? prior?.requestedContentType ?? null : null),
+      current.requestedContentType ??
+      (shouldInherit || continuesScope || refinesScope || preserveTypeForTopicSwitch
+        ? prior?.requestedContentType ?? null
+        : null),
     retrievalConcepts: current.retrievalConcepts.length
       ? current.retrievalConcepts
       : shouldInherit

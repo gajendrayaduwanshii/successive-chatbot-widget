@@ -40,7 +40,7 @@ import {
   careersPageUrl,
   fetchActiveCareerJobs,
   filterCareerJobs,
-  isCareerOpeningQuery,
+  shouldUseCareerOpeningRoute,
 } from "@/lib/careers-api";
 import {
   asksForAnotherResult,
@@ -63,6 +63,7 @@ import {
   shouldUseSemanticUnderstanding,
   buildRetrievalQuery,
   isExplicitListRequest,
+  classifyFollowUpScope,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
 import { extractQueryFacets, inferQueryRelation } from "@/lib/query-facets";
@@ -73,7 +74,7 @@ import {
   clientOverviewFallback,
   extractPublishedClientTotal,
   extractTrustedOrganizations,
-  understandStructuredRequest,
+  understandContextualStructuredRequest,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
 import { recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
@@ -612,7 +613,10 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
-  const structuredRequest = understandStructuredRequest(effectiveMessage);
+  const structuredRequest = understandContextualStructuredRequest(
+    effectiveMessage,
+    parsed.data.history.slice(-8),
+  );
   if (structuredRequest) {
     try {
       const structuredAnswer = answerStructuredRequest(
@@ -790,7 +794,15 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
-  if (isCareerOpeningQuery(effectiveMessage)) {
+  const followUpScope = classifyFollowUpScope(
+    deterministicUnderstanding,
+    effectiveMessage,
+  );
+  if (shouldUseCareerOpeningRoute(
+    effectiveMessage,
+    understanding.requestedContentType,
+    followUpScope,
+  )) {
     try {
       const jobs = await fetchActiveCareerJobs();
       const matches = filterCareerJobs(jobs, effectiveMessage);

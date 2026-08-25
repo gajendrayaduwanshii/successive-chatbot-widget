@@ -85,6 +85,18 @@ describe("generic evidence validation", () => {
     expect(result.rejected[0]?.reason).toBe("requested content type mismatch");
   });
 
+  it("treats relationship navigation words as context rather than evidence subjects", () => {
+    const current = buildDeterministicUnderstanding("show related case studies");
+    const result = validateEvidence({
+      message: "show related case studies",
+      contextMessage: "ai",
+      understanding: { ...current, topics: ["ai"], domains: ["ai"], retrievalConcepts: ["ai"] },
+      matches: [match("AI Customer Automation", "AI automation delivered for a customer.", "case_study")],
+      hasConversationSubject: true,
+    });
+    expect(result.status).toBe("SUPPORTED");
+  });
+
   it("asks for context when an estimate has no resolvable subject", () => {
     const result = validate("How long?", [], false);
     expect(result.status).toBe("AMBIGUOUS");

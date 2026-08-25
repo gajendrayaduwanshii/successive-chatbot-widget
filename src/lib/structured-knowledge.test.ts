@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WordPressItem } from "@/types/wordpress";
-import { answerStructuredRequest, availableClientSuggestionActions, classifyClientIntent, clientOverviewFallback, cleanMediaLabel, extractTrustedOrganizations, understandStructuredRequest } from "./structured-knowledge";
+import { answerStructuredRequest, availableClientSuggestionActions, classifyClientIntent, clientOverviewFallback, cleanMediaLabel, extractTrustedOrganizations, understandContextualStructuredRequest, understandStructuredRequest } from "./structured-knowledge";
 import { buildSearchDocument } from "./search-index";
 
 const page = (id: number, slug: string, title: string, acf: Record<string, unknown>): WordPressItem => ({
@@ -96,6 +96,17 @@ describe("dynamic homepage trusted organizations", () => {
 });
 
 describe("structured API knowledge", () => {
+  it("routes a terse location refinement only from active location context", () => {
+    expect(understandContextualStructuredRequest("Pune only", [
+      { role: "user", content: "Where are your offices?" },
+    ])).toMatchObject({ attribute: "company_location", subject: "pune office" });
+    expect(understandContextualStructuredRequest("Pune only", [
+      { role: "user", content: "Show current openings" },
+    ])).toBeNull();
+    expect(understandContextualStructuredRequest("Where are your offices?", [
+      { role: "user", content: "Pune office" },
+    ])).toMatchObject({ attribute: "company_location" });
+  });
   it("does not mistake a short office-location phrase for a person name", () => {
     expect(understandStructuredRequest("Office locations")).toMatchObject({
       attribute: "company_location",
@@ -400,6 +411,11 @@ describe("structured API knowledge", () => {
   it("resolves a bare team-member name from the API record", () => {
     const result = answerStructuredRequest(corpus, understandStructuredRequest("Aarav Malhotra")!);
     expect(result?.answer).toContain("Director of Engineering");
+  });
+
+  it("preserves a direct bare-name request in contextual routing", () => {
+    expect(understandContextualStructuredRequest("Aarav Malhotra", []))
+      .toMatchObject({ attribute: "person", subject: "aarav malhotra" });
   });
 
   it("does not fabricate a record for an unmatched bare name", () => {

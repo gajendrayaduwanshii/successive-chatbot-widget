@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   filterCareerJobs,
   isCareerOpeningQuery,
+  shouldUseCareerOpeningRoute,
   type CareerJob,
 } from "./careers-api";
 
@@ -50,6 +51,23 @@ describe("dynamic Successive career openings", () => {
 
   it("returns all jobs for a total-opening question", () => {
     expect(filterCareerJobs(jobs, "How many openings are available?")).toHaveLength(3);
+    expect(filterCareerJobs(jobs, "could you plz find me the current opening in successive"))
+      .toHaveLength(3);
+    expect(filterCareerJobs(
+      jobs,
+      "Hey i m lookin for it job could you plz give the data in hirings in successive",
+    )).toHaveLength(3);
+  });
+
+  it("allows only dependent career refinements into the live openings route", () => {
+    expect(shouldUseCareerOpeningRoute("Pune only", "career", "REFINE_SCOPE"))
+      .toBe(true);
+    expect(shouldUseCareerOpeningRoute("MERN only", "career", "REFINE_SCOPE"))
+      .toBe(true);
+    expect(shouldUseCareerOpeningRoute("AI services", "service", "SWITCH_TOPIC"))
+      .toBe(false);
+    expect(filterCareerJobs(jobs, "Pune only").map((job) => job.id)).toEqual([3]);
+    expect(filterCareerJobs(jobs, "MERN only").map((job) => job.id)).toEqual([2]);
   });
 
   it("filters dynamically by technology and location", () => {
@@ -57,6 +75,8 @@ describe("dynamic Successive career openings", () => {
       .toEqual([3]);
     expect(filterCareerJobs(jobs, "Show React openings in Noida").map((job) => job.id))
       .toEqual([1, 2]);
+    expect(filterCareerJobs(jobs, "Show data jobs").map((job) => job.id))
+      .toEqual([]);
   });
 
   it("filters by a candidate's stated experience", () => {

@@ -2,6 +2,7 @@ import { decodeEntities, htmlToText } from "./html-utils";
 import { buildSearchDocument, normalizeSearchText, type SuccessiveSearchDocument } from "./search-index";
 import type { WordPressItem } from "@/types/wordpress";
 import type { SuggestionAction } from "./llm/schemas";
+import { buildDeterministicUnderstanding, classifyFollowUpScope } from "./query-understanding";
 
 export type StructuredAttribute =
   | "company_overview" | "founded" | "values" | "leadership" | "executives" | "board"
@@ -256,7 +257,7 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     bareNameCandidate;
   const personTokens = personCandidate?.split(" ").filter(Boolean) ?? [];
   const person = personTokens.length >= 2 && personTokens.length <= 5 &&
-    !/\b(?:what|which|who|where|how|tell|show|list|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|solutions?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?|gis|geospatial|site selection|security|compliance|automation)\b/.test(personCandidate ?? "")
+    !/\b(?:what|which|who|where|how|tell|show|list|only|instead|company|successive|advantage|differentiators?|values?|ceo|founder|leader|leadership|board|director|executive|services?|solutions?|capabilities|technologies|programming|languages?|frameworks?|partner|culture|career|awards?|offices?|locations?|headquarters?|presence|footprint|industries?|gis|geospatial|site selection|security|compliance|automation)\b/.test(personCandidate ?? "")
     ? personCandidate
     : undefined;
   let attribute: StructuredAttribute | undefined;
@@ -284,6 +285,28 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     /\b(?:successive advantage|what makes successive different|company differentiators?|why (?:choose|successive))\b/.test(q)) attribute = "company_overview";
   if (!attribute) return null;
   return { attribute, mode, subject: person ?? subject, normalizedQuery: q };
+}
+
+/** Connects only a terse location refinement to the existing location path. */
+export function understandContextualStructuredRequest(
+  message: string,
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+): StructuredRequest | null {
+  const direct = understandStructuredRequest(message);
+  if (direct) return direct;
+  const current = buildDeterministicUnderstanding(message);
+  const scope = classifyFollowUpScope(current, message);
+  if (!["CONTINUE_SAME_SCOPE", "REFINE_SCOPE", "AMBIGUOUS_FOLLOW_UP"].includes(scope))
+    return null;
+  const previousLocation = history
+    .filter((item) => item.role === "user")
+    .map((item) => understandStructuredRequest(item.content))
+    .findLast((request) => request?.attribute === "company_location");
+  if (!previousLocation) return null;
+  const subject = current.entities[0] ?? current.industry ?? current.topics
+    .filter((topic) => !/^(?:only|instead|specifically)$/.test(topic))
+    .join(" ");
+  return subject ? understandStructuredRequest(`${subject} office`) : null;
 }
 
 function roleDocument(items: WordPressItem[], role: SuccessiveSearchDocument["role"]) {

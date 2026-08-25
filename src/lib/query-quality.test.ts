@@ -13,6 +13,8 @@ import {
   queryUnderstandingSchema,
   isDeterministicallyOffTopic,
   isExplicitListRequest,
+  classifyFollowUpScope,
+  resolveConversationUnderstanding,
   shouldUseSemanticUnderstanding,
 } from "./query-understanding";
 import { QUERY_QUALITY_CASES } from "./query-quality-cases";
@@ -30,6 +32,36 @@ const document = (title: string, slug: string, body: string, headings: string[] 
   });
 
 describe("generic query understanding", () => {
+  it("drops stale topics for broad collections and preserves only dependent refinements", () => {
+    const resolve = (previous: string, current: string) =>
+      resolveConversationUnderstanding(buildDeterministicUnderstanding(current), [
+        { role: "user" as const, content: previous },
+      ]).understanding;
+    const broadPairs = [
+      ["IT jobs at Successive", "current openings"], ["AI services", "show all services"],
+      ["healthcare case studies", "show all case studies"], ["cloud blogs", "latest articles"],
+      ["AWS partnership", "show all partners"], ["Pune office", "where are your offices"],
+      ["Kagen Voice", "what products do you have"], ["AI services", "show all case studies"],
+    ];
+    for (const [previous, current] of broadPairs) {
+      const parsed = buildDeterministicUnderstanding(current!);
+      expect(classifyFollowUpScope(parsed, current!)).toBe("BROADEN_SCOPE");
+      const result = resolve(previous!, current!);
+      const oldTopics = buildDeterministicUnderstanding(previous!).topics;
+      expect(result.topics.some((topic) => oldTopics.includes(topic))).toBe(false);
+    }
+    expect(resolve("current openings", "Pune only")).toMatchObject({ requestedContentType: "career", topics: ["pune"] });
+    expect(resolve("Pune jobs", "any more?")).toMatchObject({ requestedContentType: "career", topics: ["pune"] });
+    expect(resolve("AI services", "which ones help retail?")).toMatchObject({ requestedContentType: "service", topics: expect.arrayContaining(["ai", "retail"]) });
+    expect(resolve("healthcare case studies", "any AI ones?")).toMatchObject({ requestedContentType: "case-study", topics: expect.arrayContaining(["healthcare", "ai"]) });
+    expect(resolve("AI services", "any case studies?")).toMatchObject({ requestedContentType: "case-study", topics: ["ai"] });
+    expect(resolve("AI services", "show related case studies")).toMatchObject({ requestedContentType: "case-study", topics: ["ai"] });
+    expect(resolve("DevSecOps", "related articles")).toMatchObject({ requestedContentType: "blog", topics: ["devsecops"] });
+    expect(resolve("Healthcare", "related services")).toMatchObject({ requestedContentType: "service", topics: ["healthcare"] });
+    const switched = resolve("current openings", "what AI services do you offer?");
+    expect(switched.topics).toContain("ai");
+    expect(switched.requestedContentType).not.toBe("career");
+  });
   it("extracts independent facets and their requested relations", () => {
     const facets = extractQueryFacets(
       "What is React, does Successive use it, and do you have a case study?",

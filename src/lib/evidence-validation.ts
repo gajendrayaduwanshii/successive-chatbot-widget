@@ -139,6 +139,7 @@ const stop = new Set([
   "no", "not", "only", "cannot", "right", "correct", "unrelated",
   "serve", "industry", "industries", "career", "careers", "partner", "partners",
   "partnership", "about", "me", "you", "be", "completed", "finish",
+  "related", "relevant", "matching", "associated",
 ]);
 const attributeWords = new Set([
   "long", "time", "take", "timeline", "duration", "quickly", "days", "weeks",
