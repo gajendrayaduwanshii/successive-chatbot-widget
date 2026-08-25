@@ -140,6 +140,27 @@
   var loading = false;
   var messages = [];
   var typewritingMessage = null;
+  var latestUserMessage = null;
+  var userMessageToAnchor = null;
+  var anchoringLatestRequest = false;
+  var revealLatestRequest = false;
+  var hasRenderedConversation = false;
+  var latestRequestTopOffset = 12;
+  var moveLatestRequestTowardTop = function () {
+    if (!anchoringLatestRequest || !conversation || !latestUserMessage) return;
+    var anchor = document.getElementById(latestUserMessage.anchorId);
+    if (!anchor) return;
+    var distanceToTarget =
+      anchor.getBoundingClientRect().top -
+      conversation.getBoundingClientRect().top -
+      latestRequestTopOffset;
+    if (distanceToTarget <= 2) {
+      anchoringLatestRequest = false;
+      userMessageToAnchor = null;
+      return;
+    }
+    conversation.scrollTop += Math.min(distanceToTarget, 18);
+  };
   var sessionId = "";
   var unbindPromptInput = null;
   var loadingStatusTimer = null;
@@ -399,7 +420,7 @@
           var nextIndex = Math.min(index + charactersPerTick, characters.length);
           for (; index < nextIndex; index += 1)
             characters[index].style.display = "inline";
-          if (conversation) conversation.scrollTop = conversation.scrollHeight;
+          moveLatestRequestTowardTop();
           if (index === characters.length) {
             window.clearInterval(timer);
             typewritingMessage = null;
@@ -407,14 +428,6 @@
               renderCards(wrap, message.response.cards);
               renderSources(wrap, message.response.sources);
               renderSuggestions(wrap, executableSuggestions(message.response));
-            }
-            if (conversation) {
-              var scrollToBottom = function () {
-                conversation.scrollTop = conversation.scrollHeight;
-              };
-              if (typeof window.requestAnimationFrame === "function")
-                window.requestAnimationFrame(scrollToBottom);
-              else window.setTimeout(scrollToBottom, 0);
             }
           }
         }, 22);
@@ -437,10 +450,13 @@
       renderSuggestions(wrap, executableSuggestions(message.response));
     }
     row.appendChild(wrap);
+    if (message.anchorId) row.id = message.anchorId;
     return row;
   };
   var renderConversation = function () {
     if (!conversation) return;
+    var anchorRow = null;
+    var loadingRow = null;
     conversation.replaceChildren();
     conversation.appendChild(
       create(
@@ -450,7 +466,9 @@
       ),
     );
     messages.forEach(function (message) {
-      conversation.appendChild(renderMessage(message));
+      var row = renderMessage(message);
+      conversation.appendChild(row);
+      if (message === userMessageToAnchor) anchorRow = row;
     });
     if (loading) {
       var row = create("div", "message-row assistant");
@@ -465,8 +483,18 @@
       );
       row.appendChild(typing);
       conversation.appendChild(row);
+      loadingRow = row;
     }
-    conversation.scrollTop = conversation.scrollHeight;
+    if (anchorRow) {
+      if (revealLatestRequest) {
+        anchorRow.scrollIntoView?.({ behavior: "auto", block: "nearest" });
+        loadingRow?.scrollIntoView?.({ behavior: "auto", block: "nearest" });
+        revealLatestRequest = false;
+      }
+      moveLatestRequestTowardTop();
+    }
+    else if (!hasRenderedConversation) conversation.scrollTop = conversation.scrollHeight;
+    hasRenderedConversation = true;
   };
   var seenContent = function () {
     var seen = {};
@@ -521,7 +549,12 @@
     if (loading || message.length < 2 || message.length > 1000) return false;
     var requestHistory = history();
     var requestSeenContent = seenContent();
-    messages.push({ role: "user", content: message });
+    var userMessage = { role: "user", content: message, anchorId: "chat-request-" + Date.now() + "-" + messages.length };
+    messages.push(userMessage);
+    latestUserMessage = userMessage;
+    userMessageToAnchor = userMessage;
+    anchoringLatestRequest = true;
+    revealLatestRequest = true;
     save();
     openWidget();
     setLoading(true);
@@ -653,6 +686,10 @@
   };
   var clearConversation = function () {
     messages = [{ role: "assistant", content: config.welcomeMessage }];
+    latestUserMessage = null;
+    userMessageToAnchor = null;
+    anchoringLatestRequest = false;
+    revealLatestRequest = false;
     save();
     renderConversation();
   };

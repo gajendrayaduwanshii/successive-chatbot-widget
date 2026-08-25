@@ -1,6 +1,6 @@
 "use client";
 import { ArrowRight, Bot, ExternalLink, UserRound } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type Ref } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as Message } from "@/types/chat";
@@ -13,6 +13,8 @@ export function ChatMessage({
   animate = false,
   onAnimationProgress,
   onAnimationComplete,
+  messageRowRef,
+  messageRowId,
 }: {
   message: Message;
   onSuggestion: (value: string, action?: SuggestionAction) => void;
@@ -20,6 +22,8 @@ export function ChatMessage({
   animate?: boolean;
   onAnimationProgress?: () => void;
   onAnimationComplete?: () => void;
+  messageRowRef?: Ref<HTMLDivElement>;
+  messageRowId?: string;
 }) {
   const assistant = message.role === "assistant";
   const answer = message.response?.answer ?? message.content;
@@ -54,7 +58,7 @@ export function ChatMessage({
   }, [animate, answer, assistant, onAnimationComplete, onAnimationProgress]);
 
   return (
-    <div className={`message-row ${assistant ? "assistant" : "user"}`}>
+    <div id={messageRowId} ref={messageRowRef} className={`message-row ${assistant ? "assistant" : "user"}`}>
       <div className="avatar" aria-hidden>
         {assistant ? <Bot size={17} /> : <UserRound size={17} />}
       </div>

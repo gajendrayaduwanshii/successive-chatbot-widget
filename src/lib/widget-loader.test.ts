@@ -183,7 +183,7 @@ describe("public direct-DOM widget loader", () => {
       ok: true,
       json: async () => ({
         data: {
-          answer: "**[AI Development](https://successive.ai/ai-development/)**",
+          answer: "**[Successive Digital](https://successive.tech/)**",
           cards: [],
           sources: [],
           suggestions: [],
@@ -199,7 +199,7 @@ describe("public direct-DOM widget loader", () => {
     await vi.waitFor(() =>
       expect(
         dom.window.document.querySelector(
-          '.bubble strong a[href="https://successive.ai/ai-development/"]',
+          '.bubble strong a[href="https://successive.tech/"]',
         ),
       ).not.toBeNull(),
     );
@@ -258,6 +258,31 @@ describe("public direct-DOM widget loader", () => {
     expect(
       dom.window.document.querySelector(".typing-status")?.textContent,
     ).toBe("Preparing your response…");
+  });
+
+  it("moves the latest request toward the top without a blank spacer", () => {
+    const dom = createWidget();
+    vi.mocked(dom.window.fetch).mockImplementationOnce(() => new Promise(() => {}));
+    const conversation = dom.window.document.querySelector<HTMLElement>(".conversation")!;
+    conversation.scrollTop = 10;
+    const reveal = vi.fn();
+    Object.defineProperty(dom.window.HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: reveal,
+    });
+    vi.spyOn(dom.window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const top = this === conversation ? 20 : this.matches(".message-row.user") ? 70 : 0;
+      return { x: 0, y: top, top, left: 0, right: 0, bottom: top, width: 0, height: 0, toJSON: () => ({}) };
+    });
+    const api = (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat;
+
+    api.sendMessage("keep this request visible");
+
+    expect(conversation.scrollTop).toBe(28);
+    expect(reveal).toHaveBeenCalledWith({ behavior: "auto", block: "nearest" });
+    expect(reveal).toHaveBeenCalledTimes(2);
+    expect(conversation.querySelector(".request-scroll-spacer")).toBeNull();
+    expect(conversation.querySelector<HTMLElement>(".message-row.user")?.id).toMatch(/^chat-request-/);
   });
 
   it("replaces copied stale widget markup", () => {

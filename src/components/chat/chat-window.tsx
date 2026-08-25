@@ -1,6 +1,6 @@
 "use client";
 import { RotateCcw, Sparkles, Trash2, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AssistantResponse, SuggestionAction } from "@/lib/llm/schemas";
 import type { ChatMessage, HistoryMessage, SeenContent } from "@/types/chat";
 import { ChatInput } from "./chat-input";
@@ -10,6 +10,7 @@ import { TypingIndicator } from "./typing-indicator";
 const defaultWelcome =
   "Hello! I’m the Successive AI Assistant. I can help you explore Successive’s products, customer stories, resources, events, and more. What would you like to know?";
 const storageKey = "successive-chat:conversation:v1";
+const latestRequestTopOffset = 12;
 
 interface ChatWindowProps {
   widget?: boolean;
@@ -42,7 +43,13 @@ export function ChatWindow({
   const [messages, setMessages] = useState<ChatMessage[]>([welcome]);
   const [loading, setLoading] = useState(false);
   const [animatingMessageId, setAnimatingMessageId] = useState<string>();
-  const end = useRef<HTMLDivElement>(null);
+  const [latestUserMessageId, setLatestUserMessageId] = useState<string>();
+  const conversation = useRef<HTMLDivElement>(null);
+  const latestUserMessage = useRef<HTMLDivElement>(null);
+  const loadingMessage = useRef<HTMLDivElement>(null);
+  const userMessageToAnchor = useRef<string | undefined>(undefined);
+  const anchoringLatestRequest = useRef(false);
+  const revealLatestRequest = useRef(false);
   const sessionId = useRef("");
   const receivedExternalPrompts = useRef(new Set<string>());
   const postParent = useCallback(
@@ -88,8 +95,35 @@ export function ChatWindow({
     } catch {
       /* storage may be blocked */
     }
-    end.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  }, [messages]);
+  const moveLatestRequestTowardTop = useCallback(() => {
+    if (!anchoringLatestRequest.current || !latestUserMessage.current || !conversation.current) return;
+    const distanceToTarget =
+      latestUserMessage.current.getBoundingClientRect().top -
+      conversation.current.getBoundingClientRect().top -
+      latestRequestTopOffset;
+    if (distanceToTarget <= 2) {
+      anchoringLatestRequest.current = false;
+      userMessageToAnchor.current = undefined;
+      return;
+    }
+    conversation.current.scrollTop += Math.min(distanceToTarget, 18);
+  }, []);
+  useLayoutEffect(() => {
+    if (!userMessageToAnchor.current) return;
+    if (revealLatestRequest.current) {
+      latestUserMessage.current?.scrollIntoView({
+        behavior: "auto",
+        block: "nearest",
+      });
+      loadingMessage.current?.scrollIntoView({
+        behavior: "auto",
+        block: "nearest",
+      });
+      revealLatestRequest.current = false;
+    }
+    moveLatestRequestTowardTop();
+  }, [messages, loading, moveLatestRequestTowardTop]);
   const send = useCallback(
     async (text: string, suggestionAction?: SuggestionAction) => {
       if (loading) return;
@@ -98,6 +132,10 @@ export function ChatWindow({
         role: "user",
         content: text,
       };
+      userMessageToAnchor.current = user.id;
+      anchoringLatestRequest.current = true;
+      revealLatestRequest.current = true;
+      setLatestUserMessageId(user.id);
       const history: HistoryMessage[] = messages
         .filter((m) => m.id !== "welcome")
         .slice(-10)
@@ -256,6 +294,7 @@ export function ChatWindow({
   }, [embedded, postParent]);
   const clear = () => {
     setMessages([welcome]);
+    setLatestUserMessageId(undefined);
     try {
       sessionStorage.removeItem(storageKey);
     } catch {
@@ -308,7 +347,7 @@ export function ChatWindow({
           )}
         </div>
       </div>
-      <div className="conversation" aria-live="polite">
+      <div ref={conversation} className="conversation" aria-live="polite">
         <p className="chat-disclaimer">
           Successive AI answers from published Successive content. Please verify
           important information using the linked sources.
@@ -317,35 +356,28 @@ export function ChatWindow({
           <Message
             key={message.id}
             message={message}
+            messageRowRef={message.id === latestUserMessageId ? latestUserMessage : undefined}
+            messageRowId={message.id === latestUserMessageId ? `chat-request-${message.id}` : undefined}
             onSuggestion={send}
             onRetry={send}
             animate={message.id === animatingMessageId}
-            onAnimationProgress={() =>
-              window.requestAnimationFrame(() =>
-                end.current?.scrollIntoView({ behavior: "auto" }),
-              )
-            }
+            onAnimationProgress={moveLatestRequestTowardTop}
             onAnimationComplete={() => {
+              moveLatestRequestTowardTop();
               setAnimatingMessageId((current) =>
                 current === message.id ? undefined : current,
-              );
-              window.requestAnimationFrame(() =>
-                window.requestAnimationFrame(() =>
-                  end.current?.scrollIntoView({ behavior: "smooth" }),
-                ),
               );
             }}
           />
         ))}
         {loading && (
-          <div className="message-row assistant">
+          <div ref={loadingMessage} className="message-row assistant">
             <div className="avatar">
               <Sparkles size={16} />
             </div>
             <TypingIndicator />
           </div>
         )}
-        <div ref={end} />
       </div>
       <ChatInput onSend={send} disabled={loading} />
       {loading && (
