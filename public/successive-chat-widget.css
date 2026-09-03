@@ -49,6 +49,17 @@
   transform: translateY(-2px);
   box-shadow: 0 16px 40px rgba(15, 23, 42, 0.35);
 }
+.successive-chat-widget-wrap .successive-chat-launcher-icon-only {
+  width: 56px;
+  padding: 0;
+  justify-content: center;
+}
+.successive-chat-widget-wrap .successive-chat-launcher-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+}
 .successive-chat-widget-wrap .successive-chat-panel {
   position: absolute;
   bottom: 70px;

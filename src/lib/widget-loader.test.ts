@@ -106,6 +106,33 @@ describe("public direct-DOM widget loader", () => {
     );
   });
 
+  it("supports an icon-only launcher from the embed attributes", () => {
+    const iconUrl = "https://assets.example/custom-chat-icon.png";
+    const dom = createWidget(
+      "",
+      `data-title="Ask Successive AI" data-button-label="" data-button-icon-url="${iconUrl}"`,
+    );
+    const launcher = dom.window.document.querySelector<HTMLButtonElement>(
+      ".successive-chat-launcher",
+    )!;
+    const launcherIcon = launcher.querySelector<HTMLImageElement>(
+      ".successive-chat-launcher-icon",
+    );
+
+    expect(launcher.getAttribute("aria-label")).toBe("Open Ask Successive AI");
+    expect(launcher.classList.contains("successive-chat-launcher-icon-only")).toBe(true);
+    expect(launcherIcon?.src).toBe(iconUrl);
+    expect(launcherIcon?.alt).toBe("");
+    expect(launcher.querySelector(".successive-chat-label")).toBeNull();
+
+    launcher.click();
+    expect(launcher.getAttribute("aria-label")).toBe("Close Ask Successive AI");
+    expect(launcher.querySelector(".successive-chat-launcher-icon")).toBeNull();
+    expect(launcher.querySelector("svg path")?.getAttribute("d")).toContain(
+      "18 6 6 18",
+    );
+  });
+
   it("scopes every widget UI selector under the wrapper class", () => {
     expect(stylesheet).toContain(
       ".successive-chat-widget-wrap .successive-chat-launcher",

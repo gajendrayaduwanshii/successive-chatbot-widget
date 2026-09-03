@@ -113,7 +113,11 @@
     ),
     primaryColor: safeColor(data.primaryColor, "#0063ce"),
     position: data.position === "bottom-left" ? "bottom-left" : "bottom-right",
-    buttonLabel: safeText(data.buttonLabel, "Chat with Successive", 40),
+    buttonLabel:
+      data.buttonLabel == null
+        ? "Chat with Successive"
+        : String(data.buttonLabel).trim().slice(0, 40),
+    buttonIconUrl: safeUrl(data.buttonIconUrl, ""),
     logoUrl: safeUrl(data.logoUrl, ""),
     openByDefault: bool(data.openByDefault, false),
     zIndex: clamp(data.zIndex, 2147483000, 1000, 2147483646),
@@ -651,10 +655,24 @@
     launcher.setAttribute("aria-expanded", String(open));
     launcher.setAttribute(
       "aria-label",
-      open ? "Close " + config.title : config.buttonLabel,
+      open
+        ? "Close " + config.title
+        : config.buttonLabel || "Open " + config.title,
     );
-    launcher.innerHTML = icon(open ? closeIcon : chatIcon, 23);
-    if (!open)
+    launcher.classList.toggle(
+      "successive-chat-launcher-icon-only",
+      !config.buttonLabel,
+    );
+    launcher.innerHTML = "";
+    if (!open && config.buttonIconUrl) {
+      var launcherIcon = create("img", "successive-chat-launcher-icon");
+      launcherIcon.src = config.buttonIconUrl;
+      launcherIcon.alt = "";
+      launcher.appendChild(launcherIcon);
+    } else {
+      launcher.innerHTML = icon(open ? closeIcon : chatIcon, 23);
+    }
+    if (!open && config.buttonLabel)
       launcher.appendChild(
         create("span", "successive-chat-label", config.buttonLabel),
       );
