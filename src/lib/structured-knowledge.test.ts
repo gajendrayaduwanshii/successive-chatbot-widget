@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { WordPressItem } from "@/types/wordpress";
-import { answerStructuredRequest, availableClientSuggestionActions, classifyClientIntent, clientOverviewFallback, cleanMediaLabel, extractTrustedOrganizations, understandContextualStructuredRequest, understandStructuredRequest } from "./structured-knowledge";
+import { answerStructuredRequest, availableClientSuggestionActions, classifyClientIntent, classifyUnsupportedCompanyInformation, clientOverviewFallback, cleanMediaLabel, extractTrustedOrganizations, isOwnershipQuery, understandContextualStructuredRequest, understandStructuredRequest } from "./structured-knowledge";
 import { buildSearchDocument } from "./search-index";
+import { designationHasRole, requestedPersonRole } from "./person-roles";
+import { extractQueryFacets } from "./query-facets";
 
 const page = (id: number, slug: string, title: string, acf: Record<string, unknown>): WordPressItem => ({
   id, type: "page", slug, link: `https://example.test/${slug}/`,
@@ -27,6 +29,20 @@ const corpus: WordPressItem[] = [
     culture_content: "We support employee learning and workplace inclusion.",
   }),
 ];
+
+describe("unsupported structured company information", () => {
+  it.each([
+    ["What are your office timings?", "operational_hours"],
+    ["Are you open on weekends?", "operational_hours"],
+    ["What's its revenue?", "financial_metrics"],
+    ["What is the annual turnover of the company?", "financial_metrics"],
+    ["How many employees does the company have?", "financial_metrics"],
+    ["Which is your biggest focus?", "industry_superlative"],
+    ["Is Successive a product company?", "company_type"],
+  ] as const)("classifies %s", (query, expected) => {
+    expect(classifyUnsupportedCompanyInformation(query)).toBe(expected);
+  });
+});
 
 const trustedLabel = (suffix: string) => `Fixture Organization ${suffix}`;
 const trustedHomepage = (names: string[], heading = "Completely revised marketing copy"): WordPressItem => ({
@@ -96,6 +112,41 @@ describe("dynamic homepage trusted organizations", () => {
 });
 
 describe("structured API knowledge", () => {
+  it.each([
+    ["tell me about the company", "company_overview"],
+    ["what does the company do", "company_overview"],
+    ["tell me about your company", "company_overview"],
+    ["what does our company do", "company_overview"],
+  ] as const)("normalizes generic company-overview grammar: %s", (query, attribute) => {
+    expect(understandStructuredRequest(query)?.attribute).toBe(attribute);
+  });
+
+  it.each([
+    ["Who is the CEO and tell me about the company?", "Published Chief"],
+    ["Who is the founder and what does Successive Digital do?", "Published Chief"],
+    ["Who are the Board of Directors and what does the company do?", "Published Director"],
+    ["Show me the Executive Management team and tell me about Successive Digital.", "Published Chief"],
+  ])("independently resolves and composes structured intent facets: %s", (query, expectedPerson) => {
+    const about = page(134, "about-us", "About Us", {
+      executive_management: [{ name: "Published Chief", designation: "Founder & CEO" }],
+      "board-directors": [{ name: "Published Director", designation: "Independent Director" }],
+      about_content: "A published digital transformation company overview.",
+    });
+    const requests = extractQueryFacets(query).map(({ text }) => understandStructuredRequest(text));
+    expect(requests.every(Boolean)).toBe(true);
+    const answers = requests.map((request) => answerStructuredRequest([about], request!)?.answer);
+    expect(answers[0]).toContain(expectedPerson);
+    expect(answers[1]).toContain("digital transformation company overview");
+  });
+  it.each(["ceo", "CEO", "Who is the CEO?", "Who is the CEO of Successive Digital?", "Chief Executive Officer"])(
+    "normalizes CEO query form consistently: %s",
+    (query) => {
+      const request = understandStructuredRequest(query);
+      expect(request?.requestedRole).toBe("ceo");
+      expect(["leadership", "executives"]).toContain(request?.attribute);
+    },
+  );
+
   it("routes a terse location refinement only from active location context", () => {
     expect(understandContextualStructuredRequest("Pune only", [
       { role: "user", content: "Where are your offices?" },
@@ -233,7 +284,7 @@ describe("structured API knowledge", () => {
     },
   );
 
-  it.each(["ceo", "Current CEO", "chief executive", "Who runs Successive?", "owner", "Who owns Successive?", "founder", "Who founded Successive?"])(
+  it.each(["ceo", "Current CEO", "chief executive", "Who runs Successive?", "founder", "Who founded Successive?"])(
     "answers %s from Executive Management instead of unrelated retrieval",
     (query) => {
     const about = page(13, "about-us", "About Us", {
@@ -253,6 +304,104 @@ describe("structured API knowledge", () => {
     expect(result?.document.url).toContain("#w-tabs-5-data-w-pane-1");
     },
   );
+
+  it.each(["owner", "business owner", "Who owns Successive?"])(
+    "does not substitute a founder for an unpublished ownership role: %s",
+    (query) => {
+      const about = page(130, "about-us", "About Us", {
+        executive_management: [{ name: "Published Founder", desgnation: "Founder & CEO" }],
+      });
+      const request = understandStructuredRequest(query)!;
+      const result = answerStructuredRequest([about], request);
+      expect(request.attribute).toBe("ownership");
+      expect(request.requestedRole).toBeUndefined();
+      expect(result?.answer).toBe("I couldn’t confirm Successive Digital’s ownership from the current published Successive content.");
+      expect(result?.answer).not.toContain("Published Founder");
+    },
+  );
+
+  it.each([
+    "Who owns Successive Digital?",
+    "Who is the owner of Successive Digital?",
+    "Who are the owners?",
+    "Who owns the company?",
+    "Tell me about Successive Digital's ownership.",
+    "What is the ownership of Successive Digital?",
+    "Can you tell me about the company's ownership?",
+  ])("detects generic ownership intent: %s", (query) => {
+    expect(isOwnershipQuery(query)).toBe(true);
+    expect(understandStructuredRequest(query)?.attribute).toBe("ownership");
+  });
+
+  it.each(["data ownership", "ownership mindset", "content ownership model"])(
+    "does not classify an unrelated ownership phrase as company ownership: %s",
+    (query) => expect(isOwnershipQuery(query)).toBe(false),
+  );
+
+  it.each([
+    ["Who founded Successive Digital?", "leadership", "founder"],
+    ["Who is the CEO?", "leadership", "ceo"],
+  ] as const)("keeps non-ownership role intent unchanged: %s", (query, attribute, role) => {
+    const request = understandStructuredRequest(query);
+    expect(request?.attribute).toBe(attribute);
+    expect(request?.requestedRole).toBe(role);
+  });
+
+  it("answers only from explicit published ownership evidence", () => {
+    const about = page(133, "about-us", "About Us", {
+      ownership: "Example Holdings",
+      executive_management: [{ name: "Different Founder", desgnation: "Founder & CEO" }],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("Who is the owner?")!);
+    expect(result?.answer).toContain("Example Holdings");
+    expect(result?.answer).not.toContain("Different Founder");
+    expect(result?.evidencePaths).not.toEqual([]);
+  });
+
+  it.each([
+    ["Chief Marketing Officer", "CMO"],
+    ["Chief Information Officer", "CIO"],
+    ["Chief Human Resources Officer", "CHRO"],
+    ["technology head", "Head of Technology"],
+    ["Head of Engineering", "Head of Engineering"],
+    ["Head of Sales", "Head of Sales"],
+    ["Head of Marketing", "Head of Marketing"],
+    ["Head of HR", "Head of HR"],
+    ["Chairperson", "Chairperson"],
+    ["President", "President"],
+    ["Vice President", "Vice President"],
+    ["MD", "Managing Director"],
+    ["Director", "Director"],
+    ["Principal", "Principal"],
+    ["General Manager", "General Manager"],
+  ])("generically resolves role alias %s", (query, designation) => {
+    const about = page(131, "about-us", "About Us", {
+      executive_management: [
+        { name: "Requested Person", desgnation: designation },
+        { name: "Unrelated CEO", desgnation: "CEO" },
+      ],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest(query)!);
+    expect(result?.answer).toContain("Requested Person");
+    expect(result?.answer).not.toContain("Unrelated CEO");
+  });
+
+  it("preserves founder/co-founder and president/vice-president distinctions", () => {
+    expect(designationHasRole("Co-Founder", requestedPersonRole("founder")!)).toBe(false);
+    expect(designationHasRole("Founder", requestedPersonRole("co-founder")!)).toBe(false);
+    expect(designationHasRole("Vice President", requestedPersonRole("president")!)).toBe(false);
+    expect(designationHasRole("President", requestedPersonRole("vice president")!)).toBe(false);
+  });
+
+  it("uses structured board membership evidence without treating executive management as the board", () => {
+    const about = page(132, "about-us", "About Us", {
+      executive_management: [{ name: "Company Executive", desgnation: "Executive" }],
+      "board-directors": [{ name: "Published Board Person", desgnation: "Independent Director" }],
+    });
+    const result = answerStructuredRequest([about], understandStructuredRequest("board member")!);
+    expect(result?.answer).toContain("Published Board Person");
+    expect(result?.answer).not.toContain("Company Executive");
+  });
 
   it.each([
     ["managing partner", "Managing Partner"],

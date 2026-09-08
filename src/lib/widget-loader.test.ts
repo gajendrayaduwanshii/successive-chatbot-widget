@@ -106,6 +106,30 @@ describe("public direct-DOM widget loader", () => {
     );
   });
 
+  it("honors an explicitly empty button label", () => {
+    const dom = createWidget("", 'data-button-label=""');
+    const launcher = dom.window.document.querySelector<HTMLButtonElement>(".successive-chat-launcher")!;
+    expect(launcher.querySelector(".successive-chat-label")).toBeNull();
+    expect(launcher.textContent).toBe("");
+    expect(launcher.getAttribute("aria-label")).toBe("Chat with Successive");
+  });
+
+  it("renders a safe image supplied through data-button-icon-url", () => {
+    const dom = createWidget("", 'data-button-label="" data-button-icon-url="https://cdn.example/chat.png"');
+    const launcher = dom.window.document.querySelector<HTMLButtonElement>(".successive-chat-launcher")!;
+    const image = launcher.querySelector<HTMLImageElement>(".successive-chat-launcher-image")!;
+    expect(image.src).toBe("https://cdn.example/chat.png");
+    launcher.click();
+    expect(launcher.querySelector("img")).toBeNull();
+    expect(launcher.querySelector("svg")).not.toBeNull();
+  });
+
+  it("rejects an unsafe custom button image URL", () => {
+    const dom = createWidget("", 'data-button-icon-url="javascript:alert(1)"');
+    expect(dom.window.document.querySelector(".successive-chat-launcher img")).toBeNull();
+  });
+
+
   it("scopes every widget UI selector under the wrapper class", () => {
     expect(stylesheet).toContain(
       ".successive-chat-widget-wrap .successive-chat-launcher",

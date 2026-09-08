@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCareerFilterMessage,
   filterCareerJobs,
   isCareerOpeningQuery,
+  resolveCareerJobReference,
   shouldUseCareerOpeningRoute,
   type CareerJob,
 } from "./careers-api";
@@ -68,6 +70,27 @@ describe("dynamic Successive career openings", () => {
       .toBe(false);
     expect(filterCareerJobs(jobs, "Pune only").map((job) => job.id)).toEqual([3]);
     expect(filterCareerJobs(jobs, "MERN only").map((job) => job.id)).toEqual([2]);
+    expect(shouldUseCareerOpeningRoute("What about Noida?", "career", "SWITCH_TOPIC"))
+      .toBe(true);
+    expect(isCareerOpeningQuery("cloud roles")).toBe(true);
+  });
+
+  it("retains structured career filters and resolves ordinal Keka results", () => {
+    expect(buildCareerFilterMessage(jobs, "React roles", [
+      { role: "user", content: "Show openings in Noida" },
+    ])).toContain("Noida");
+    const history = [{ role: "assistant" as const, content:
+      "[Full-Stack Lead](https://successivesoftware.keka.com/careers/jobdetails/1)\n[MERN Lead](https://successivesoftware.keka.com/careers/jobdetails/2)" }];
+    expect(resolveCareerJobReference("Tell me about the second one", history))
+      .toEqual({ id: 2, title: "MERN Lead" });
+    expect(resolveCareerJobReference("Roles for 5 years experience", history)).toBeNull();
+    expect(resolveCareerJobReference("Pune only", history)).toBeNull();
+  });
+
+  it("does not interpret a person's role as a job-opening request", () => {
+    expect(isCareerOpeningQuery("Who is Jordan Lee and what is their role?"))
+      .toBe(false);
+    expect(isCareerOpeningQuery("cloud roles")).toBe(true);
   });
 
   it("filters dynamically by technology and location", () => {
@@ -84,10 +107,13 @@ describe("dynamic Successive career openings", () => {
       .toEqual([3]);
     expect(filterCareerJobs(jobs, "Node openings for 8 years experience").map((job) => job.id))
       .toEqual([1, 2]);
+    expect(filterCareerJobs([{ id: 8, title: "Analyst", description: "Experience level 4-5 years working with maps." }], "roles for 5 years experience"))
+      .toHaveLength(1);
   });
 
   it("returns no matches for unsupported criteria", () => {
     expect(filterCareerJobs(jobs, "Show Golang jobs in Noida")).toEqual([]);
+    expect(filterCareerJobs(jobs, "Any AI roles?")).toEqual([]);
   });
 
   it("requires strong skill evidence instead of an incidental long-description mention", () => {

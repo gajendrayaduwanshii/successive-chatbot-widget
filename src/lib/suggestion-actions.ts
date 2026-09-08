@@ -1,9 +1,37 @@
 import type { SuggestionAction } from "./llm/schemas";
 import { normalizeSearchText, type SuccessiveSearchDocument } from "./search-index";
+import { designationHasRole, type PersonRoleConcept } from "./person-roles";
 
 export type ExecutableSuggestionAction = Omit<SuggestionAction, "label"> & Partial<Pick<SuggestionAction, "label">>;
 type ActionExecutor = (action: ExecutableSuggestionAction) => string;
 export type SuggestionContextType = "TOPIC_CONTEXT" | "INDIVIDUAL_PAGE_CONTEXT" | "CATEGORY_LISTING_CONTEXT" | "OTHER_CONTEXT";
+
+export interface RelatedContentRequest {
+  requestedRoles: SuccessiveSearchDocument["role"][];
+}
+
+const TOPICAL_DISCOVERY_ROLES = new Set<SuccessiveSearchDocument["role"]>([
+  "service", "technology", "product", "industry", "case_study", "blog",
+  "editorial", "resource", "whitepaper", "report", "accelerator",
+]);
+
+/** Parses only the generic action grammar used by related-content controls. */
+export function parseRelatedContentRequest(message: string): RelatedContentRequest | null {
+  const normalized = normalizeSearchText(message);
+  const roleLabel = normalized.match(/^(?:explore|show|find|view|read)\s+(?:some\s+)?related\s+(.+)$/)?.[1];
+  if (!roleLabel) return null;
+  const mappings: Array<[RegExp, SuccessiveSearchDocument["role"][]]> = [
+    [/\b(?:articles?|posts?|blogs?)\b/, ["blog", "editorial"]],
+    [/\bresources?\b/, ["resource", "whitepaper", "report"]],
+    [/\bcase stud(?:y|ies)\b/, ["case_study"]],
+    [/\bservices?\b/, ["service"]],
+    [/\bpartners?(?:hip)?(?: content| information)?\b/, ["partner", "partners"]],
+    [/\bcontact(?: information| details)?\b/, ["contact", "location"]],
+    [/\bpages?\b/, ["page"]],
+  ];
+  return mappings.map(([pattern, requestedRoles]) => pattern.test(roleLabel) ? { requestedRoles } : null)
+    .find((value): value is RelatedContentRequest => Boolean(value)) ?? null;
+}
 
 export function classifySuggestionContext({ source, exactResource = false, categoryListing = false, personEntity = false }: {
   source?: SuccessiveSearchDocument;
@@ -33,6 +61,8 @@ const actionRegistry: Record<SuggestionAction["intent"], ActionExecutor> = {
       return `Business outcomes and value of ${topic}`;
     if (/\b(?:implement|implementation|apply|adopt)\b/.test(normalizedQuery))
       return `How Successive can implement ${topic} for a business`;
+    if (/\b(?:cost|pricing|price|estimate|quote|quotation|proposal|requirements|consultation|sales)\b/.test(normalizedQuery))
+      return `${query} for ${topic}`;
     return `${query} related to ${topic}`;
   },
 };
@@ -69,7 +99,23 @@ export function resolveEligibleActionDocuments(
 ): SuccessiveSearchDocument[] {
   if (!action.resultKeys?.length) return [];
   const requested = new Set(action.resultKeys);
-  return documents.filter((document) => requested.has(documentActionKey(document)) && promisedRole(action, document));
+  const source = action.sourceContext
+    ? documents.find((document) => documentActionKey(document) === action.sourceContext)
+    : undefined;
+  return documents.filter((document) => {
+    if (!requested.has(documentActionKey(document)) || !promisedRole(action, document)) return false;
+    if (action.relation !== "RELATED_TO_SOURCE") return true;
+    if (!source) return false;
+    const subject = action.subject ?? action.entity ?? action.topic ?? source.title;
+    if (isBroadNavigationPage(document, subject)) return false;
+    if (action.contextType === "INDIVIDUAL_PAGE_CONTEXT")
+      return action.sourcePageRole && TOPICAL_DISCOVERY_ROLES.has(source.role)
+        ? relatedActionEvidence(source, document, subject)
+        : Boolean(individualPageRelation(source, document)) || relatedActionEvidence(source, document, subject);
+    if (action.contextType === "CATEGORY_LISTING_CONTEXT")
+      return Boolean(navigationRelation(source, document)) && relatedActionEvidence(source, document, subject);
+    return relatedActionEvidence(source, document, subject) && !isBroadNavigationPage(document, subject);
+  });
 }
 
 function normalizeUrl(value: string): string {
@@ -79,14 +125,133 @@ function normalizeUrl(value: string): string {
 
 function relationIsStrong(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument): boolean {
   if (source.id === candidate.id && source.type === candidate.type) return false;
-  if (source.internalLinks.some((url) => normalizeUrl(url) === normalizeUrl(candidate.url)) ||
-      candidate.internalLinks.some((url) => normalizeUrl(url) === normalizeUrl(source.url))) return true;
   const relationship = source.relatedCapabilities.find((item) => item.documentId === candidate.id) ??
     candidate.relatedCapabilities.find((item) => item.documentId === source.id);
-  if (relationship && relationship.score >= 35 && relationship.evidence.some((value) =>
-    ["explicit-reference", "internal-link", "phrase", "taxonomy", "distinctive-concepts"].includes(value))) return true;
-  const sourceTerms = new Set(source.topicProfile.primaryTopics.filter((term) => term.length > 3));
-  return candidate.topicProfile.primaryTopics.filter((term) => sourceTerms.has(term)).length >= 2;
+  if (relationship && relationship.score >= 0.35 && relationship.evidence.some((value) =>
+    ["explicit-reference", "phrase"].includes(value))) return true;
+  return validatedDirectLinkRelation(source, candidate);
+}
+
+function validatedDirectLinkRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument): boolean {
+  const relationship = source.relatedCapabilities.find((item) => item.documentId === candidate.id) ??
+    candidate.relatedCapabilities.find((item) => item.documentId === source.id);
+  if (!relationship || relationship.score < 0.35 || !relationship.evidence.includes("internal-link"))
+    return false;
+  if (!TOPICAL_DISCOVERY_ROLES.has(source.role))
+    return false;
+  if (isBroadNavigationPage(candidate, source.title)) return false;
+  const pageCapabilityIdentity = normalizeSearchText(
+    `${candidate.title} ${candidate.slug.replace(/[-_]+/g, " ")} ${candidate.service_type ?? ""}`,
+  );
+  const eligibleDestination = TOPICAL_DISCOVERY_ROLES.has(candidate.role) ||
+    (candidate.role === "page" && candidate.contentQuality >= 30 &&
+      /\b(?:service|services|solution|solutions|consulting|development|engineering|technology|company)\b/.test(pageCapabilityIdentity));
+  if (!eligibleDestination) return false;
+  // A linked capability page may use a different name from the editorial
+  // source. Its authored direct link is the relationship evidence; generic
+  // pages still require their own identity and navigation checks above.
+  if (candidate.role === "page") return true;
+  const sourceTopics = new Set([
+    ...source.topicProfile.primaryTopics,
+    ...source.topicProfile.secondaryTopics,
+  ].filter((term) => term.length >= 4));
+  return [...candidate.topicProfile.primaryTopics, ...candidate.topicProfile.secondaryTopics]
+    .some((term) => term.length >= 4 && sourceTopics.has(term));
+}
+
+const SUBJECT_NOISE = new Set(["successive", "digital", "company", "service", "services", "capability", "capabilities", "development", "information", "related"]);
+
+function subjectTerms(value: string): string[] {
+  return [...new Set(normalizeSearchText(value).split(" ")
+    .filter((term) => term.length >= 2 && !SUBJECT_NOISE.has(term) &&
+      !["and", "for", "the", "with"].includes(term)))];
+}
+
+function containsTerm(evidence: string, term: string): boolean {
+  return new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(evidence);
+}
+
+function fieldCoherentlySupportsSubject(field: string, subject: string, terms: string[]): boolean {
+  const normalized = normalizeSearchText(field).slice(0, 500);
+  if (!normalized) return false;
+  const normalizedSubject = normalizeSearchText(subject);
+  if (normalized.includes(normalizedSubject)) return true;
+  if (terms.length === 1) return containsTerm(normalized, terms[0]!);
+  const tokens = normalized.split(" ");
+  const windowSize = Math.max(terms.length + 2, Math.ceil(terms.length * 1.5));
+  return tokens.some((_, start) => {
+    const window = new Set(tokens.slice(start, start + windowSize));
+    return terms.every((term) => window.has(term));
+  });
+}
+
+/**
+ * Page discovery is deliberately stricter than typed content discovery. A
+ * page must independently carry the distinguishing part of the active
+ * subject; generic company/product vocabulary and link proximity cannot make
+ * an otherwise broad page relevant.
+ */
+function directlySupportsPageSubject(candidate: SuccessiveSearchDocument, subject: string): boolean {
+  const terms = subjectTerms(subject);
+  if (!terms.length) return false;
+  // Evaluate bounded, page-owned fields independently. This prevents separate
+  // generic tokens from being assembled across unrelated headings/excerpts.
+  // Full textSegments are excluded because they can include menus and footers.
+  const identityFields = [candidate.title, ...candidate.headings.slice(0, 2)];
+  const localizedFields = [...identityFields, ...candidate.descriptions.slice(0, 2)];
+  if (terms.length === 1 && terms[0]!.length <= 3)
+    return identityFields.some((field) => fieldCoherentlySupportsSubject(field, subject, terms));
+  return localizedFields.some((field) => fieldCoherentlySupportsSubject(field, subject, terms));
+}
+
+function hasAuthoritativePageRelation(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument): boolean {
+  const relationship = source.relatedCapabilities.find((item) => item.documentId === candidate.id) ??
+    candidate.relatedCapabilities.find((item) => item.documentId === source.id);
+  if (relationship && relationship.score >= 0.35 && relationship.evidence.some((value) =>
+    ["explicit-reference", "taxonomy"].includes(value))) return true;
+  return validatedDirectLinkRelation(source, candidate);
+}
+
+function directlySupportsSubject(candidate: SuccessiveSearchDocument, subject: string): boolean {
+  const terms = normalizeSearchText(subject).split(" ")
+    .filter((term) => term.length >= 2 && !SUBJECT_NOISE.has(term));
+  if (!terms.length) return false;
+  const identity = normalizeSearchText(`${candidate.title} ${candidate.slug.replace(/[-_]+/g, " ")} ${candidate.aliases.join(" ")}`);
+  if (terms.length === 1) return containsTerm(identity, terms[0]!);
+  const phrase = terms.join(" ");
+  const localized = [candidate.title, candidate.slug.replace(/[-_]+/g, " "),
+    ...candidate.aliases, ...candidate.headings.slice(0, 2), ...candidate.descriptions.slice(0, 2)]
+    .map(normalizeSearchText);
+  return localized.some((field) => field.includes(phrase)) || terms.every((term) => containsTerm(identity, term));
+}
+
+function relatedActionEvidence(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument, subject: string): boolean {
+  const subjectEvidence = candidate.role === "page"
+    ? directlySupportsPageSubject(candidate, subject)
+    : directlySupportsSubject(candidate, subject);
+  // Generic pages are commonly linked from broad indexes, footers, or sitemaps.
+  // A structural link alone must not turn one into a subject-specific promise.
+  if (candidate.role === "page") return subjectEvidence || hasAuthoritativePageRelation(source, candidate);
+  return relationIsStrong(source, candidate) || subjectEvidence;
+}
+
+function isBroadNavigationPage(document: SuccessiveSearchDocument, subject: string): boolean {
+  if (document.role !== "page") return false;
+  const identity = normalizeSearchText(`${document.type} ${document.slug.replace(/[-_]+/g, " ")} ${document.title} ${document.sectionKey ?? ""}`);
+  if (/\b(?:site map|site index|page index|website directory|content directory|topic directory|navigation directory|archive index|all pages)\b/.test(identity) ||
+      /\b(?:sitemap|archive|directory|navigation index)\b/.test(normalizeSearchText(document.type))) return true;
+  const navigationHeavy = document.internalLinks.length >= 10 &&
+    document.internalLinks.length > Math.max(3, document.descriptions.length * 3);
+  const routingLanguage = normalizeSearchText(`${document.title} ${document.headings.slice(0, 2).join(" ")} ${document.descriptions.slice(0, 2).join(" ")}`);
+  return navigationHeavy && (/\b(?:browse|directory|index|navigation|all topics|all pages|explore topics)\b/.test(routingLanguage) ||
+    !directlySupportsPageSubject(document, subject));
+}
+
+export function noRelatedContentMessage(action: ExecutableSuggestionAction): string {
+  const role = action.targetContentType?.replace(/_/g, " ");
+  return role
+    ? `No clearly supported related ${role === "page" ? "pages" : role} were found for this topic in the available Successive content.`
+    : "No clearly supported related content was found for this topic in the available Successive content.";
 }
 
 function dynamicActionLabel(document: SuccessiveSearchDocument): string {
@@ -116,8 +281,8 @@ function groupedActionLabel(role: SuccessiveSearchDocument["role"]): string {
     .replace(/\brelated\s+related\b/i, "related").slice(0, 160);
 }
 
-function relationStrength(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument): number {
-  if (!relationIsStrong(source, candidate)) return 0;
+function relationStrength(source: SuccessiveSearchDocument, candidate: SuccessiveSearchDocument, subject?: string): number {
+  if (!relatedActionEvidence(source, candidate, subject || source.title)) return 0;
   let score = 0;
   if (source.internalLinks.some((url) => normalizeUrl(url) === normalizeUrl(candidate.url)) ||
       candidate.internalLinks.some((url) => normalizeUrl(url) === normalizeUrl(source.url))) score += 100;
@@ -143,7 +308,9 @@ export function buildGlobalRelatedContentActions({ source, corpus, userSubject, 
   const recent = new Set(recentActionIds);
   const groups = new Map<SuccessiveSearchDocument["role"], Array<{ document: SuccessiveSearchDocument; score: number }>>();
   for (const document of corpus) {
-    const score = relationStrength(source, document);
+    if (document.id === source.id && document.type === source.type) continue;
+    if (isBroadNavigationPage(document, userSubject ?? source.title)) continue;
+    const score = relationStrength(source, document, userSubject ?? source.title);
     if (!score) continue;
     const group = groups.get(document.role) ?? [];
     group.push({ document, score });
@@ -238,7 +405,7 @@ function isPersonPrimarySubject(userSubject: string | undefined, source: Success
 function candidateMentionsSubject(candidate: SuccessiveSearchDocument, userSubject: string): boolean {
   const tokens = normalizeSearchText(userSubject).split(" ").filter((token) => token.length > 1);
   if (tokens.length < 2) return false;
-  const haystack = normalizeSearchText(`${candidate.title} ${candidate.headings.join(" ")} ${candidate.combinedText}`);
+  const haystack = normalizeSearchText(`${candidate.title} ${candidate.headings.slice(0, 4).join(" ")} ${candidate.descriptions.slice(0, 3).join(" ")} ${candidate.structuredFields.slice(0, 12).map(({ label, value }) => `${label} ${value}`).join(" ")}`);
   return tokens.every((token) => haystack.includes(token));
 }
 
@@ -289,6 +456,50 @@ const INDIVIDUAL_RELATION_PRIORITY: Record<NonNullable<SuggestionAction["relatio
   PARENT: 8, CHILD: 7, SIBLING: 6, DIRECTLY_CONNECTED: 5, SAME_SECTION: 4, SAME_PAGE_GROUP: 3,
 };
 
+export interface LeadershipSuggestionContext {
+  relation: "leadership" | "executives" | "board";
+  requestedRole?: PersonRoleConcept;
+  resolvedPerson?: string;
+  publishedRole?: string;
+  teamRelation?: string;
+}
+
+const GENERIC_PERSON_ROLE_TERMS = new Set([
+  "senior", "junior", "manager", "management", "head", "lead", "leader", "leadership",
+  "chief", "officer", "executive", "director", "president", "vice", "associate", "principal",
+  "global", "group", "business", "unit", "team", "department", "division", "and", "the", "of",
+]);
+
+function publishedRoleDomainTerms(role: string): string[] {
+  return [...new Set(normalizeSearchText(role).split(" ").filter((term) =>
+    term.length >= 3 && !GENERIC_PERSON_ROLE_TERMS.has(term)))];
+}
+
+function locallySupportsLeadershipContext(
+  candidate: SuccessiveSearchDocument,
+  context: LeadershipSuggestionContext,
+): boolean {
+  if (isBroadNavigationPage(candidate, context.resolvedPerson ?? context.requestedRole ?? context.relation)) return false;
+  const localEvidence = normalizeSearchText([
+    candidate.title,
+    ...candidate.headings.slice(0, 4),
+    ...candidate.descriptions.slice(0, 3),
+    ...candidate.structuredFields.slice(0, 12).map(({ label, value }) => `${label} ${value}`),
+  ].join(" "));
+  const person = normalizeSearchText(context.resolvedPerson ?? "");
+  if (person && localEvidence.includes(person)) return true;
+  if (context.requestedRole && designationHasRole(localEvidence, context.requestedRole)) return true;
+  const normalizedRole = normalizeSearchText(context.publishedRole ?? "");
+  if (normalizedRole && localEvidence.includes(normalizedRole)) return true;
+  const domainTerms = publishedRoleDomainTerms(context.publishedRole ?? "");
+  if (domainTerms.length && domainTerms.every((term) => containsTerm(localEvidence, term))) return true;
+  const teamRelation = normalizeSearchText(context.teamRelation ?? "");
+  if (teamRelation && localEvidence.includes(teamRelation)) return true;
+  if (context.relation === "board") return /\b(?:board of directors|board member|board appointment|appointed to (?:the )?board)\b/.test(localEvidence);
+  if (context.relation === "executives") return /\b(?:executive management|management team|executive team)\b/.test(localEvidence);
+  return /\b(?:leadership|leadership team|executive management)\b/.test(localEvidence);
+}
+
 function individualRelationStrength(
   source: SuccessiveSearchDocument,
   target: SuccessiveSearchDocument,
@@ -309,22 +520,26 @@ function individualRelationStrength(
 /** Structural navigation for a resolved individual page; semantic similarity
  * alone is deliberately insufficient and cross-category topic feeds are excluded.
  * Broad COMPANY_INFORMATION membership is not enough to render a suggestion. */
-export function buildIndividualPageNavigationActions({ source, corpus, userSubject, excludedResultKeys = [], limit = 3 }: {
+export function buildIndividualPageNavigationActions({ source, corpus, userSubject, leadershipContext, excludedResultKeys = [], limit = 3 }: {
   source: SuccessiveSearchDocument;
   corpus: SuccessiveSearchDocument[];
   userSubject?: string;
+  leadershipContext?: LeadershipSuggestionContext;
   excludedResultKeys?: string[];
   limit?: number;
 }): SuggestionAction[] {
   const excluded = new Set([documentActionKey(source), ...excludedResultKeys]);
-  const personSubject = isPersonPrimarySubject(userSubject, source);
+  const personSubject = !leadershipContext && isPersonPrimarySubject(userSubject, source);
   const MIN_RELATION_SCORE = 50;
   return corpus.flatMap((target): Array<{ target: SuccessiveSearchDocument; relationType: NonNullable<SuggestionAction["relationType"]>; score: number }> => {
     if (excluded.has(documentActionKey(target))) return [];
+    if (leadershipContext && !locallySupportsLeadershipContext(target, leadershipContext)) return [];
     const mentionsSubject = Boolean(userSubject && candidateMentionsSubject(target, userSubject));
     const relationType = individualPageRelation(source, target) ??
       (personSubject && mentionsSubject ? "DIRECTLY_CONNECTED" : undefined);
     if (!relationType) return [];
+    if (!leadershipContext && !personSubject && TOPICAL_DISCOVERY_ROLES.has(source.role) &&
+        !relatedActionEvidence(source, target, userSubject ?? source.title)) return [];
     const targetGroup = pageSemanticGroup(target);
     if (personSubject && !mentionsSubject && (!PERSON_NAVIGATION_GROUPS.has(targetGroup) ||
         target.role === "contact" || target.role === "location")) return [];
@@ -432,7 +647,7 @@ export function buildEvidenceBackedSuggestionActions({ source, acceptedRelated, 
     const id = `content-${normalizeSearchText(resultKey).replace(/\s+/g, "-")}`.slice(0, 80);
     if (recent.has(id)) return [];
     const action: SuggestionAction = exactDocumentAction(document, source, "RELATED_TO_SOURCE");
-    return resolveEligibleActionDocuments(action, acceptedRelated).length ? [action] : [];
+    return resolveEligibleActionDocuments(action, [source, ...acceptedRelated]).length ? [action] : [];
   });
   const seen = new Set<string>();
   return actions.filter((action) => { const identity = [...(action.resultKeys ?? [])].sort().join("|");

@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { buildSearchDocument, buildSearchIndex } from "./search-index";
+import { buildSearchDocument, buildSearchIndex, normalizeServiceSchemaType } from "./search-index";
 import { detectIntent } from "./intent-detector";
 import {
   cardEligibility,
+  extractExplicitInformationalSubject,
+  semanticInformationalSubject,
   isBroadAiServicesQuery,
+  isExplicitRequestedRoleRelation,
+  isRequestedContentTypeCompatible,
+  matchExactIndexedTitle,
+  matchValidatedRequestedRole,
+  rankEmbeddedEntityEvidence,
   rankSearchDocument,
+  selectSiblingEntityMatches,
 } from "./search-retriever";
 import {
   applyStructuralBroadQueryRules,
@@ -12,6 +20,7 @@ import {
   buildRetrievalQuery,
   queryUnderstandingSchema,
   isDeterministicallyOffTopic,
+  shouldUseOffTopicFallback,
   isExplicitListRequest,
   classifyFollowUpScope,
   resolveConversationUnderstanding,
@@ -31,7 +40,506 @@ const document = (title: string, slug: string, body: string, headings: string[] 
     acf: { sections: headings.map((heading) => ({ heading })) },
   });
 
+describe("capability wrapper normalization", () => {
+  it("preserves the underlying capability subject without wrapper contamination", () => {
+    const understanding = buildDeterministicUnderstanding("Do you support mobile development as well?");
+    expect(understanding.topics).toEqual(["mobile", "development"]);
+    expect(understanding.requestedContentType).toBe("service");
+    expect(buildRetrievalQuery(understanding)).not.toMatch(/support|well/);
+  });
+});
+
+describe("standalone and follow-up canonical subject consistency", () => {
+  const canonical = document(
+    "Workflow Orchestration Services and Solutions",
+    "workflow-orchestration-services",
+    "Workflow orchestration coordinates business operations.",
+  );
+
+  it.each([
+    "Tell me about Workflow Orchestration",
+    "What about Workflow Orchestration?",
+    "Explain Workflow Orchestration",
+    "Workflow Orchestration",
+    "Can you tell me about Workflow Orchestration?",
+  ])("resolves the same canonical entity through informational wrapper: %s", (query) => {
+    expect(matchExactIndexedTitle([canonical], query)?.document.id).toBe(canonical.id);
+  });
+
+  it("preserves the complete multi-word subject while removing only the wrapper", () => {
+    expect(extractExplicitInformationalSubject(
+      "Could you tell me about Workflow Orchestration?",
+    )).toBe("workflow orchestration");
+  });
+
+  it("does not require prior conversation state for a standalone subject", () => {
+    const standalone = matchExactIndexedTitle([canonical], "Workflow Orchestration");
+    expect(standalone).toMatchObject({ document: { id: canonical.id }, confidence: "high" });
+  });
+
+  it("keeps an explicit new subject when unrelated history exists", () => {
+    const current = buildDeterministicUnderstanding("What about Workflow Orchestration?");
+    const resolved = resolveConversationUnderstanding(current, [
+      { role: "user", content: "Tell me about retail commerce" },
+      { role: "assistant", content: "Published retail information." },
+    ]).understanding;
+    expect(resolved.topics).toEqual(["workflow", "orchestration"]);
+    expect(classifyFollowUpScope(current, current.normalizedQuery)).toBe("SWITCH_TOPIC");
+  });
+
+  it("does not manufacture a canonical match for genuine no-content wording", () => {
+    expect(matchExactIndexedTitle([canonical], "Tell me about an unpublished orbital ledger"))
+      .toBeUndefined();
+  });
+
+  it("preserves exact entity and exact capability controls", () => {
+    const entity = document("Atlas Platform", "atlas-platform", "Atlas is a published platform.");
+    expect(matchExactIndexedTitle([entity, canonical], "Atlas Platform")?.document.id).toBe(entity.id);
+    expect(matchExactIndexedTitle([entity, canonical], "Workflow Orchestration")?.document.id).toBe(canonical.id);
+  });
+
+  it("keeps a canonically locked sub-service compatible through final alignment", () => {
+    const subService = document("Workflow Orchestration Services", "workflow-orchestration-services", "Published capability.");
+    subService.role = "service";
+    subService.service_type = "Sub-service";
+    expect(isRequestedContentTypeCompatible(subService, "sub-service")).toBe(true);
+  });
+});
+
+describe("shared service-family source-schema normalization", () => {
+  const typedDocument = (serviceType: string) => buildSearchDocument({
+    id: Math.floor(Math.random() * 1_000_000), type: "page", slug: "published-capability",
+    link: "https://successive.tech/published-capability/",
+    title: { rendered: "Published Capability" },
+    content: { rendered: "<p>A grounded published capability.</p>" },
+    acf: { service_type: serviceType },
+  });
+
+  it.each([
+    ["Service", "service"],
+    ["Sub-service", "sub-service"],
+    ["sub_service", "sub-service"],
+    ["Expertise", "expertise"],
+    ["Piller", "pillar"],
+  ] as const)("normalizes source-schema alias %s to %s", (raw, expected) => {
+    expect(normalizeServiceSchemaType(raw)).toBe(expected);
+    expect(isRequestedContentTypeCompatible(typedDocument(raw), "service")).toBe(true);
+  });
+
+  it("keeps an explicit sub-service taxonomy request strict", () => {
+    expect(isRequestedContentTypeCompatible(typedDocument("Sub-service"), "sub-service")).toBe(true);
+    expect(isRequestedContentTypeCompatible(typedDocument("Expertise"), "sub-service")).toBe(false);
+  });
+
+  it.each([
+    ["post", "blog"],
+    ["case-study", "case_study"],
+  ] as const)("rejects a %s candidate as explicit service evidence", (type, role) => {
+    const candidate = document("Published Story", "published-story", "A published story.");
+    candidate.type = type;
+    candidate.role = role;
+    expect(isRequestedContentTypeCompatible(candidate, "service")).toBe(false);
+  });
+
+  it("rejects a general navigation page as service evidence", () => {
+    const navigation = document("Site Navigation", "site-navigation", "Browse pages and links.");
+    navigation.role = "page";
+    expect(isRequestedContentTypeCompatible(navigation, "service")).toBe(false);
+  });
+});
+
+describe("multi-part query coverage", () => {
+  it("represents a dependent related-content clause without instruction residue", () => {
+    const facets = extractQueryFacets("Tell me about your cloud services and give me an example of a related case study.");
+    expect(facets.map(({ subject, requestedContentType, dependent }) =>
+      ({ subject, requestedContentType, dependent }))).toEqual([
+      { subject: "cloud services", requestedContentType: "service", dependent: false },
+      { subject: "cloud services", requestedContentType: "case-study", dependent: true },
+    ]);
+    expect(facets.flatMap(({ understanding }) => understanding.topics).join(" ")).not.toMatch(/example|give/);
+  });
+
+  it.each([
+    ["Tell me about Atlas Engineering and show me related services.", true],
+    ["Tell me about Atlas Engineering and give me a related case study.", true],
+    ["Tell me about Widget Runtime and show me related articles.", true],
+    ["Tell me about Workflow Automation. Give me an example.", true],
+    ["Tell me about Atlas Engineering and then tell me about Orion Modernization.", false],
+    ["Tell me about Atlas Engineering and show me Orion services.", false],
+  ])("distinguishes dependent relation clauses from explicit subjects: %s", (query, secondDependent) => {
+    const facets = extractQueryFacets(query);
+    expect(facets).toHaveLength(2);
+    expect(facets[1]?.dependent).toBe(secondDependent);
+    if (secondDependent) expect(facets[1]?.subject).toBe(facets[0]?.subject);
+    else expect(facets[1]?.subject).not.toBe(facets[0]?.subject);
+  });
+  it("keeps independently answerable clauses separate", () => {
+    const facets = extractQueryFacets("Whos the founder and how long company is in business?");
+    expect(facets.map(({ text }) => text)).toEqual([
+      "Whos the founder",
+      "how long company is in business",
+    ]);
+  });
+  it("separates a capability request from a requested evidence type", () => {
+    expect(extractQueryFacets("Show automation capabilities and a relevant case study"))
+      .toHaveLength(2);
+  });
+  it.each([
+    ["Who is the CEO and tell me about the company?", ["Who is the CEO", "tell me about the company"]],
+    ["Who is the founder and what does Successive Digital do?", ["Who is the founder", "what does Successive Digital do"]],
+    ["Who are the Board of Directors and what does the company do?", ["Who are the Board of Directors", "what does the company do"]],
+    ["Show me the Executive Management team and tell me about Successive Digital.", ["Show me the Executive Management team", "tell me about Successive Digital."]],
+    ["What is React and what does it cost to create a React project?", ["What is React", "what does it cost to create a React project"]],
+    ["Tell me about Cloud Migration and how much would implementation cost?", ["Tell me about Cloud Migration", "how much would implementation cost"]],
+    ["What AI services do you provide and how can I discuss a project?", ["What AI services do you provide", "how can I discuss a project"]],
+    ["What industries does Successive work with and what services do you provide for healthcare?", ["What industries does Successive work with", "what services do you provide for healthcare"]],
+    ["Who is the Founder and what AI services does Successive provide?", ["Who is the Founder", "what AI services does Successive provide"]],
+    ["Tell me about React development. How much would that service cost?", ["Tell me about React development", "How much would that service cost"]],
+    ["Tell me about Data Engineering. What about Application Modernization? How can I discuss that project?", ["Tell me about Data Engineering", "What about Application Modernization", "How can I discuss that project"]],
+    ["Tell me about your cloud services and give me an example of a related case study.", ["Tell me about your cloud services", "give me an example of a related case study."]],
+    ["Tell me about Data Engineering and show me related services. Then tell me how I can discuss that project with Successive.", ["Tell me about Data Engineering", "show me related services", "Then tell me how I can discuss that project with Successive."]],
+  ])("preserves independently answerable intent clauses: %s", (query, expected) => {
+    expect(extractQueryFacets(query).map(({ text }) => text)).toEqual(expected);
+  });
+});
+
 describe("generic query understanding", () => {
+  it("keeps the required published blog title intact inside the used-for grammar", () => {
+    const exact = buildSearchDocument({
+      id: 12675, type: "post", slug: "evolving-technologies-making-way-to-deal-with-coronavirus-pandemic",
+      link: "https://successive.tech/blog/evolving-technologies-making-way-to-deal-with-coronavirus-pandemic/",
+      title: { rendered: "Evolving Technologies Making Way to Deal With Coronavirus Pandemic" },
+      content: { rendered: "<p>Published first-party article evidence.</p>" },
+    });
+    const broadCatalogue = document("Global Capabilities", "global-capabilities", "Published technology catalogue.");
+    const query = "What is Evolving Technologies Making Way to Deal With Coronavirus Pandemic used for?";
+    expect(extractExplicitInformationalSubject(query)).toBe(exact.normalizedTitle);
+    expect(matchExactIndexedTitle([broadCatalogue, exact], query)?.document.id).toBe(exact.id);
+  });
+
+  it.each([
+    ["Understanding the Investment: The Cost to Develop a Robust Real Estate App", "post", "What is {title} used for?"],
+    ["Cloud Cost Analysis: A Comprehensive Guide", "post", "Tell me about {title}."],
+    ["Modern Application Development Services and Implementation", "page", "How does {title} work?"],
+    ["Enterprise Delivery Team Earns a Technology Award", "award", "What does {title} do?"],
+    ["Retail Platform Transformation for Faster Fulfilment", "case_study", "Summarize {title}"],
+  ] as const)("locks an indexed title before intent words are interpreted: %s", (title, type, wrapper) => {
+    const exact = buildSearchDocument({
+      id: Math.floor(Math.random() * 1_000_000), type,
+      slug: title.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+      link: `https://successive.tech/${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}/`,
+      title: { rendered: title },
+      content: { rendered: `<p>${title} has exact first-party descriptive evidence.</p>` },
+    });
+    const unrelated = document("Generic Development Services", "generic-development", "Generic commercial development services.");
+    const match = matchExactIndexedTitle([unrelated, exact], wrapper.replace("{title}", title));
+    expect(match?.document.id).toBe(exact.id);
+    expect(match?.matchedFields).toContain("exact-title-lock");
+  });
+
+  it("preserves one punctuated canonical title across equivalent direct wrappers", () => {
+    const title = "How Much Does Atlas Cost? [A 2026 Guide]: Plan (Carefully)";
+    const exact = document(title, "atlas-cost-guide", `${title} has published evidence.`);
+    for (const query of [
+      `Tell me about ${title}.`, `What does ${title} do?`,
+      `How does ${title} work?`, `What is ${title} used for?`, `What is ${title}?`,
+    ]) expect(matchExactIndexedTitle([exact], query)?.document.id).toBe(exact.id);
+  });
+
+  it("locks a canonical title after an explicit topic-switch wrapper", () => {
+    const exact = document("Payment Gateway Integration: A Complete Guide", "payment-gateway-guide", "Published evidence.");
+    expect(matchExactIndexedTitle(
+      [exact],
+      `Switch topics: tell me about ${exact.title}.`,
+    )?.document.id).toBe(exact.id);
+  });
+
+  it("locks a corpus-owned title through one bounded typo without weakening identity", () => {
+    const exact = document("Status Codes in API Testing", "status-codes-api-testing", "Published evidence.");
+    expect(matchExactIndexedTitle([exact], "pls tell abt Staus Codes in API Testing?")?.document.id)
+      .toBe(exact.id);
+  });
+
+  it("abstains from ambiguous corpus typo correction", () => {
+    const first = document("Cloud Store Guide", "cloud-store-guide", "Published evidence.");
+    const second = document("Cloud Score Guide", "cloud-score-guide", "Published evidence.");
+    expect(matchExactIndexedTitle([first, second], "Tell me about Cloud Sore Guide."))
+      .toBeUndefined();
+  });
+
+  it("does not lock weak partial title similarity", () => {
+    const exact = document("Enterprise Cloud Implementation Cost Guide", "cloud-cost-guide", "Published evidence.");
+    expect(matchExactIndexedTitle([exact], "Tell me about cloud implementation."))
+      .toBeUndefined();
+  });
+
+  it("locks published titles containing safeguard-like role and roadmap words", () => {
+    const roleArticle = document("The Role of Observability in Reliable Delivery", "role-observability", "Published article.");
+    const roadmapArticle = document("Enterprise Platform Guide: From Roadmap to Growth", "platform-roadmap", "Published roadmap article.");
+    expect(matchExactIndexedTitle([roleArticle], `What is ${roleArticle.title} used for?`)?.document.id)
+      .toBe(roleArticle.id);
+    expect(matchExactIndexedTitle([roadmapArticle], `Tell me about ${roadmapArticle.title}.`)?.document.id)
+      .toBe(roadmapArticle.id);
+    expect(matchExactIndexedTitle([roleArticle], "Show current engineering roles."))
+      .toBeUndefined();
+  });
+
+  it("keeps an authoritative exact title even when its vocabulary looks off-topic", () => {
+    const exact = document(
+      "Business Lessons from a Championship Match", "business-lessons-championship-match",
+      "First-party editorial evidence connects teamwork and strategy to business.",
+    );
+    const query = `Tell me about ${exact.title}.`;
+    const lock = matchExactIndexedTitle([exact], query);
+    const semanticOffTopic = { ...buildDeterministicUnderstanding(query), intent: "off_topic" as const, isOffTopic: true };
+    expect(lock?.document.id).toBe(exact.id);
+    expect(shouldUseOffTopicFallback(query, semanticOffTopic, Boolean(lock))).toBe(false);
+    expect(shouldUseOffTopicFallback(query, semanticOffTopic, false)).toBe(true);
+  });
+
+  it("retains explicit short article topics for evidence-constrained retrieval", () => {
+    expect(buildDeterministicUnderstanding("Show articles about teamwork.")).toMatchObject({
+      requestedContentType: "blog", topics: ["teamwork"],
+    });
+    expect(buildDeterministicUnderstanding("Show articles about confidential.")).toMatchObject({
+      requestedContentType: "blog", topics: ["confidential"],
+    });
+  });
+
+  it("preserves outgoing structured links as role edges in a full corpus", () => {
+    const base = {
+      id: 1, type: "post", slug: "operating-model-guide",
+      link: "https://successive.tech/blog/operating-model-guide/",
+      title: { rendered: "Operating Model Guide" }, content: { rendered: "<p>A published guide.</p>" },
+      acf: { related_items: [{ url: "https://successive.tech/cloud-delivery/" }, { url: "https://successive.tech/platform-delivery/" }, { url: "https://successive.tech/industries/energy/" }] },
+    };
+    const service = {
+      id: 2, type: "page", slug: "cloud-delivery", link: "https://successive.tech/cloud-delivery/",
+      title: { rendered: "Cloud Delivery Services" }, content: { rendered: "<p>Cloud delivery services.</p>" },
+      acf: { service_type: "Service" },
+    };
+    const industry = {
+      id: 3, type: "industries", slug: "energy", link: "https://successive.tech/industries/energy/",
+      title: { rendered: "Energy" }, content: { rendered: "<p>Energy industry.</p>" }, acf: {},
+    };
+    const secondService = {
+      id: 4, type: "page", slug: "platform-delivery", link: "https://successive.tech/platform-delivery/",
+      title: { rendered: "Platform Delivery Services" }, content: { rendered: "<p>Platform delivery services.</p>" },
+      acf: { service_type: "Service" },
+    };
+    const semanticAlternative = {
+      id: 5, type: "page", slug: "operating-model-consulting", link: "https://successive.tech/operating-model-consulting/",
+      title: { rendered: "Operating Model Consulting Services" }, content: { rendered: "<p>Operating model guide consulting services.</p>" },
+      acf: { service_type: "Service" },
+    };
+    const filler = Array.from({ length: 246 }, (_, index) => ({
+      id: index + 10, type: "page", slug: `unrelated-${index}`,
+      link: `https://successive.tech/unrelated-${index}/`, title: { rendered: `Unrelated Page ${index}` },
+      content: { rendered: "<p>Generic unrelated content.</p>" }, acf: {},
+    }));
+    const index = buildSearchIndex([base, service, industry, secondService, semanticAlternative, ...filler]);
+    expect(matchValidatedRequestedRole(index, "Show services related to Operating Model Guide.", "service").map(x => x.document.id).sort())
+      .toEqual([service.id, secondService.id].sort());
+    expect(matchValidatedRequestedRole(index, "Show industries related to Operating Model Guide.", "industry")[0]?.document.id)
+      .toBe(industry.id);
+  });
+
+  it("does not turn a role-relationship request into an exact-title lookup", () => {
+    const article = document("A Guide to Emerging Operations", "emerging-operations", "Published article.");
+    expect(matchExactIndexedTitle(
+      [article],
+      "Show case studies related to A Guide to Emerging Operations.",
+    )).toBeUndefined();
+  });
+
+  it("recognizes an explicit role relation even when its long subject contains a pronoun", () => {
+    expect(isExplicitRequestedRoleRelation(
+      "Show services related to What is Customer Experience in Business and Why It Matters in the Digital Era.",
+    )).toBe(true);
+    expect(isExplicitRequestedRoleRelation("What does it do?")).toBe(false);
+  });
+
+  it("selects only role-compatible exact or explicitly related records", () => {
+    const service = { ...document("Nova Operations Services", "nova-operations-services", "Nova delivery offering."), role: "service" as const };
+    const article = document("Nova Operations Guide", "nova-operations-guide", "An editorial guide.");
+    const caseStudy = { ...document("Nova Customer Outcome", "nova-customer-outcome", "Customer outcome."), role: "case_study" as const, type: "case_study" };
+    const linkedArticle = { ...article, relatedCapabilities: [{
+      documentId: caseStudy.id, score: 0.9, evidence: ["internal-link" as const],
+    }] };
+    expect(matchValidatedRequestedRole(
+      [service, linkedArticle, caseStudy],
+      "Show services related to Nova Operations Services.",
+      "service",
+    )).toEqual([]);
+    expect(matchValidatedRequestedRole(
+      [service, linkedArticle, caseStudy],
+      "Show case studies related to Nova Operations Guide.",
+      "case-study",
+    )[0]?.document.id).toBe(caseStudy.id);
+    expect(matchValidatedRequestedRole(
+      [service, article, caseStudy],
+      "Show case studies related to Nova Operations Guide.",
+      "case-study",
+    )).toEqual([]);
+  });
+
+  it.each([
+    ["Atlas Flow", "product", "Atlas Flow is an AI platform that automates governed delivery."],
+    ["Nova Migration", "service", "Nova Migration is a service that helps teams modernize applications."],
+    ["Orbit Studio", "technology", "Orbit Studio is a technology offering for building digital experiences."],
+    ["Summit Alliance", "partner", "Summit Alliance is a partner program for joint cloud delivery."],
+    ["Rapid Mapper", "accelerator", "Rapid Mapper is an accelerator that automates geospatial analysis."],
+    ["Care Pathway", "industry", "Care Pathway is a healthcare solution designed for patient workflows."],
+  ] as const)("uses embedded first-party descriptions for unseen %s entities", (entity, requestedType, description) => {
+    const authoritative = document("Capabilities", "capabilities", description, [entity]);
+    const parent = buildSearchDocument({
+      id: Math.floor(Math.random() * 1_000_000), type: "press-release", slug: "parent-announcement",
+      link: "https://successive.tech/parent-announcement/", title: { rendered: `${entity.split(" ")[0]} announcement` },
+      content: { rendered: `<p>${entity.split(" ")[0]} is part of a broader company initiative.</p>` },
+    });
+    const understanding = {
+      ...buildDeterministicUnderstanding(`What is ${entity}?`),
+      requestedContentType: requestedType,
+      topics: entity.toLowerCase().split(" "),
+    } as ReturnType<typeof buildDeterministicUnderstanding>;
+    const matches = rankEmbeddedEntityEvidence(
+      [parent, authoritative], `What is ${entity}?`, understanding, new Set(),
+    );
+    expect(matches[0]?.document.title).toBe("Capabilities");
+    expect(matches[0]?.matchedFields).toContain("exact-embedded-entity");
+    expect(matches[0]?.selectedPassages.join(" ")).toContain(entity);
+    expect(matches.some((match) => match.document.id === parent.id)).toBe(false);
+  });
+
+  it("keeps exact embedded entity representation ahead of exact mention-only press content", () => {
+    const direct = document(
+      "Delivery Capabilities", "delivery-capabilities",
+      "Nimbus Build is an AI-native platform that helps teams plan, test, and launch software.",
+      ["Nimbus Build"],
+    );
+    const press = buildSearchDocument({
+      id: 991, type: "press-release", slug: "nimbus-company-launch", link: "https://successive.tech/nimbus-company-launch/",
+      title: { rendered: "Nimbus company launch" }, content: { rendered: "Nimbus Build is mentioned in the company announcement." },
+    });
+    const understanding = {
+      ...buildDeterministicUnderstanding("What is Nimbus Build?"),
+      requestedContentType: "product" as const,
+      topics: ["nimbus", "build"],
+    };
+    const matches = rankEmbeddedEntityEvidence([press, direct], "What is Nimbus Build?", understanding, new Set());
+    expect(matches.map((match) => match.document.title)).toEqual(["Delivery Capabilities"]);
+  });
+
+  it("uses authoritative embedded evidence for an explanatory direct lookup", () => {
+    const authoritative = document(
+      "Security Capabilities", "security-capabilities",
+      "Adaptive Defense is a security solution that detects and contains threats.",
+      ["Adaptive Defense"],
+    );
+    const query = "Tell me about Adaptive Defense.";
+    const matches = rankEmbeddedEntityEvidence(
+      [authoritative], query, buildDeterministicUnderstanding(query), new Set(),
+    );
+    expect(matches[0]?.matchedFields).toContain("exact-embedded-entity");
+  });
+
+  it("does not promote article-prefixed short body mentions to embedded identity", () => {
+    const incidental = document(
+      "Student Experience Modernization", "student-experience-modernization",
+      "API access is provided through an API gateway, API-first workflows, and API-led integrations.",
+    );
+    const dedicated = document(
+      "API Testing Guide", "api-testing-guide",
+      "An API is an application programming interface used by software systems to communicate.",
+    );
+    const query = "What is an API?";
+    const matches = rankEmbeddedEntityEvidence(
+      [incidental, dedicated], query, buildDeterministicUnderstanding(query), new Set(),
+    );
+    expect(extractExplicitInformationalSubject(query)).toBe("an api");
+    expect(semanticInformationalSubject("an api")).toBe("api");
+    expect(matches.map(({ document }) => document.title)).toEqual(["API Testing Guide"]);
+    expect(matches[0]?.matchedFields).toContain("embedded-direct-subject-authority");
+  });
+
+  it("uses one role-aware sibling source for list and single-other product resolution", () => {
+    const makeMatch = (
+      title: string,
+      type: string,
+      role: ReturnType<typeof document>["role"],
+      score: number,
+      matchedFields = ["content-token-overlap"],
+    ) => {
+      const built = buildSearchDocument({
+        id: Math.floor(Math.random() * 1_000_000), type, slug: title.toLowerCase().replace(/\W+/g, "-"),
+        link: `https://successive.tech/${title.toLowerCase().replace(/\W+/g, "-")}/`,
+        title: { rendered: title }, content: { rendered: `<p>${title} is an enterprise product platform.</p>` },
+      });
+      return {
+        document: { ...built, role, productLike: role === "product" || type === "media-coverage" },
+        score, matchedFields, selectedPassages: [`${title} is an enterprise product platform.`], confidence: "high" as const,
+      };
+    };
+    const current = makeMatch("Atlas Build", "page", "product", 240);
+    const directSibling = makeMatch("Atlas Voice", "page", "product", 180);
+    const embeddedSibling = makeMatch("Platform Capabilities", "page", "page", 210, ["exact-embedded-entity"]);
+    const mediaMention = makeMatch("Atlas Voice Wins an Award", "media-coverage", "media", 320);
+    const understanding = {
+      ...buildDeterministicUnderstanding("What other Atlas products are there?"),
+      requestedContentType: "product" as const,
+      topics: ["atlas"],
+    };
+    const args = {
+      candidates: [mediaMention, current, embeddedSibling, directSibling], understanding,
+      previouslyPresented: `${current.document.title} ${current.document.url}`,
+    };
+    const list = selectSiblingEntityMatches({ ...args, limit: 8 });
+    const single = selectSiblingEntityMatches({ ...args, limit: 1 });
+    expect(list.map(({ document }) => document.title)).toEqual([
+      "Atlas Voice", "Platform Capabilities", "Atlas Voice Wins an Award",
+    ]);
+    expect(single[0]?.document.id).toBe(list[0]?.document.id);
+    expect(list.some(({ document }) => document.id === current.document.id)).toBe(false);
+  });
+
+  it("keeps both sides of a contextual comparison", () => {
+    const resolved = resolveConversationUnderstanding(
+      buildDeterministicUnderstanding("Is it better than native development?"),
+      [{ role: "user", content: "What is Flutter?" }],
+    ).understanding;
+    expect(resolved.topics).toEqual(expect.arrayContaining(["flutter", "native", "development"]));
+  });
+
+  it("distinguishes replacement corrections from additive refinements", () => {
+    const replaced = resolveConversationUnderstanding(buildDeterministicUnderstanding("I mean cloud security, actually."), [
+      { role: "user", content: "What is cloud computing?" },
+    ]).understanding;
+    expect(replaced.topics).toContain("security");
+    expect(replaced.topics).not.toContain("computing");
+    const additive = resolveConversationUnderstanding(buildDeterministicUnderstanding("Do you mean data engineering too?"), [
+      { role: "user", content: "Do you do data science?" },
+    ]).understanding;
+    expect(additive.topics).toEqual(expect.arrayContaining(["data", "science", "engineering"]));
+  });
+
+  it("treats Kagen as a product-family subject and broad industry wording as a portfolio", () => {
+    expect(buildDeterministicUnderstanding("Tell me about Kagen").requestedContentType).toBe("kagen-product");
+    expect(applyStructuralBroadQueryRules(buildDeterministicUnderstanding("What industries do you serve?"), "What industries do you serve?"))
+      .toMatchObject({ requestedContentType: "industry", targetScope: "portfolio", topics: [] });
+    expect(applyStructuralBroadQueryRules(buildDeterministicUnderstanding("Which sectors do you work in?"), "Which sectors do you work in?"))
+      .toMatchObject({ requestedContentType: "industry", targetScope: "portfolio", topics: [] });
+  });
+
+  it("derives product identity from structured product/platform metadata", () => {
+    const product = buildSearchDocument({
+      id: 88, type: "page", slug: "home", link: "https://successive.tech/",
+      title: { rendered: "Home" }, acf: {
+        hero_description: "Kagen ADD, our AI-native platform, helps enterprises plan, build, test, and launch.",
+      },
+    });
+    expect(product.productLike).toBe(false);
+    expect(product.combinedText).toMatch(/Kagen ADD/i);
+  });
   it("drops stale topics for broad collections and preserves only dependent refinements", () => {
     const resolve = (previous: string, current: string) =>
       resolveConversationUnderstanding(buildDeterministicUnderstanding(current), [
@@ -117,6 +625,8 @@ describe("generic query understanding", () => {
     expect(isExplicitListRequest("Which technologies are available?")).toBe(true);
     expect(isExplicitListRequest("Tell me about retail services")).toBe(false);
     expect(isExplicitListRequest("Explore Successive industries")).toBe(true);
+    expect(isExplicitListRequest("What products are available?")).toBe(true);
+    expect(isExplicitListRequest("Show available accelerators.")).toBe(true);
     expect(applyStructuralBroadQueryRules(
       buildDeterministicUnderstanding("Explore Successive industries"),
       "Explore Successive industries",

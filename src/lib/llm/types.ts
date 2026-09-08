@@ -2,6 +2,7 @@ import type { HistoryMessage } from "@/types/chat";
 import type { NormalizedContent } from "@/types/wordpress";
 import type { AssistantResponse } from "./schemas";
 import type { QueryUnderstanding } from "../query-understanding";
+import type { CommercialIntent } from "../commercial-intent";
 export interface LLMInput {
   message: string;
   responseLanguage: string;
@@ -24,4 +25,11 @@ export interface LLMProvider {
     history: HistoryMessage[],
   ): Promise<QueryUnderstanding>;
   generateStructuredResponse(input: LLMInput): Promise<AssistantResponse>;
+  generateCommercialResponse(input: {
+    message: string;
+    subject: string | null;
+    intents: CommercialIntent[];
+    history: HistoryMessage[];
+    evidence: NormalizedContent[];
+  }): Promise<string>;
 }

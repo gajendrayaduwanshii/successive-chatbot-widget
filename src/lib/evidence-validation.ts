@@ -1,5 +1,5 @@
 import { normalizeSearchText } from "./search-index";
-import { isRequestedContentTypeCompatible, type SearchMatch } from "./search-retriever";
+import { hasDirectSubjectAuthority, isRequestedContentTypeCompatible, isShortSemanticSubject, semanticInformationalSubject, type SearchMatch } from "./search-retriever";
 import type { QueryUnderstanding } from "./query-understanding";
 import type { QueryRelation } from "./query-facets";
 
@@ -10,9 +10,10 @@ export type EvidenceStatus =
   | "AMBIGUOUS";
 
 export type RequestedAttribute =
-  | "duration" | "cost" | "staffing" | "schedule" | "private_record"
+  | "duration" | "guarantee" | "cost" | "staffing" | "schedule" | "private_record"
   | "partnership" | "capability" | "content_type" | "freshness"
-  | "quantity" | "comparison" | "recommendation" | "fact";
+  | "quantity" | "comparison" | "recommendation" | "availability"
+  | "compatibility" | "engagement" | "support_model" | "project_requirement" | "fact";
 
 export interface EvidenceValidation {
   status: EvidenceStatus;
@@ -51,13 +52,13 @@ export function analyzeQuerySafety(message: string): QuerySafetyProfile {
 
   let relation: SafetyRelation = "UNSPECIFIED";
   if (/\b(?:salary|compensation|pay|appraisal|performance rating|bonus|hike)\b/.test(q)) relation = "EMPLOYEE_COMPENSATION";
-  else if (/\b(?:leave|attendance|employee record|employee id|who is absent)\b/.test(q)) relation = "EMPLOYEE_PRIVATE_RECORD";
-  else if (/\b(?:who|which (?:employee|developer|client)|team members?|assigned)\b.*\b(?:working|projects?|assigned|clients?)\b|\b(?:employees?|developers?)\b.*\b(?:working for|assigned to|clients?|projects?)\b|\bwho is on (?:the )?.*project\b/.test(q)) relation = "EMPLOYEE_WORKS_ON";
+  else if (/\b(?:leave|attendance|employee record|employee id|employee (?:phone|email|address)|employees? (?:phone|email|address)|who is absent)\b/.test(q)) relation = "EMPLOYEE_PRIVATE_RECORD";
+  else if (/\b(?:who|which (?:employee|developer|client)|team members?|assigned)\b.*\b(?:working|projects?|assigned|clients?)\b|\b(?:employees?|developers?)\b.*\b(?:working for|assigned to|which clients?)\b|\bwho is on (?:the )?.*project\b/.test(q)) relation = "EMPLOYEE_WORKS_ON";
   else if (/\b(?:contracts?|contract value|client billing|billing rate|minimum contract)\b/.test(q)) relation = /\b(?:private|confidential|active|current|billing|value)\b/.test(q) ? "PRIVATE_CONTRACT" : "PRIVATE_PRICING";
-  else if (/\b(?:price|pricing|hourly rate|project worth|project cost|free trial)\b/.test(q)) relation = "PRIVATE_PRICING";
+  else if (/\b(?:price|pricing|hourly rate|project worth|project cost)\b/.test(q)) relation = "PRIVATE_PRICING";
   else if (/\b(?:roadmap|future launch|upcoming .*launch)\b/.test(q)) relation = "INTERNAL_ROADMAP";
   else if (/\b(?:internal meetings?|meeting notes?|meeting minutes?)\b/.test(q)) relation = "INTERNAL_MEETING";
-  else if (/\b(?:vulnerabilit|security (?:problems?|incidents?|weakness(?:es)?)|internal (?:systems?|infrastructure)|credentials|source code)\b/.test(q)) relation = "INTERNAL_SECURITY";
+  else if (/\b(?:vulnerabilit|security (?:problems?|incidents?|weakness(?:es)?)|internal (?:security architecture|infrastructure (?:details?|diagram|configuration))|credentials|source code)\b/.test(q)) relation = "INTERNAL_SECURITY";
   else if (/\b(?:projects?|client engagements?|client work|customer project|what are you working on)\b/.test(q) && (current || future || privateScope)) relation = "CURRENT_PROJECTS";
   else if (publicScope) relation = "PUBLIC_INFORMATION";
 
@@ -139,15 +140,15 @@ const stop = new Set([
   "no", "not", "only", "cannot", "right", "correct", "unrelated",
   "serve", "industry", "industries", "career", "careers", "partner", "partners",
   "partnership", "about", "me", "you", "be", "completed", "finish",
-  "related", "relevant", "matching", "associated",
+  "related", "relevant", "matching", "associated", "so", "handles", "handle", "improve",
 ]);
 const attributeWords = new Set([
   "long", "time", "take", "timeline", "duration", "quickly", "days", "weeks",
   "months", "cost", "price", "pricing", "budget", "much", "developers",
   "people", "team", "staff", "required", "schedule", "date", "credited",
   "rating", "hike", "salary", "bonus", "appraisal", "attendance", "manager",
-  "policy", "partner", "partnership", "case", "study", "blog", "article",
-  "resource", "news", "announcement", "announcements", "latest", "current", "recent", "newest", "recommend",
+  "policy", "partner", "partnership", "case", "study", "blog", "blogs", "article", "articles",
+  "resource", "resources", "news", "announcement", "announcements", "latest", "current", "recent", "newest", "recommend",
 ]);
 
 const terms = (value: string) => normalizeSearchText(value).split(" ")
@@ -161,10 +162,19 @@ function evidenceTermSet(value: string): Set<string> {
   return new Set(normalizeSearchText(value).split(" ").filter(Boolean).map(identityTerm));
 }
 
+const isAttributeTerm = (term: string) =>
+  attributeWords.has(term) || attributeWords.has(identityTerm(term));
+
 export function requestedAttribute(message: string, understanding: QueryUnderstanding): RequestedAttribute {
   const query = normalizeSearchText(message);
+  if (/\b(?:guarantee|guaranteed|commit|committed)\b.*\b(?:delivery|date|timeline|duration|time|outcome|result|performance)\b/.test(query)) return "guarantee";
+  if (/\b(?:free trials?|trial availability|free demos?|demo availability|available in (?:our|my|the) (?:region|country|market|location))\b/.test(query)) return "availability";
+  if (/\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|work with|connect(?:s|ed|ing|ion)?)\b/.test(query)) return "compatibility";
+  if (/\b(?:dedicated(?: [a-z0-9+.#-]+){0,3} (?:developers?|engineers?|team)|engagement model|long term (?:project|engagement)|staff(?:ing| augmentation))\b/.test(query)) return "engagement";
+  if (/\b(?:post launch support|after implementation|post implementation|ongoing (?:support|maintenance))\b/.test(query)) return "support_model";
+  if (/\b(?:custom|specific|particular) (?:project |business )?(?:need|requirement|use case)\b/.test(query)) return "project_requirement";
   if (/\b(?:how long|timeline|duration|how quickly|how soon|guarantee .*?(?:date|timeline)|next (?:week|month|quarter|year)|this (?:week|month|quarter|year)|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen)\s*(?:days?|weeks?|months?))\b/.test(query)) return "duration";
-  if (/\b(?:how much|price|pricing|budget|revenue|project cost|engagement cost|cost to|cost of (?:building|developing|implementing))\b/.test(query)) return "cost";
+  if (/\b(?:how much|price|pricing|budget|project cost|engagement cost|cost to|cost of (?:building|developing|implementing))\b/.test(query)) return "cost";
   if (/\b(?:how many (?:developers|engineers|people|team members)|team size|(?:developers|engineers|people) (?:are )?required)\b/.test(query)) return "staffing";
   if (/\b(?:appraisal|salary|bonus|leave|promotion|probation|notice period|attendance|employee id|my manager|personal|private|confidential|internal|absent)\b/.test(query))
     return /\b(?:my|mine|i|manager|rating|approved)\b/.test(query) ? "private_record" : "schedule";
@@ -172,25 +182,26 @@ export function requestedAttribute(message: string, understanding: QueryUndersta
   if (understanding.requestedContentType) return "content_type";
   if (understanding.temporalIntent || /\b(?:latest|recent|newest|today|currently)\b/.test(query)) return "freshness";
   if (/\b(?:how many|count|total|number of)\b/.test(query)) return "quantity";
-  if (/\b(?:compare|comparison|versus|\bvs\b|difference)\b/.test(query)) return "comparison";
+  if (/\b(?:compare|comparison|versus|\bvs\b|difference|better than|worse than)\b/.test(query)) return "comparison";
   if (understanding.intent === "recommendation") return "recommendation";
-  if (/\b(?:provide|support|work with|build with|capabilit|services?|can (?:you|successive) (?:build|develop|create|implement))\b/.test(query)) return "capability";
+  if (/\b(?:provide|support|work with|build with|capabilit|services?|who (?:handles|supports|can help with)|can (?:you|successive) (?:build|develop|create|implement))\b/.test(query)) return "capability";
   return "fact";
 }
 
 function contentTypeCompatible(match: SearchMatch, requested: QueryUnderstanding["requestedContentType"]): boolean {
-  if (!requested) return true;
-  const identity = `${match.document.type} ${match.document.role} ${match.document.slug}`;
-  if (requested === "case-study") return /case/.test(identity);
-  if (requested === "blog") return match.document.role === "blog" || match.document.type === "post";
-  if (requested === "partner") return /partner/.test(identity);
-  if (requested === "industry") return match.document.role === "industry" || match.document.type === "industries";
-  if (requested === "career") return /career|job/.test(identity);
-  if (requested === "service") return match.document.role === "service" || match.document.role === "global_capabilities";
-  if (requested === "event") return /event|webinar/.test(identity);
-  if (requested === "whitepaper") return /whitepaper|ebook|resource/.test(identity);
-  if (requested === "news") return /press_release|press-release|media-coverage|editorial/.test(identity);
-  return true;
+  if (isRequestedContentTypeCompatible(match.document, requested)) return true;
+  // An exact named entity can be represented by a descriptive first-party
+  // section even when the containing page has a different document role.
+  // Keep this match-scoped: a mention does not reclassify the whole page.
+  if (requested && match.matchedFields.includes("exact-embedded-entity")) return true;
+  if (requested === "case-study") return match.document.role === "case_study";
+  if (requested === "blog") return match.document.role === "blog";
+  if (requested === "partner") return ["partner", "partners"].includes(match.document.role);
+  if (requested === "industry") return match.document.role === "industry";
+  if (requested === "career") return ["career", "careers"].includes(match.document.role);
+  if (requested === "service") return ["service", "global_capabilities"].includes(match.document.role);
+  if (requested === "resource") return match.document.role === "resource";
+  return false;
 }
 
 function evidenceText(match: SearchMatch): string {
@@ -204,6 +215,7 @@ function evidenceText(match: SearchMatch): string {
 function attributeCoverage(attribute: RequestedAttribute, text: string, match: SearchMatch): number {
   const checks: Record<RequestedAttribute, RegExp> = {
     duration: /\b(?:timeline|duration|delivery time|days?|weeks?|months?|hours?|estimate)\b/,
+    guarantee: /\b(?:guarantee|guaranteed|commitment|committed|service level agreement|sla)\b/,
     cost: /\b(?:cost|price|pricing|budget|fee|rate|investment|revenue)\b/,
     staffing: /\b(?:team size|developers?|engineers?|staffing|resources?)\b/,
     schedule: /\b(?:schedule|date|cycle|policy|appraisal|salary|bonus|leave|promotion|probation|notice period)\b/,
@@ -215,6 +227,11 @@ function attributeCoverage(attribute: RequestedAttribute, text: string, match: S
     quantity: /\b\d+\b/,
     comparison: /\b(?:compare|versus|difference|better|advantages?|tradeoffs?)\b/,
     recommendation: /\b(?:recommend|suitable|fit|approach|solution|service|capability)\b/,
+    availability: /\b(?:free trial|trial availability|free demo|demo availability|available in|regional availability)\b/,
+    compatibility: /\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|work with|connect(?:s|ed|ing|ion)?)\b/,
+    engagement: /\b(?:dedicated(?: [a-z0-9+.#-]+){0,3} (?:developers?|engineers?|team)|engagement model|long term|staff(?:ing| augmentation))\b/,
+    support_model: /\b(?:post launch support|after implementation|post implementation|ongoing (?:support|maintenance))\b/,
+    project_requirement: /\b(?:custom|specific|particular) (?:project |business )?(?:need|requirement|use case)\b/,
     fact: /./,
   };
   if (attribute === "content_type") return 1;
@@ -229,20 +246,32 @@ export function validateEvidence(args: {
   understanding: QueryUnderstanding;
   matches: SearchMatch[];
   hasConversationSubject: boolean;
+  authoritativeSubject?: string | null;
 }): EvidenceValidation {
   const { message, understanding, matches } = args;
   const safety = analyzeQuerySafety(message);
   const attribute = requestedAttribute(message, understanding);
-  const queryTerms = terms(message).filter((term) => !attributeWords.has(term));
+  const authoritativeSubjectTerms = args.authoritativeSubject?.trim()
+    ? terms(args.authoritativeSubject).filter((term) => !isAttributeTerm(term)) : [];
+  const queryTerms = authoritativeSubjectTerms.length
+    ? [] : terms(message).filter((term) => !isAttributeTerm(term));
   const contextTerms = args.contextMessage &&
+    !authoritativeSubjectTerms.length &&
     normalizeSearchText(args.contextMessage) !== normalizeSearchText(message)
-    ? terms(args.contextMessage).filter((term) => !attributeWords.has(term))
+    ? terms(args.contextMessage).filter((term) => !isAttributeTerm(term))
     : [];
+  const explicitTopicTerms = new Set(understanding.topics.flatMap(terms));
   const subjectTerms = [...new Set([
-    ...understanding.entities.flatMap(terms), ...understanding.topics.flatMap(terms),
-    ...understanding.domains.flatMap(terms), ...queryTerms, ...contextTerms,
-  ])].filter((term) => !attributeWords.has(term));
+    ...(authoritativeSubjectTerms.length ? authoritativeSubjectTerms : [
+      ...understanding.entities.flatMap(terms), ...understanding.topics.flatMap(terms),
+      ...understanding.domains.flatMap(terms), ...queryTerms, ...contextTerms,
+    ]),
+  ])].filter((term) => !isAttributeTerm(term) ||
+    (attribute === "content_type" && explicitTopicTerms.has(term)));
   const subject = subjectTerms.join(" ") || "the requested information";
+  const shortDefinitionSubject = attribute === "fact" &&
+    ["define", "explain"].includes(understanding.answerMode) &&
+    subjectTerms.length === 1 && isShortSemanticSubject(semanticInformationalSubject(subject));
   const ambiguous = /^(?:how long|how much|when|where|who|what about that|can you do it|tell me more|what will it cost|how quickly can you finish)[?.!\s]*$/i.test(message.trim());
   if (ambiguous && !args.hasConversationSubject) {
     return { status: "AMBIGUOUS", confidence: "none", subject, requestedAttribute: attribute, accepted: [], rejected: [], reason: "The requested subject is unresolved." };
@@ -275,15 +304,20 @@ export function validateEvidence(args: {
       ? Math.max(lexicalSubjectCoverage, match.scoreBreakdown?.functional ?? 0)
       : lexicalSubjectCoverage;
     const relationCoverage = attributeCoverage(attribute, text, match);
+    const directSubjectAuthority = !shortDefinitionSubject ||
+      hasDirectSubjectAuthority(match.document, subject) ||
+      match.matchedFields.includes("embedded-direct-subject-authority");
     const contentCompatible = contentTypeCompatible(match, understanding.requestedContentType);
-    const authority = ["service", "company", "global_capabilities", "partner", "partners", "product", "press_release", "editorial", "culture", "careers", "awards", "case_study", "blog", "resource", "industry"].includes(match.document.role);
+    const authority = ["service", "company", "global_capabilities", "partner", "partners", "product", "press_release", "editorial", "culture", "careers", "awards", "case_study", "blog", "resource", "industry"].includes(match.document.role) ||
+      match.matchedFields.includes("exact-embedded-entity");
     const structured = match.matchedFields.some((field) => /structured|entity|exact|canonical/.test(field));
     const score = subjectCoverage * 0.45 + relationCoverage * 0.3 + (contentCompatible ? 0.15 : 0) + (authority ? 0.07 : 0) + (structured ? 0.03 : 0);
     const reason = !contentCompatible ? "requested content type mismatch"
       : relationCoverage === 0 ? `missing ${attribute} evidence`
+        : !directSubjectAuthority ? "short definition subject lacks direct document authority"
         : subjectCoverage < 0.34 ? "weak subject coverage"
           : !authority ? "insufficient document authority" : "supported";
-    return { match, score, subjectCoverage, identitySubjectCoverage, relationCoverage, contentCompatible, reason };
+    return { match, score, subjectCoverage, identitySubjectCoverage, relationCoverage, contentCompatible, directSubjectAuthority, reason };
   });
   const explicitMetric = (item: typeof evaluated[number]) => {
     const text = evidenceText(item.match);
@@ -295,6 +329,16 @@ export function validateEvidence(args: {
     }
     if (attribute === "cost") return /(?:[$€£₹]\s*\d|\b\d[\d,.]*\s*(?:usd|dollars?|euros?|rupees?)\b)/.test(text);
     if (attribute === "staffing") return /\b\d+(?:\s*[-–]\s*\d+)?\s*(?:developers?|engineers?|people|members?)\b/.test(text);
+    if (attribute === "compatibility") {
+      if (attributeCoverage(attribute, text, item.match) === 0) return false;
+      const target = normalizeSearchText(message).match(
+        /\b(?:with|to) (?:our |my |the )?(?:existing |custom |internal )?([a-z0-9+#.-]+)(?: (?:system|platform|pipeline))?/,
+      )?.[1];
+      return !target || /^(?:system|platform|pipeline|environment|technology)$/.test(target) ||
+        new RegExp(`\\b${target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text);
+    }
+    if (["availability", "engagement", "support_model", "project_requirement"].includes(attribute))
+      return attributeCoverage(attribute, text, item.match) > 0;
     if (attribute === "recommendation") return false;
     return true;
   };
@@ -305,7 +349,7 @@ export function validateEvidence(args: {
     );
   const direct = evaluated.filter((item) =>
     item.score >= 0.68 && item.subjectCoverage >= 0.34 && item.relationCoverage > 0 &&
-    item.contentCompatible && explicitMetric(item) && strongMetricIdentity(item) &&
+    item.contentCompatible && item.directSubjectAuthority && explicitMetric(item) && strongMetricIdentity(item) &&
     (attribute !== "capability" || item.identitySubjectCoverage >= 0.34 || item.match.document.role === "industry"),
   );
   const related = evaluated.filter((item) =>
@@ -332,10 +376,12 @@ export function validateEvidence(args: {
 
 export function safeEvidenceResponse(validation: EvidenceValidation): string {
   const labels: Record<RequestedAttribute, string> = {
-    duration: "timeline or delivery duration", cost: "project-specific cost or pricing", staffing: "required team size",
+    duration: "timeline or delivery duration", guarantee: "guarantee or delivery commitment", cost: "project-specific cost or pricing", staffing: "required team size",
     schedule: "schedule or policy", private_record: "private employee information", partnership: "formal partnership relationship",
     capability: "capability", content_type: "requested content type", freshness: "current or latest status",
-    quantity: "requested quantity", comparison: "requested comparison", recommendation: "recommendation", fact: "requested fact",
+    quantity: "requested quantity", comparison: "requested comparison", recommendation: "recommendation",
+    availability: "requested availability", compatibility: "requested compatibility", engagement: "engagement model",
+    support_model: "support model", project_requirement: "project-specific requirement", fact: "requested fact",
   };
   if (validation.status === "AMBIGUOUS") return "What subject or project are you asking about? Please add a little context so I can check the relevant Successive information.";
   if (validation.status === "PARTIALLY_SUPPORTED") {
@@ -348,6 +394,25 @@ export function safeEvidenceResponse(validation: EvidenceValidation): string {
       ? "A reliable estimate would require the project scope, integrations, constraints, and delivery requirements."
       : "You can clarify the subject or ask about a related published Successive capability.";
   return `I couldn’t confirm the ${labels[validation.requestedAttribute]} for ${validation.subject} from the available Successive content. ${nextStep}`;
+}
+
+export function answerAddressesRequestedAttribute(
+  answer: string,
+  message: string,
+  attribute: RequestedAttribute,
+): boolean {
+  const text = normalizeSearchText(answer);
+  if (attribute === "availability") return /\b(?:free trial|trial availability|free demo|demo availability|available in|regional availability)\b/.test(text);
+  if (attribute === "engagement") return /\b(?:dedicated(?: [a-z0-9+.#-]+){0,3} (?:developers?|engineers?|team)|engagement model|long term|staff(?:ing| augmentation))\b/.test(text);
+  if (attribute === "support_model") return /\b(?:post launch support|after implementation|post implementation|ongoing (?:support|maintenance))\b/.test(text);
+  if (attribute === "project_requirement") return /\b(?:custom|specific|particular) (?:project |business )?(?:need|requirement|use case)\b/.test(text);
+  if (attribute !== "compatibility") return true;
+  if (!/\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|work with|connect(?:s|ed|ing|ion)?)\b/.test(text)) return false;
+  const target = normalizeSearchText(message).match(
+    /\b(?:with|to) (?:our |my |the )?(?:existing |custom |internal )?([a-z0-9+#.-]+)(?: (?:system|platform|pipeline))?/,
+  )?.[1];
+  return !target || /^(?:system|platform|pipeline|environment|technology)$/.test(target) ||
+    new RegExp(`\\b${target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text);
 }
 
 export function safeUnsupportedQueryResponse(message: string): string | null {

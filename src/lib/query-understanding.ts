@@ -103,19 +103,28 @@ const QUESTION_WORDS = new Set([
   "what", "which", "who", "where", "when", "why", "how", "is", "are", "a", "an", "the", "can", "could", "as",
   "would", "should", "do", "does", "did", "have", "has", "tell", "show",
   "give", "find", "please", "me", "about", "with", "from", "this", "that", "these",
-  "those", "your", "you", "our", "we", "us", "my", "its", "they", "them", "something", "anything", "any",
-  "more", "else", "need", "want", "like", "help", "successive", "digital",
+  "those", "your", "you", "our", "we", "us", "my", "its", "it", "they", "them", "he", "him", "his", "she", "her", "their", "same", "something", "anything", "any",
+  "more", "else", "need", "want", "like", "help", "mean", "meant", "too", "actually", "include", "includes", "included", "so", "handles", "successive", "digital",
   "provide", "specialize", "specialise", "build", "develop", "create", "implement", "business", "company",
   "suggest", "recommend", "summarize", "summarise", "summary", "called", "named", "titled", "latest", "newest", "recent", "current", "currently", "well", "work", "compare", "vs", "and",
-  "no", "not", "only", "cannot", "right", "correct", "unrelated",
+  "no", "not", "only", "cannot", "right", "correct", "unrelated", "in", "on", "at", "for", "to",
 ]);
 
-const followUpPattern = /^(?:tell me more|what about(?: this| that)?|anything else|any examples?|how|why|how would (?:it|this|that) help(?: us|my company)?|what (?:would you suggest|do you recommend|next))[?.!\s]*$/i;
+const followUpPattern = /^(?:tell me more(?: about (?:it|this|that|him|her))?|what about(?: this| that| it| him| her)?|anything else|any examples?|how|why|how (?:does|would) (?:it|this|that) (?:work|help)(?: us|my company)?|what (?:can it do|is (?:his|her|its) experience|is (?:his|her|its) role|would you suggest|do you recommend|next))[?.!\s]*$/i;
+
+/** Grammar that requires an earlier subject/result; it never owns a subject. */
+export function isDependentFollowUp(message: string): boolean {
+  const normalized = normalizeSearchText(message);
+  return /\b(?:this|that|it|its|these|those|they|them|their|same)\b/.test(normalized) ||
+    /\b(?:other|another)\b.*\b(?:product|service|case study|article|resource|partner|job|opening|result|one)\b/.test(normalized) ||
+    /^(?:what about|how about|tell me more|more about|any|another|other|next|first|second|third|last)\b/.test(normalized) ||
+    /^(?:what does it|what do they|who is it for|where is it|which industries .*\bthis\b|does it|what does .* cover)\b/.test(normalized);
+}
 
 const explicitTypeRequest = (message: string, type: RegExp): boolean => {
   const normalized = normalizeSearchText(message);
   return type.test(normalized) && (
-    /\b(?:show|find|list|give|summarize|summarise|read|download|explore|any|another|latest|newest|recent|recently|current|upcoming|published)\b/.test(normalized) ||
+    /\b(?:show|find|list|give|summarize|summarise|read|download|explore|any|another|latest|newest|recent|recently|current|upcoming|published|offer|offers|offered|provide|provides|provided|have|has|available|related)\b/.test(normalized) ||
     /^(?:[a-z0-9.+# -]+\s+)?(?:services?|capabilit(?:y|ies)|approach|case stud(?:y|ies)|blogs?|articles?|white ?papers?|e-?books?|webinars?|events?|news|press releases?|products?|partners?|industries)\??$/.test(normalized) ||
     /\b(?:do you have|have you (?:done|published)|what (?:services?|products?|industries)|which (?:services?|products?|industries))\b/.test(normalized)
   );
@@ -166,19 +175,28 @@ export function buildDeterministicUnderstanding(
   message: string,
 ): QueryUnderstanding {
   const normalizedQuery = normalizeSearchText(message);
+  const capabilitySubjectCandidate = normalizedQuery.match(
+    /^(?:do (?:you|successive) (?:support|offer|provide|work with)|can (?:you|successive) (?:help with|support|provide|offer))\s+(.+?)(?:\s+as well)?$/,
+  )?.[1]?.trim();
+  const capabilitySubject = capabilitySubjectCandidate && !/^(?:it|this|that|these|those|him|her)$/.test(capabilitySubjectCandidate)
+    ? capabilitySubjectCandidate : undefined;
   const tokens = normalizedQuery
     .split(" ")
     .filter((token) => token.length > 1 && !QUESTION_WORDS.has(token));
   const isFollowUp = followUpPattern.test(message.trim());
-  const asksEvidence = /\b(?:case stud(?:y|ies)|customer (?:example|story|work)|success stor(?:y|ies)|client example|project example|similar (?:work|project)|done (?:this|that|anything)|have you done)\b/i.test(message);
+  const asksEvidence = /\b(?:case stud(?:y|ies)|customer (?:example|story|work)|success stor(?:y|ies)|client example|project example|similar (?:work|project)|done (?:this|that|anything)|have you done|implemented (?:this|that|it)|(?:use|used) (?:this|that|it))\b/i.test(message);
   const asksResource = /\b(?:blogs?|articles?|white ?papers?|e-?books?|resources?|something (?:to )?read|webinars?|events?|thought leadership)\b/i.test(message);
   const asksRecommendation = /\b(?:recommend|which|best|right|what service|where to start|don.t know what)\b/i.test(message);
   const inferred = inferredBusinessSignals(message);
   const describesProblem = /\b(?:we|our|teams?|platform|system|operations?|customers?|agents?|editors?|reports?|workloads?|application|monolith|cloud|apis?)\b.*\b(?:cannot|can.t|struggl|slow|manual|fragment|too (?:much|many|slow)|difficult|expensive|lack|need|want|keeps?|increas|mismatch|inconsisten|risk|complex|wait|repeat|crash|disagree|relocate|reuse)\b/i.test(message) ||
     inferred.concepts.length > 0 || /\bwhat capability could help\b/i.test(message);
   const asksContact = /\b(?:contact|talk to|speak with|book a demo|email|estimate)\b/i.test(message);
-  const requestedContentType = explicitTypeRequest(message, /\bcase stud(?:y|ies)|customer stor(?:y|ies)|success stor(?:y|ies)\b/)
+  const requestedContentType = explicitTypeRequest(message, /\bcase stud(?:y|ies)|customer stor(?:y|ies)|success stor(?:y|ies)|customer work|(?:customers?|clients?) (?:for|using|involving) (?:it|this|that|[a-z0-9+.# -]+)\b/)
     ? "case-study"
+    : explicitTypeRequest(message, /\b(?:blogs?|articles?)\b/)
+      ? "blog"
+    : explicitTypeRequest(message, /\bresources?|guides?\b/)
+      ? "resource"
     : /\bwhite ?papers?\b/i.test(message)
       ? "whitepaper"
       : /\be-?books?\b/i.test(message)
@@ -197,19 +215,17 @@ export function buildDeterministicUnderstanding(
                   ? "accelerator"
                   : /\bawards?|recognitions?\b/i.test(message)
                     ? "award"
-                    : (/\bkagen(?: add| voice)\b/i.test(message) || explicitTypeRequest(message, /\bproducts?\b/))
+                    : (/\bkagen\b/i.test(message) || explicitTypeRequest(message, /\bproducts?\b/))
                       ? /\bkagen\b/i.test(message) ? "kagen-product" : "product"
       : /\bthought leadership\b/i.test(message)
         ? "thought-leadership"
         : /\b(?:partner|partnership|alliance)\b/i.test(message)
           ? "partner"
-          : explicitTypeRequest(message, /\bindustr(?:y|ies)\b/)
+          : explicitTypeRequest(message, /\b(?:industr(?:y|ies)|sectors?)\b/)
             ? "industry"
             : /\b(?:career|careers|jobs?|openings?|vacanc(?:y|ies)|hiring)\b/i.test(message)
               ? "career"
-      : explicitTypeRequest(message, /\b(?:blogs?|articles?)\b/)
-        ? "blog"
-        : explicitTypeRequest(message, /\b(?:services?|serivces?|approach)\b/)
+      : explicitTypeRequest(message, /\b(?:services?|serivces?|capabilit(?:y|ies)|offerings?|approach)\b/)
             ? "service"
             : null;
   const answerMode = /^(?:what|who)\s+(?:is|are)\b/i.test(message)
@@ -236,6 +252,7 @@ export function buildDeterministicUnderstanding(
     : /\bcurrent(?:ly)?\b/i.test(message)
       ? "current" as const
       : null;
+  const effectiveRequestedContentType = requestedContentType ?? (capabilitySubject ? "service" : null);
   const intent = asksContact
     ? "contact"
     : isFollowUp
@@ -250,44 +267,58 @@ export function buildDeterministicUnderstanding(
             ? "recommendation"
             : describesProblem
               ? "solve_problem"
-            : requestedContentType === "service"
+            : effectiveRequestedContentType === "service"
               ? "discovery"
               : tokens.length <= 2
                 ? "explore"
                 : "informational";
   const contentTypeTerms = new Set([
     "case", "study", "studies", "customer", "story", "stories", "whitepaper",
-    "whitepapers", "ebook", "ebooks", "blog", "blogs", "article", "articles",
+    "whitepapers", "ebook", "ebooks", "blog", "blogs", "article", "articles", "resource", "resources", "guide", "guides",
     "webinar", "webinars", "event", "events", "news", "announcement", "announcements", "thought", "leadership", "partner",
-    "partnership", "industry", "industries", "career", "careers", "job", "jobs",
+    "partnership", "industry", "industries", "sector", "sectors", "career", "careers", "job", "jobs",
     "opening", "openings", "vacancy", "vacancies", "hiring",
+    "role", "roles",
     "service", "services", "serivce", "serivces", "capability", "capabilities", "offerings",
     "product", "products", "platform", "platforms", "solution", "solutions",
-    "provide", "specialize", "specialise",
+    "provide", "provides", "provided", "providing", "offer", "offers", "offered", "offering",
+    "tell", "show", "give", "find", "list", "example", "examples", "explore", "discuss", "share", "then", "also",
+    "have", "has", "available", "availability", "implement", "implemented", "implementing",
+    "use", "used", "using", "related", "team", "specialize", "specialise",
+    "cover", "covers", "covered", "covering", "more", "another", "other",
   ]);
   const relationshipWords = new Set(["related", "relevant", "matching", "associated"]);
-  const topics = [...new Set(tokens.filter((token) =>
+  const explicitArticleTopic = requestedContentType === "blog"
+    ? normalizedQuery.match(/^(?:show|find|give me|list|do you have)\s+(?:some\s+)?(?:blogs?|articles?|posts?)\s+(?:about|on|for)\s+(.+)$/)?.[1]?.trim()
+    : undefined;
+  const topics = [...new Set([
+    ...(explicitArticleTopic ? explicitArticleTopic.split(" ").filter((token) => token.length > 1) : []),
+    ...tokens.filter((token) =>
     !contentTypeTerms.has(token) &&
     !(requestedContentType && relationshipWords.has(token)),
-  ))].slice(0, 6);
-  const offTopic = /\b(?:weather|forecast|movie|film|poem|song|joke|capital of|president of|prime minister|sports? score|recipe|horoscope|sorting code)\b/i.test(message);
+  )])].slice(0, 6);
+  const effectiveTopics = capabilitySubject
+    ? capabilitySubject.split(" ").filter((token) => token.length > 1)
+    : topics;
+  const offTopic = /\b(?:weather|forecast|rain|temperature|movie|film|poem|song|joke|capital of|president of|prime minister|cricket|football|sports?|match result|election|recipe|horoscope|sorting code)\b/i.test(message);
   const industryMatch = normalizedQuery.match(
     /\b(?:for|in|with|about) ([a-z][a-z ]{1,50}?) (?:companies|businesses|organizations|organisations|industry|sector)\b/,
   );
+  const explicitIndustry = industryMatch?.[1]?.trim();
   const needsClarification =
     (isFollowUp && topics.length === 0) ||
     (asksRecommendation && topics.length === 0);
   return {
     normalizedQuery,
     intent: offTopic ? "off_topic" : intent,
-    topics,
+    topics: effectiveTopics,
     businessProblem: describesProblem ? message.trim() : null,
     desiredOutcomes: inferred.outcomes,
-    domains: [...new Set([...topics, ...inferred.domains])],
-    technicalSignals: [...new Set([...topics, ...inferred.concepts])],
-    industry: industryMatch?.[1]?.trim() ?? null,
+    domains: [...new Set([...effectiveTopics, ...inferred.domains])],
+    technicalSignals: [...new Set([...effectiveTopics, ...inferred.concepts])],
+    industry: explicitIndustry && !/^(?:this|that|same|the same)$/.test(explicitIndustry) ? explicitIndustry : null,
     existingPlatform: null,
-    requestedContentType,
+    requestedContentType: effectiveRequestedContentType,
     requestedAction: null,
     answerMode,
     targetScope: namedSuccessivePerson || companyPossessive || companyFact ? "company" : portfolioRequest ? "portfolio" : "topic",
@@ -295,15 +326,15 @@ export function buildDeterministicUnderstanding(
     containsPremise,
     entities: namedSuccessivePerson ? [namedSuccessivePerson] : [],
     constraints: [],
-    retrievalConcepts: [...new Set([...topics, ...inferred.concepts])],
-    isBroadQuery: topics.length <= 2,
+    retrievalConcepts: [...new Set([...effectiveTopics, ...inferred.concepts])],
+    isBroadQuery: effectiveTopics.length <= 2,
     isFollowUp,
     isOffTopic: offTopic,
     needsClarification,
     clarificationQuestion: needsClarification
       ? "What business outcome or technology challenge are you mainly trying to address?"
       : null,
-    confidence: offTopic ? 0.95 : topics.length ? 0.58 : 0.3,
+    confidence: offTopic ? 0.95 : effectiveTopics.length ? 0.58 : 0.3,
   };
 }
 
@@ -333,7 +364,7 @@ export function classifyFollowUpScope(
   message: string,
 ): FollowUpScope {
   const normalized = normalizeSearchText(message);
-  const collection = /\b(?:openings?|jobs?|careers?|services?|offerings?|capabilities|case studies?|customer stories|blogs?|articles?|insights?|partners?|partnerships?|industries|locations?|offices?|products?|platforms?)\b/;
+  const collection = /\b(?:openings?|jobs?|careers?|services?|offerings?|capabilities|case studies?|customer stories|blogs?|articles?|insights?|resources?|white ?papers?|reports?|events?|webinars?|partners?|partnerships?|alliances?|industries|locations?|offices?|products?|platforms?|accelerators?|awards?|recognitions?|technologies|press releases?|media)\b/;
   const explicitBroad =
     /\b(?:all|every|complete|full list|entire)\b/.test(normalized) ||
     /^(?:what|which)\b.*\b(?:do you (?:have|offer|provide)|are available|work with|serve)\b/.test(normalized) ||
@@ -342,9 +373,13 @@ export function classifyFollowUpScope(
   if (collection.test(normalized) && explicitBroad) return "BROADEN_SCOPE";
   if (/^(?:any more|more|another|next|anything else)(?:\s+(?:one|ones|results?|items?))?$/.test(normalized))
     return "CONTINUE_SAME_SCOPE";
+  if (/\b(?:this|that|these|those|them|it|its)\b/.test(normalized) &&
+      /\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|support(?:s|ed|ing)?|implement(?:s|ed|ing|ation)?|deploy(?:s|ed|ing|ment)?|customi[sz](?:e|es|ed|ing|ation)|connect(?:s|ed|ing|ion)?|work with|requirements?|needs?)\b/.test(normalized))
+    return "REFINE_SCOPE";
   if (/\b(?:only|instead|specifically)\b/.test(normalized) ||
       /^(?:in|for|with|from|any)\b/.test(normalized) ||
-      (current.requestedContentType && /\b(?:related|relevant|matching|associated)\b/.test(normalized)) ||
+      (/\b(?:related|relevant|matching|associated)\b/.test(normalized) &&
+        (Boolean(current.requestedContentType) || /\b(?:these|those|them|this|that|it)\b/.test(normalized))) ||
       /\b(?:one|ones)\b/.test(normalized)) return "REFINE_SCOPE";
   if (current.topics.length || current.entities.length || current.industry || current.requestedContentType)
     return "SWITCH_TOPIC";
@@ -359,11 +394,17 @@ export function resolveConversationUnderstanding(
 ): { understanding: QueryUnderstanding; state: ConversationState } {
   const priorUsers = history.filter((item) => item.role === "user");
   let prior: QueryUnderstanding | undefined;
+  let priorSubject: QueryUnderstanding | undefined;
   let lastExplicitTopicTurn: number | null = null;
   priorUsers.forEach((item, index) => {
     const candidate = buildDeterministicUnderstanding(item.content);
     if (candidate.topics.length || candidate.entities.length || candidate.industry || candidate.requestedContentType)
       prior = candidate;
+    const subjectlessDependency = isDependentFollowUp(item.content) &&
+      (!candidate.topics.length || /\b(?:this|that|it|its|these|those|they|them|their|one|ones|other|another)\b/i.test(item.content) ||
+        /^(?:any|another|other|next|first|second|third|last)\b/i.test(item.content.trim()));
+    if ((candidate.topics.length || candidate.entities.length || candidate.industry) && !subjectlessDependency)
+      priorSubject = candidate;
     if (candidate.topics.length) {
       lastExplicitTopicTurn = index;
     }
@@ -372,57 +413,63 @@ export function resolveConversationUnderstanding(
   const broadensScope = scope === "BROADEN_SCOPE";
   const refinesScope = scope === "REFINE_SCOPE";
   const continuesScope = scope === "CONTINUE_SAME_SCOPE" || scope === "AMBIGUOUS_FOLLOW_UP";
-  const currentTopics = current.topics.filter((topic) => !/^(?:one|ones|item|items|result|results)$/.test(topic));
+  // Collection-wide operators control context ownership; they are never
+  // semantic subjects or filters in the resolved retrieval request.
+  const currentTopics = current.topics.filter((topic) =>
+    !/^(?:all|every|complete|full|entire|one|ones|item|items|result|results)$/.test(topic));
   const hasExplicitCurrentSubject = currentTopics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
-  const shouldInherit = !broadensScope && !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 ||
-    /\b(?:this|that|it|its|these|those|them)\b/i.test(current.normalizedQuery));
+  const dependent = isDependentFollowUp(current.normalizedQuery);
+  const shouldInherit = !broadensScope && !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 || dependent);
   const preserveTypeForTopicSwitch = /^what about\b/.test(current.normalizedQuery);
-  const topics = refinesScope && prior
-    ? [...new Set([...prior.topics, ...currentTopics])]
+  const comparison = /\b(?:better than|compare(?:d)? (?:to|with)|difference between|versus|\bvs\b|or .+\??$|do you mean .+ too)\b/i.test(current.normalizedQuery);
+  const correction = /^(?:i mean|i meant|no i mean|actually|sorry i mean|not .+? (?:but|instead) )\b/i.test(current.normalizedQuery);
+  const topics = (comparison || (refinesScope && !correction)) && priorSubject
+    ? [...new Set([...priorSubject.topics, ...currentTopics])]
     : currentTopics.length
     ? currentTopics
     : shouldInherit
-      ? prior?.topics ?? []
+      ? priorSubject?.topics ?? []
       : [];
   const entities = current.entities.length
     ? current.entities
     : shouldInherit
-      ? prior?.entities ?? []
+      ? priorSubject?.entities ?? []
       : [];
   const understanding = {
     ...current,
     topics,
     entities,
-    businessProblem: current.businessProblem ?? (shouldInherit ? prior?.businessProblem ?? null : null),
-    desiredOutcomes: current.desiredOutcomes.length
+    businessProblem: broadensScope ? null : current.businessProblem ?? (shouldInherit ? prior?.businessProblem ?? null : null),
+    desiredOutcomes: broadensScope ? [] : current.desiredOutcomes.length
       ? current.desiredOutcomes
       : shouldInherit
         ? prior?.desiredOutcomes ?? []
         : [],
-    domains: current.domains.length
+    domains: broadensScope ? [] : current.domains.length
       ? current.domains
       : shouldInherit
         ? prior?.domains ?? topics
         : topics,
-    technicalSignals: current.technicalSignals.length
+    technicalSignals: broadensScope ? [] : current.technicalSignals.length
       ? current.technicalSignals
       : shouldInherit
         ? prior?.technicalSignals ?? []
         : [],
-    industry: current.industry ?? (shouldInherit ? prior?.industry ?? null : null),
+    industry: broadensScope ? null : current.industry ?? (shouldInherit ? priorSubject?.industry ?? null : null),
     existingPlatform:
-      current.existingPlatform ??
+      broadensScope ? null : current.existingPlatform ??
       (shouldInherit ? prior?.existingPlatform ?? null : null),
     requestedContentType:
       current.requestedContentType ??
       (shouldInherit || continuesScope || refinesScope || preserveTypeForTopicSwitch
         ? prior?.requestedContentType ?? null
         : null),
-    retrievalConcepts: current.retrievalConcepts.length
+    retrievalConcepts: broadensScope ? [] : current.retrievalConcepts.length
       ? current.retrievalConcepts
       : shouldInherit
         ? prior?.retrievalConcepts ?? topics
         : topics,
+    constraints: broadensScope ? [] : current.constraints,
   };
   return {
     understanding,
@@ -435,7 +482,7 @@ export function resolveConversationUnderstanding(
       businessProblem: understanding.businessProblem,
       lastExplicitTopicTurn: current.topics.length ? priorUsers.length : lastExplicitTopicTurn,
       lastIntent: understanding.intent,
-      previousTopics: prior?.topics ?? [],
+      previousTopics: priorSubject?.topics ?? [],
       activeProduct: /\bkagen\b/.test(understanding.normalizedQuery) ? topics.join(" ") || null : null,
       activePartner: understanding.requestedContentType === "partner" ? topics.join(" ") || null : null,
     },
@@ -447,7 +494,7 @@ export function applyStructuralBroadQueryRules(
   message: string,
 ): QueryUnderstanding {
   const normalized = normalizeSearchText(message);
-  if (/^(?:what services do you provide|what do you specialize in|what do you specialise in|what are your capabilities|how can successive help (?:our|my|a) business)$/.test(normalized)) {
+  if (/^(?:what services (?:do you|does successive) (?:provide|offer)|which services (?:do you|does successive) (?:provide|offer)|what do you specialize in|what do you specialise in|what are your capabilities|how can successive help (?:our|my|a) business)$/.test(normalized)) {
     return {
       ...understanding,
       intent: "discovery",
@@ -462,7 +509,7 @@ export function applyStructuralBroadQueryRules(
       confidence: Math.max(understanding.confidence, 0.95),
     };
   }
-  if (/^(?:industries focus|industry focus|what industries|which industries|list industries|show all industries|show (?:me )?(?:successive )?industries|explore (?:successive )?industries|industries)$/.test(normalized)) {
+  if (/^(?:industries focus|industry focus|what industries(?: (?:do|does) (?:you|successive) serve)?|which industries(?: (?:do|does) (?:you|successive) serve)?|which sectors do (?:you|successive) work in|list industries|show all industries|show (?:me )?(?:successive )?industries|explore (?:successive )?industries|industries)$/.test(normalized)) {
     return {
       ...understanding,
       intent: "discovery",
@@ -507,6 +554,9 @@ export function isExplicitListRequest(message: string): boolean {
     /\b(?:show|give|provide)\s+(?:me\s+)?(?:all|every|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+are\s+(?:all|the complete|the full)\b/.test(normalized) ||
     /\b(?:what|which)\s+(?:industries|categories|technologies|services|offerings)\b.*\b(?:serve|served|cover|covered|available|offer|offered|provide|provided|use|used)\b/.test(normalized) ||
+    /^(?:what|which)\s+(?:\w+\s+){0,2}(?:products?|accelerators?|awards?|recognitions?)\s+(?:are\s+)?available$/.test(normalized) ||
+    /^(?:show|give|provide)(?:\s+me)?\s+(?:the\s+)?available\s+(?:products?|accelerators?|awards?|recognitions?)$/.test(normalized) ||
+    /^(?:what|which)\s+(?:awards?|recognitions?)\s+(?:has|have|did)\b.*\b(?:receive|received|win|won|earn|earned)$/.test(normalized) ||
     /^(?:show (?:me )?|explore )(?:successive )?industries$/.test(normalized) ||
     /^(?:all|every)\s+\S+/.test(normalized)
   );
@@ -516,4 +566,16 @@ export function isDeterministicallyOffTopic(message: string): boolean {
   const normalized = normalizeSearchText(message);
   return (/(?:\b(?:weather|forecast|movie|film|poem|song|joke|capital of|president of|prime minister|sports? score|recipe|horoscope|sorting code)\b|\b(?:who won|score|result)\b.*\b(?:match|game|football|cricket|basketball|tennis|hockey)\b)/.test(normalized)) &&
     !/\b(?:software|platform|application|app|technology|digital|data|ai|cloud|enterprise|business|operations)\b/.test(normalized);
+}
+
+export function shouldUseOffTopicFallback(
+  message: string,
+  understanding: QueryUnderstanding,
+  hasAuthoritativeExactIdentity: boolean,
+): boolean {
+  return !hasAuthoritativeExactIdentity && (
+    isDeterministicallyOffTopic(message) ||
+    understanding.isOffTopic ||
+    understanding.intent === "off_topic"
+  );
 }

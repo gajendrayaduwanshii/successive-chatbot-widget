@@ -27,8 +27,12 @@ import {
   isBroadAiServicesQuery,
   isUseCaseQuery,
   getIndexDiagnostics,
+  isExplicitRequestedRoleRelation,
+  extractExplicitInformationalSubject,
+  resolveExactIndexedTitle,
   retrieveFromIndex,
   cardEligibility,
+  selectSiblingEntityMatches,
   type SearchMatch,
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
@@ -38,8 +42,10 @@ import {
   careerJobSummary,
   careerJobUrl,
   careersPageUrl,
+  buildCareerFilterMessage,
   fetchActiveCareerJobs,
   filterCareerJobs,
+  resolveCareerJobReference,
   shouldUseCareerOpeningRoute,
 } from "@/lib/careers-api";
 import {
@@ -54,15 +60,19 @@ import {
   resolveUnsupportedAlternativeFollowUp,
   rejectsPendingAlternative,
   resolveStructuredFollowUpMessage,
+  buildStructuredConversationState,
+  isAmbiguousResultSetReference,
+  continuesOffTopicContext,
 } from "@/lib/conversation-context";
 import {
   buildDeterministicUnderstanding,
   resolveConversationUnderstanding,
-  isDeterministicallyOffTopic,
+  shouldUseOffTopicFallback,
   applyStructuralBroadQueryRules,
   shouldUseSemanticUnderstanding,
   buildRetrievalQuery,
   isExplicitListRequest,
+  isDependentFollowUp,
   classifyFollowUpScope,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
@@ -74,12 +84,17 @@ import {
   clientOverviewFallback,
   extractPublishedClientTotal,
   extractTrustedOrganizations,
+  understandStructuredRequest,
   understandContextualStructuredRequest,
+  requestedCompanyFactLabel,
+  classifyUnsupportedCompanyInformation,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
-import { recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
-import { alignedCta, selectAlignedSecondaryMatches } from "@/lib/response-alignment";
-import { buildCategoryNavigationActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, buildFollowUpQueryActions, classifySuggestionContext, resolveEligibleActionDocuments, resolveSuggestionAction, type SuggestionContextType } from "@/lib/suggestion-actions";
+import { answerAddressesRequestedAttribute, recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
+import { alignedCta, anchorExactSubjectMatches, documentContentType, ensureRequestedRoleFraming, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches } from "@/lib/response-alignment";
+import { buildCategoryNavigationActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, buildFollowUpQueryActions, classifySuggestionContext, documentActionKey, noRelatedContentMessage, parseRelatedContentRequest, resolveEligibleActionDocuments, resolveSuggestionAction, type LeadershipSuggestionContext, type SuggestionContextType } from "@/lib/suggestion-actions";
+import { commercialAnswer, commercialSubject, commercialSubjectFromAnswer, contactUsCta, detectCommercialIntent, detectCommercialIntents, hasExplicitGenericProjectSubject, isCommerciallyPriceableContext, isDependentCommercialSubjectQuery } from "@/lib/commercial-intent";
+import { buildContactableFallbackAnswer, selectContactableFallback, type ContactableFallback } from "@/lib/contactable-fallback";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -143,18 +158,19 @@ const error = (
 
 let suggestionCorpusCache: { loadedAt: number; documents: SuccessiveSearchDocument[] } | undefined;
 async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]> {
-  if (suggestionCorpusCache && Date.now() - suggestionCorpusCache.loadedAt < 5 * 60_000)
+  if (suggestionCorpusCache && Date.now() - suggestionCorpusCache.loadedAt < 60 * 60_000)
     return suggestionCorpusCache.documents;
   const documents = buildSearchIndex(await fetchAllPublishedContent());
   suggestionCorpusCache = { loadedAt: Date.now(), documents };
   return documents;
 }
 
-async function buildResolvedNavigationActions({ document, subject, contextType, excludedResultKeys = [] }: {
+async function buildResolvedNavigationActions({ document, subject, contextType, excludedResultKeys = [], leadershipContext }: {
   document: SuccessiveSearchDocument;
   subject?: string;
   contextType: Exclude<SuggestionContextType, "TOPIC_CONTEXT" | "OTHER_CONTEXT">;
   excludedResultKeys?: string[];
+  leadershipContext?: LeadershipSuggestionContext;
 }) {
   const corpus = await getSuggestionCorpus();
   const source = corpus.find((candidate) => candidate.id === document.id && candidate.type === document.type) ??
@@ -162,7 +178,7 @@ async function buildResolvedNavigationActions({ document, subject, contextType, 
   return contextType === "CATEGORY_LISTING_CONTEXT"
     ? buildCategoryNavigationActions({ source, corpus, excludedResultKeys, limit: 3 })
     : buildIndividualPageNavigationActions({ source, corpus, userSubject: subject ?? source.title,
-        excludedResultKeys, limit: 3 });
+        leadershipContext, excludedResultKeys, limit: 3 });
 }
 
 async function fetchStructuredItems(request: StructuredRequest) {
@@ -297,18 +313,79 @@ export async function POST(request: NextRequest) {
     !parsed.data.suggestionAction.topic
     ? groundedTitleFromHistory ?? parsed.data.seenContent.at(-1)?.title
     : undefined;
+  let inferredRelatedAction;
+  const textOnlyRelatedRequest = parsed.data.suggestionAction
+    ? null : parseRelatedContentRequest(preparedQuery.englishQuery);
+  if (textOnlyRelatedRequest) {
+    const state = buildStructuredConversationState(parsed.data.history.slice(-8));
+    const priorResource = state.lastPresentedResources[0];
+    const subject = state.activeTopic ?? priorResource?.title ?? null;
+    if (subject && priorResource) {
+      try {
+        const corpus = await getSuggestionCorpus();
+        const source = corpus.find((document) =>
+          document.url.replace(/\/$/, "") === priorResource.url.replace(/\/$/, ""));
+        if (source) {
+          inferredRelatedAction = buildGlobalRelatedContentActions({
+            source, corpus, userSubject: subject, limit: 20,
+          }).find((action) => textOnlyRelatedRequest.requestedRoles.includes(
+            action.targetContentType as typeof source.role,
+          ));
+        }
+      } catch {
+        // The safe response below owns unavailable or changed related content.
+      }
+    }
+    if (!inferredRelatedAction) {
+      return NextResponse.json({ success: true, data: {
+        answer: subject
+          ? "I couldn’t find clearly supported related content of that type for the previous subject."
+          : "Which subject should the related content be about? Please name the service, capability, product, or entity.",
+        cards: [], sources: [], suggestions: [], suggestionActions: [],
+        confidence: "low", insufficientContext: true,
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    }
+  }
   const resolvedSuggestionAction = parsed.data.suggestionAction
     ? { ...parsed.data.suggestionAction, topic: parsed.data.suggestionAction.topic ?? legacyActionTopic }
-    : undefined;
+    : inferredRelatedAction;
   const actionMessage = resolveSuggestionAction(resolvedSuggestionAction);
-  const effectiveMessage = actionMessage ?? resolveUnsupportedAlternativeFollowUp(
+  const explicitTurnUnderstanding = buildDeterministicUnderstanding(preparedQuery.englishQuery);
+  const effectiveMessage = actionMessage ?? (explicitTurnUnderstanding.requestedContentType || detectCommercialIntent(preparedQuery.englishQuery)
+    ? preparedQuery.englishQuery
+    : resolveUnsupportedAlternativeFollowUp(
     preparedQuery.englishQuery,
     parsed.data.history,
   ) ?? resolveOfferedResourceFollowUp(
     preparedQuery.englishQuery,
     parsed.data.history,
   ) ?? resolveStructuredFollowUpMessage(preparedQuery.englishQuery, parsed.data.history)
-    ?? preparedQuery.englishQuery;
+    ?? preparedQuery.englishQuery);
+  // The raw current query owns an explicit informational subject. Contextual
+  // rewrites are only a fallback for dependent/action turns; they must not
+  // replace a resolvable standalone entity before fact/no-content routing.
+  const currentExplicitSubject = actionMessage
+    ? undefined : extractExplicitInformationalSubject(preparedQuery.englishQuery);
+  const currentQueryTitleLock = currentExplicitSubject
+    ? await resolveExactIndexedTitle(preparedQuery.englishQuery) : undefined;
+  const exactTitleLock = currentQueryTitleLock ??
+    (normalizeSearchText(effectiveMessage) !== normalizeSearchText(preparedQuery.englishQuery)
+      ? await resolveExactIndexedTitle(effectiveMessage) : undefined);
+  if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
+      !detectCommercialIntent(preparedQuery.englishQuery) &&
+      !isExplicitRequestedRoleRelation(preparedQuery.englishQuery) &&
+      !understandStructuredRequest(preparedQuery.englishQuery) &&
+      extractQueryFacets(preparedQuery.englishQuery).length < 2 &&
+      isDependentFollowUp(preparedQuery.englishQuery)) {
+    const role = explicitTurnUnderstanding.requestedContentType?.replace("-", " ");
+    const answer = role
+      ? `Which ${role} subject would you like to explore?`
+      : "What would you like to know more about? Please name the service, product, technology, industry, or item.";
+    return NextResponse.json({ success: true, data: {
+      answer, cards: [], sources: [], suggestions: [], suggestionActions: [],
+      confidence: "high", insufficientContext: true,
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
   const followUpActions = (labels: string[], topic?: string) => {
     const excluded = new Set([
       normalizeSearchText(effectiveMessage),
@@ -316,23 +393,244 @@ export async function POST(request: NextRequest) {
     ].filter(Boolean));
     return buildFollowUpQueryActions(labels.filter((label) => !excluded.has(normalizeSearchText(label))), 3, topic);
   };
+  const groundedFacetSuggestionActions = async (
+    facets: Array<{ document: SuccessiveSearchDocument; subject?: string | null }>,
+  ) => {
+    const excludedResultKeys = facets.map(({ document }) => documentActionKey(document));
+    // A single suggestion strip follows the latest successfully grounded
+    // facet; earlier facets must not consume its limited action slots.
+    const activeFacet = facets.at(-1);
+    if (!activeFacet) return [];
+    const canonicalSubject = activeFacet.subject || activeFacet.document.title;
+    const individualActions = await buildResolvedNavigationActions({
+      document: activeFacet.document,
+      subject: canonicalSubject,
+      contextType: "INDIVIDUAL_PAGE_CONTEXT",
+      excludedResultKeys,
+    });
+    const corpus = await getSuggestionCorpus();
+    const source = corpus.find((candidate) => documentActionKey(candidate) === documentActionKey(activeFacet.document)) ??
+      activeFacet.document;
+    const selectedResultKeys = new Set(individualActions.flatMap((action) => action.resultKeys ?? []));
+    const availableCorpus = corpus.filter((candidate) =>
+      documentActionKey(candidate) === documentActionKey(source) ||
+      (!excludedResultKeys.includes(documentActionKey(candidate)) && !selectedResultKeys.has(documentActionKey(candidate))));
+    const topicActions = individualActions.length < 3 ? buildGlobalRelatedContentActions({
+      source,
+      corpus: availableCorpus,
+      userSubject: canonicalSubject,
+      limit: 3 - individualActions.length,
+    }) : [];
+    return [...individualActions, ...topicActions].filter((action, index, all) =>
+      all.findIndex((candidate) => candidate.id === action.id) === index).slice(0, 3);
+  };
+  const isDependentFacetAction = (text: string) =>
+    /^(?:(?:then|also)\s+)?(?:give|show|find|tell)\b.*\b(?:related|example|case stud(?:y|ies)|services?|articles?|resources?)\b|\b(?:that|this|those|these|them|same|latest one|first one|second one)\b/i.test(text);
+  const contactableFallbackResponse = async (decision: ContactableFallback) => {
+    try {
+      const item = (await fetchSuccessive("/pages/contact"))[0];
+      if (!item) return null;
+      const document = buildSearchDocument(item);
+      if (!document.url) return null;
+      const suggestions = buildRelatedSuggestions("general");
+      return NextResponse.json({ success: true, data: {
+        answer: buildContactableFallbackAnswer(decision, document.url),
+        cards: [{ type: "page" as const, title: document.title,
+          description: document.descriptions[0] ?? "Contact Successive to discuss your requirements.",
+          url: document.url, image: document.image, badge: "page" }],
+        sources: [{ title: document.title, url: document.url }],
+        suggestions,
+        suggestionActions: followUpActions(suggestions, decision.subject ?? undefined),
+        confidence: "high", insufficientContext: true,
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    } catch {
+      // If the official page cannot be validated, retain the existing honest
+      // no-content response rather than manufacturing a Contact Us action.
+      return null;
+    }
+  };
+  const classifyContactableNoContent = (understanding: QueryUnderstanding) =>
+    selectContactableFallback(
+      effectiveMessage,
+      understanding,
+      "NO_VALID_CONTENT",
+      buildStructuredConversationState(parsed.data.history.slice(-8)).activeTopic,
+    );
 
-  if (parsed.data.suggestionAction?.intent === "CONTENT_DISCOVERY" && parsed.data.suggestionAction.resultKeys?.length) {
+  const currentFacets = extractQueryFacets(effectiveMessage);
+  if (currentFacets.length > 1) {
+    const facetRequests = currentFacets.map(({ text }, index) => {
+      const structured = understandStructuredRequest(text);
+      const unsupported = classifyUnsupportedCompanyInformation(text);
+      const roleOfPriorPerson = index > 0 && /\b(?:his|her|their|the person(?:'s)?)\s+role\b/i.test(text) &&
+        ["person", "leadership", "executives"].includes(understandStructuredRequest(currentFacets[0]!.text)?.attribute ?? "");
+      return { text, structured, unsupported, roleOfPriorPerson };
+    });
+    if (facetRequests.every((facet) => facet.structured || facet.unsupported || facet.roleOfPriorPerson)) {
+      try {
+        const structuredAnswers = await Promise.all(facetRequests.map(async ({ structured }) =>
+          structured ? answerStructuredRequest(await fetchStructuredItems(structured), structured) : null));
+        const answers = structuredAnswers.filter((answer): answer is NonNullable<typeof answer> => Boolean(answer));
+        const unsupported = facetRequests.filter(({ unsupported }) => unsupported && unsupported !== "company_type");
+        const unsupportedLines = unsupported.map(({ text }) =>
+          `I couldn’t find a publicly confirmed **${requestedCompanyFactLabel(text)}** for Successive Digital in the available published content.`);
+        const documents = answers.map(({ document }) => document).filter((document, index, all) =>
+          all.findIndex((candidate) => candidate.id === document.id && candidate.type === document.type) === index);
+        if (unsupported.some(({ unsupported: kind }) => kind === "financial_metrics")) {
+          const contactItem = (await fetchSuccessive("/pages/contact"))[0];
+          if (contactItem) {
+            const contact = buildSearchDocument(contactItem);
+            documents.push(contact);
+            unsupportedLines.push(`For the most accurate and up-to-date information, please contact the Successive team through the official [Contact Us](${contact.url}) page.`);
+          }
+        }
+        const unresolvedStructuredFacet = structuredAnswers.some((answer, index) =>
+          Boolean(facetRequests[index]?.structured) && !answer && !facetRequests[index]?.roleOfPriorPerson);
+        if (!unresolvedStructuredFacet) return NextResponse.json({ success: true, data: {
+          answer: [...answers.map(({ answer }) => answer), ...unsupportedLines].join("\n\n"),
+          cards: documents.map((document) => ({ type: "page" as const, title: document.title,
+            description: (document.descriptions[0] ?? document.textSegments[0] ?? document.title).slice(0, 500),
+            url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
+          sources: documents.map(({ title, url }) => ({ title, url })),
+          suggestions: [], suggestionActions: [], confidence: "high",
+          insufficientContext: unsupported.length > 0,
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      } catch {
+        // Continue through the shared route when a structured source is unavailable.
+      }
+    }
+  }
+
+  if (currentFacets.length > 1 && !detectCommercialIntent(effectiveMessage)) {
+    const parts: Array<{ answer: string; documents: SuccessiveSearchDocument[]; understanding: QueryUnderstanding;
+      subject?: string | null; structured?: StructuredRequest }> = [];
+    for (const facet of currentFacets) {
+      const priorPart = parts.at(-1);
+      const inheritedCollectionOperation = /\b(?:latest|newest|most recent)\s+(?:one|item|entry|record)?\b/i.test(facet.text) &&
+        priorPart?.structured ? { ...priorPart.structured, mode: "latest" as const,
+          normalizedQuery: normalizeSearchText(facet.text) } : undefined;
+      const structured = understandStructuredRequest(facet.text) ?? inheritedCollectionOperation;
+      if (structured) {
+        const resolved = answerStructuredRequest(await fetchStructuredItems(structured), structured);
+        if (resolved) {
+          parts.push({ answer: resolved.answer, documents: [resolved.document], understanding: facet.understanding,
+            subject: structured.subject || resolved.document.title, structured });
+          continue;
+        }
+      }
+      const prior = parts.at(-1)?.understanding;
+      const dependent = isDependentFollowUp(facet.text) || isDependentFacetAction(facet.text);
+      const relationAction = isDependentFacetAction(facet.text);
+      const facetUnderstanding: QueryUnderstanding = {
+        ...facet.understanding,
+        topics: relationAction ? prior?.topics ?? [] : facet.understanding.topics.length ? facet.understanding.topics : dependent ? prior?.topics ?? [] : [],
+        entities: relationAction ? prior?.entities ?? [] : facet.understanding.entities.length ? facet.understanding.entities : dependent ? prior?.entities ?? [] : [],
+        industry: facet.understanding.industry ?? (dependent ? prior?.industry ?? null : null),
+        retrievalConcepts: facet.understanding.retrievalConcepts.length
+          ? facet.understanding.retrievalConcepts : dependent ? prior?.retrievalConcepts ?? [] : [],
+      };
+      const exact = await resolveExactIndexedTitle(facet.text);
+      if (exact) {
+        parts.push({ answer: buildGroundedRetrievalAnswer([exact]), documents: [exact.document], understanding: facetUnderstanding,
+          subject: exact.document.title });
+        continue;
+      }
+      const facetQuery = buildRetrievalQuery(facetUnderstanding) || facet.text;
+      const retrieved = await retrieveFromIndex(facetQuery, detectIntent(facet.text), facet.text, new Set(), facetUnderstanding);
+      const explicitSubjectPool = [...retrieved.matches, ...(retrieved.candidates ?? [])]
+        .filter((match, index, all) => all.findIndex((candidate) =>
+          candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
+      const validationMatches = facet.subject
+        ? anchorExactSubjectMatches(explicitSubjectPool, facetUnderstanding)
+        : retrieved.matches;
+      const validation = validateEvidence({ message: facet.text, contextMessage: facetQuery,
+        understanding: facetUnderstanding, matches: validationMatches, hasConversationSubject: dependent,
+        authoritativeSubject: facet.subject });
+      const aligned = anchorExactSubjectMatches(
+        selectFacetAlignedMatches({ matches: validation.accepted, understandings: [facetUnderstanding] }),
+        facetUnderstanding,
+      ).slice(0, 3);
+      parts.push({
+        answer: aligned.length ? buildGroundedRetrievalAnswer(aligned) : safeEvidenceResponse(validation),
+        documents: aligned.map(({ document }) => document), understanding: facetUnderstanding,
+        subject: aligned[0]?.document.title,
+      });
+    }
+    const composedParts = parts.filter((part, index, all) => {
+      const primary = part.documents[0];
+      return !primary || all.findIndex((candidate) => candidate.documents[0]?.id === primary.id &&
+        candidate.documents[0]?.type === primary.type) === index;
+    });
+    const documents = composedParts.flatMap(({ documents }) => documents).filter((document, index, all) =>
+      all.findIndex((candidate) => candidate.id === document.id && candidate.type === document.type) === index);
+    const suggestionActions = await groundedFacetSuggestionActions(composedParts.flatMap((part) =>
+      part.documents[0] ? [{ document: part.documents[0], subject: part.subject }] : []));
+    return NextResponse.json({ success: true, data: {
+      answer: composedParts.map(({ answer }) => answer).filter(Boolean).join("\n\n"),
+      cards: documents.map((document) => ({ type: cardType(document.type), title: document.title,
+        description: document.descriptions[0] ?? document.textSegments[0] ?? document.title,
+        url: document.url, image: document.image, badge: document.role.replace(/_/g, " ") })),
+      sources: documents.map(({ title, url }) => ({ title, url })),
+      suggestions: suggestionActions.map(({ label }) => label), suggestionActions, confidence: "high",
+      insufficientContext: composedParts.some(({ documents: evidence }) => evidence.length === 0),
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
+
+  if (!exactTitleLock && continuesOffTopicContext(preparedQuery.englishQuery, parsed.data.history)) {
+    return NextResponse.json({ success: true, data: {
+      answer: "I'm here to help with Successive Digital's services, capabilities, industries, case studies, resources, and related business technology questions.",
+      cards: [], sources: [], suggestions: [], suggestionActions: [],
+      confidence: "high", insufficientContext: true,
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
+
+  const unsupportedCompanyInformation = exactTitleLock
+    ? null
+    : classifyUnsupportedCompanyInformation(effectiveMessage);
+  if (unsupportedCompanyInformation && unsupportedCompanyInformation !== "company_type") {
+    if (unsupportedCompanyInformation === "financial_metrics") {
+      const label = requestedCompanyFactLabel(effectiveMessage);
+      const decision: ContactableFallback = { kind: "company_fact", subject: label };
+      const response = await contactableFallbackResponse(decision);
+      if (response) return response;
+    }
+    const answer = unsupportedCompanyInformation === "operational_hours"
+      ? "The available published Successive content does not confirm current office hours or weekend availability. Please use the official Contact Us page for current operational information."
+      : unsupportedCompanyInformation === "financial_metrics"
+        ? `I couldn’t find a publicly confirmed ${requestedCompanyFactLabel(effectiveMessage)} for Successive Digital in the available published content.`
+        : unsupportedCompanyInformation === "industry_superlative"
+          ? "Successive publishes work across multiple industries, but the available content does not establish a single largest or primary industry focus."
+          : "Successive’s published content describes it as a digital transformation company delivering digital engineering services and solutions; it does not support reducing the company to an unqualified product-versus-services binary.";
+    return NextResponse.json({ success: true, data: {
+      answer, cards: [], sources: [], suggestions: [], suggestionActions: [],
+      confidence: "high", insufficientContext: true,
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
+
+  if (!exactTitleLock && isAmbiguousResultSetReference(preparedQuery.englishQuery, parsed.data.history)) {
+    return NextResponse.json({ success: true, data: {
+      answer: "Which item do you mean? You can name it or say the first, second, or third result.",
+      cards: [], sources: [], suggestions: [], suggestionActions: [],
+      confidence: "high", insufficientContext: true,
+    }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+  }
+
+  if (resolvedSuggestionAction?.intent === "CONTENT_DISCOVERY" && resolvedSuggestionAction.resultKeys?.length) {
     try {
       const documents = await getSuggestionCorpus();
-      const eligible = resolveEligibleActionDocuments(parsed.data.suggestionAction, documents);
+      const eligible = resolveEligibleActionDocuments(resolvedSuggestionAction, documents);
       if (eligible.length) {
         const presented = eligible.slice(0, 3);
-        const nextActions = parsed.data.suggestionAction.contextType === "INDIVIDUAL_PAGE_CONTEXT"
+        const nextActions = resolvedSuggestionAction.contextType === "INDIVIDUAL_PAGE_CONTEXT"
           ? buildIndividualPageNavigationActions({ source: presented[0]!, corpus: documents,
-              userSubject: parsed.data.suggestionAction.subject ?? parsed.data.suggestionAction.topic,
-              excludedResultKeys: [parsed.data.suggestionAction.sourceContext ?? ""], limit: 3 })
-          : parsed.data.suggestionAction.contextType === "CATEGORY_LISTING_CONTEXT"
+              userSubject: resolvedSuggestionAction.subject ?? resolvedSuggestionAction.topic,
+              excludedResultKeys: [resolvedSuggestionAction.sourceContext ?? ""], limit: 3 })
+          : resolvedSuggestionAction.contextType === "CATEGORY_LISTING_CONTEXT"
             ? buildCategoryNavigationActions({ source: presented[0]!, corpus: documents,
-                excludedResultKeys: [parsed.data.suggestionAction.sourceContext ?? ""], limit: 3 })
+                excludedResultKeys: [resolvedSuggestionAction.sourceContext ?? ""], limit: 3 })
           : buildGlobalRelatedContentActions({ source: presented[0]!, corpus: documents,
-              userSubject: parsed.data.suggestionAction.subject ?? parsed.data.suggestionAction.topic ?? presented[0]!.title,
-              recentActionIds: [parsed.data.suggestionAction.id], limit: 3 });
+              userSubject: resolvedSuggestionAction.subject ?? resolvedSuggestionAction.topic ?? presented[0]!.title,
+              recentActionIds: [resolvedSuggestionAction.id], limit: 3 });
         const answer = presented.map((document) => {
           const details = [...new Set([...document.descriptions, ...document.textSegments])]
             .filter((value) => normalizeSearchText(value) !== document.normalizedTitle)
@@ -353,7 +651,9 @@ export async function POST(request: NextRequest) {
       // A changed/unavailable corpus must never fall through to raw label search.
     }
     return NextResponse.json({ success: true, data: {
-      answer: "That published item is no longer available in the current Successive content collection.",
+      answer: resolvedSuggestionAction.relation === "RELATED_TO_SOURCE"
+        ? noRelatedContentMessage(resolvedSuggestionAction)
+        : "That published item is no longer available in the current Successive content collection.",
       cards: [], sources: [], suggestions: [], suggestionActions: [], confidence: "low", insufficientContext: true,
     }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
   }
@@ -472,7 +772,8 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  if (/\b(?:client|customer|partner|work did|did you do|tell me about)\b/i.test(effectiveMessage)) {
+  if (!exactTitleLock && !detectCommercialIntent(effectiveMessage) &&
+      /\b(?:client|customer|partner|work did|did you do|tell me about)\b/i.test(effectiveMessage)) {
     try {
       const items = await fetchAllPublishedContent();
       const trusted = extractTrustedOrganizations(items);
@@ -530,7 +831,12 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const unsupportedAnswer = safeUnsupportedQueryResponse(effectiveMessage);
+  // Strong sales requests must reach the commercial route before private-price
+  // evidence safeguards; the commercial route already refuses invented prices
+  // and attaches only the validated Contact Us destination.
+  const unsupportedAnswer = exactTitleLock || detectCommercialIntent(effectiveMessage)
+    ? null
+    : safeUnsupportedQueryResponse(effectiveMessage);
   if (unsupportedAnswer) {
     return NextResponse.json({
       success: true,
@@ -577,7 +883,7 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
-  if (/\b(?:free trials?|trial availability|free demos?|demo availability|hourly rates?|discounts?)\b/i.test(effectiveMessage)) {
+  if (/\b(?:hourly rates?|discounts?)\b/i.test(effectiveMessage)) {
     return NextResponse.json(
       {
         success: true,
@@ -613,10 +919,60 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
-  const structuredRequest = understandContextualStructuredRequest(
+  const deterministicUnderstanding = actionMessage
+    ? buildDeterministicUnderstanding(effectiveMessage)
+    : explicitTurnUnderstanding;
+  const compoundFacets = exactTitleLock || detectCommercialIntent(effectiveMessage)
+    ? [] : extractQueryFacets(effectiveMessage);
+  const compoundStructuredRequests = compoundFacets.length > 1
+    ? compoundFacets.map(({ text }) => understandStructuredRequest(text))
+    : [];
+  if (compoundStructuredRequests.length > 1 && compoundStructuredRequests.every(Boolean)) {
+    try {
+      const answers = await Promise.all(compoundStructuredRequests.map(async (part) =>
+        part ? answerStructuredRequest(await fetchStructuredItems(part), part) : null));
+      if (answers.every(Boolean)) {
+        const supported = answers.filter((answer): answer is NonNullable<typeof answer> => Boolean(answer));
+        const documents = supported.map(({ document }) => document).filter((document, index, all) =>
+          all.findIndex((candidate) => candidate.id === document.id && candidate.type === document.type) === index);
+        return NextResponse.json({ success: true, data: {
+          answer: supported.map(({ answer }) => answer).join("\n\n"),
+          cards: documents.map((document) => ({
+            type: "page" as const, title: document.title,
+            description: (document.descriptions[0] ?? document.textSegments[0] ?? document.title).slice(0, 500),
+            url: document.url, image: document.image, badge: document.role.replace(/_/g, " "),
+          })),
+          sources: documents.map(({ title, url }) => ({ title, url })),
+          suggestions: [], suggestionActions: [], confidence: "high",
+          insufficientContext: supported.some(({ evidencePaths }) => evidencePaths.length === 0),
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      // Continue to the normal evidence pipeline if a structured source is unavailable.
+    }
+  }
+  // An explicit content-role request owns the turn. Do not let an incidental
+  // structured fact in the previous answer (for example a board press release)
+  // convert an "other products" request into leadership lookup.
+  const directStructuredRequest = understandContextualStructuredRequest(
     effectiveMessage,
     parsed.data.history.slice(-8),
   );
+  const structuredAttributeOwnsTurn = ["technologies", "capabilities"].includes(directStructuredRequest?.attribute ?? "");
+  // A bare recognized person role (for example, "ceo") can also resemble an
+  // indexed alias. Its explicit structured role is stronger than that title
+  // lock and must use the same path as the sentence-form role query.
+  const structuredPersonRoleOwnsTurn = Boolean(directStructuredRequest?.requestedRole);
+  const structuredRequest = detectCommercialIntent(effectiveMessage) ||
+    currentFacets.length > 1 ||
+    // A catalog-like word embedded in an exact resource title is title text,
+    // not an instruction to replace that resource with a company catalog.
+    // Structured person-role requests retain their dedicated authoritative path.
+    (exactTitleLock && !structuredPersonRoleOwnsTurn) ? null : ["product", "kagen-product", "service", "sub-service", "solution", "case-study", "blog", "whitepaper", "ebook", "webinar", "event", "press-release", "media-coverage", "news", "accelerator", "partner", "career"]
+    .includes(deterministicUnderstanding.requestedContentType ?? "")
+      && !structuredAttributeOwnsTurn
+    ? null
+    : directStructuredRequest;
   if (structuredRequest) {
     try {
       const structuredAnswer = answerStructuredRequest(
@@ -626,9 +982,25 @@ export async function POST(request: NextRequest) {
       if (structuredAnswer) {
         const { document } = structuredAnswer;
         const suppressUnsupportedCard = structuredAnswer.evidencePaths.length === 0;
+        const leadershipContext = ["person", "leadership", "executives", "board"].includes(structuredRequest.attribute)
+          ? {
+              relation: (structuredRequest.attribute === "person" ? "leadership" : structuredRequest.attribute) as LeadershipSuggestionContext["relation"],
+              requestedRole: structuredRequest.requestedRole,
+              resolvedPerson: structuredRequest.requestedRole || structuredRequest.attribute === "person"
+                ? structuredAnswer.answer.match(/\*\*([^*]+)\*\*/)?.[1]
+                : undefined,
+              publishedRole: structuredRequest.attribute === "person"
+                ? [...structuredAnswer.answer.matchAll(/\*\*([^*]+)\*\*/g)][1]?.[1]
+                : undefined,
+              teamRelation: structuredRequest.attribute === "person"
+                ? structuredAnswer.answer.match(/\bin Successive(?: Digital)?['’]s (.+?) section\b/i)?.[1]
+                : undefined,
+            }
+          : undefined;
         const suggestionActions = suppressUnsupportedCard ? [] : await buildResolvedNavigationActions({
           document, subject: structuredRequest.subject || effectiveMessage,
           contextType: "INDIVIDUAL_PAGE_CONTEXT",
+          leadershipContext,
         });
         return NextResponse.json(
           {
@@ -670,8 +1042,6 @@ export async function POST(request: NextRequest) {
       // temporarily incomplete; no static company fact is used as fallback.
     }
   }
-  const deterministicUnderstanding =
-    buildDeterministicUnderstanding(effectiveMessage);
   const hasExplicitCurrentSubject = deterministicUnderstanding.topics.length > 0 ||
     deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry);
   const deterministicWithContext = resolveConversationUnderstanding(
@@ -743,7 +1113,27 @@ export async function POST(request: NextRequest) {
     understanding,
     parsed.data.history.slice(-8),
   ).understanding, effectiveMessage);
-  const intent = detectIntent(effectiveMessage);
+  // Lock explicit indexed titles before generic intent routing. Words such as
+  // cost, investment, development, or services inside a title are identity,
+  // not commercial/navigation instructions.
+  if (exactTitleLock) {
+    understanding = {
+      ...understanding,
+      intent: "informational",
+      topics: [exactTitleLock.document.title],
+      entities: [exactTitleLock.document.title],
+      requestedContentType: documentContentType(exactTitleLock.document) as QueryUnderstanding["requestedContentType"],
+      answerMode: /\b(?:summarize|summarise|summary)\b/i.test(effectiveMessage) ? "summarize" : "explain",
+      targetScope: "entity",
+      isBroadQuery: false,
+      isFollowUp: false,
+      needsClarification: false,
+      clarificationQuestion: null,
+      confidence: 1,
+    };
+  }
+  const intent = exactTitleLock ? "general" : detectIntent(effectiveMessage);
+  const commercialIntent = exactTitleLock ? null : detectCommercialIntent(effectiveMessage);
   const isNamedSuccessivePersonQuery =
     understanding.targetScope === "company" && understanding.entities.length > 0;
   const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
@@ -769,11 +1159,7 @@ export async function POST(request: NextRequest) {
   const retrievalMessage = isVagueBusinessDiscovery(contextualQuery)
     ? "digital transformation digital engineering cloud data artificial intelligence experience design services"
     : contextualQuery;
-  if (
-    isDeterministicallyOffTopic(effectiveMessage) ||
-    understanding.isOffTopic ||
-    understanding.intent === "off_topic"
-  ) {
+  if (shouldUseOffTopicFallback(effectiveMessage, understanding, Boolean(exactTitleLock))) {
     return NextResponse.json(
       {
         success: true,
@@ -794,18 +1180,241 @@ export async function POST(request: NextRequest) {
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
   }
+  if (commercialIntent) {
+    const independentFacets = currentFacets.length > 1 ? currentFacets : [];
+    const commercialFacets = independentFacets.filter(({ text }) => detectCommercialIntent(text));
+    const informationalFacets = independentFacets.filter(({ text }) => !detectCommercialIntent(text));
+    const commercialMessage = commercialFacets.length
+      ? commercialFacets.map(({ text }) => text).join(" and ")
+      : effectiveMessage;
+    const commercialIntents = detectCommercialIntents(commercialMessage);
+    const canonicalContactUrl = `${getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "")}/contact/`;
+    const informationalParts = (await Promise.all(informationalFacets.map(async (facet) => {
+      const structured = understandStructuredRequest(facet.text);
+      if (structured) {
+        const answer = answerStructuredRequest(await fetchStructuredItems(structured), structured);
+        if (answer) return {
+          answer: answer.answer,
+          documents: [answer.document],
+          subject: structured.subject,
+          contentType: structured.requestedRole ? "leadership" : structured.attribute,
+          supported: answer.evidencePaths.length > 0,
+        };
+      }
+      const facetUnderstanding = facet.understanding;
+      const facetTitleLock = await resolveExactIndexedTitle(facet.text);
+      if (facetTitleLock) {
+        return {
+          answer: buildGroundedRetrievalAnswer([facetTitleLock]),
+          documents: [facetTitleLock.document],
+          subject: facetTitleLock.document.title,
+          contentType: documentContentType(facetTitleLock.document),
+          supported: true,
+        };
+      }
+      const facetQuery = buildRetrievalQuery(facetUnderstanding) || facet.text;
+      const result = await retrieveFromIndex(facetQuery, detectIntent(facet.text), facet.text, new Set<string>(), facetUnderstanding);
+      const literalResult = await retrieveFromIndex(facet.text, detectIntent(facet.text), facet.text, new Set<string>(), facetUnderstanding);
+      const strongest = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
+        const key = `${match.document.type}:${match.document.id}`;
+        const existing = best.get(key);
+        if (!existing || match.score > existing.score) best.set(key, match);
+        return best;
+      }, new Map<string, SearchMatch>()).values()].sort((left, right) => right.score - left.score);
+      const directMatches = strongest([...result.matches, ...literalResult.matches]).slice(0, 8);
+      const recoveryPool = strongest([...(result.candidates ?? []), ...(literalResult.candidates ?? [])]);
+      const fallbackCandidates = directMatches.length ? directMatches : recoverAuthoritativeEvidence({
+        candidates: recoveryPool, understanding: facetUnderstanding, relation: facet.relation,
+      });
+      const explicitSubjectPool = [...directMatches, ...recoveryPool]
+        .filter((match, index, all) => all.findIndex((candidate) =>
+          candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
+      const candidates = facet.subject
+        ? anchorExactSubjectMatches(explicitSubjectPool.length ? explicitSubjectPool : fallbackCandidates, facetUnderstanding)
+        : fallbackCandidates;
+      const validation = validateEvidence({
+        message: facet.text, contextMessage: facetQuery, understanding: facetUnderstanding,
+        matches: candidates, hasConversationSubject: false, authoritativeSubject: facet.subject,
+      });
+      const matches = validation.accepted.length ? validation.accepted : [];
+      const aligned = anchorExactSubjectMatches(
+        selectFacetAlignedMatches({ matches, understandings: [facetUnderstanding] }),
+        facetUnderstanding,
+      ).slice(0, 3);
+      const subject = facetUnderstanding.entities[0] ?? (facetUnderstanding.topics.join(" ") || null);
+      return aligned.length ? {
+        answer: buildGroundedRetrievalAnswer(aligned),
+        documents: aligned.map(({ document }) => document),
+        subject,
+        contentType: documentContentType(aligned[0]!.document),
+        supported: true,
+      } : {
+        answer: safeEvidenceResponse(validation), documents: [], subject,
+        contentType: facetUnderstanding.requestedContentType, supported: false,
+      };
+    }))).filter((part): part is NonNullable<typeof part> => Boolean(part));
+    // Commercial-only turns change intent, not subject ownership. Resolve the
+    // active subject from recent non-commercial turns so pricing -> estimate
+    // -> quote chains cannot replace a validated service with request words.
+    const subjectHistory = parsed.data.history.slice(-8).filter((item) =>
+      item.role === "assistant" || !detectCommercialIntent(item.content));
+    const state = buildStructuredConversationState(subjectHistory);
+    const stablePriorSubject = parsed.data.history.filter((item) => item.role === "user")
+      .slice().reverse().find((item) =>
+        !detectCommercialIntent(item.content) &&
+        !isDependentFollowUp(item.content),
+      );
+    const stablePriorUnderstanding = stablePriorSubject
+      ? buildDeterministicUnderstanding(stablePriorSubject.content) : null;
+    const stablePriorTopics = stablePriorUnderstanding?.topics.join(" ") || null;
+    const priorAnswerSubject = parsed.data.history.filter((item) => item.role === "assistant")
+      .slice().reverse().map((item) => commercialSubjectFromAnswer(item.content)).find(Boolean) ?? null;
+    const inheritedSubject = state.lastPresentedResources[0]?.title ?? stablePriorTopics ?? state.activeTopic ?? priorAnswerSubject;
+    const explicitSubject = commercialSubject(commercialMessage);
+    const explicitGenericProject = hasExplicitGenericProjectSubject(commercialMessage);
+    const inheritedContentType = state.activeContentType ?? stablePriorUnderstanding?.requestedContentType;
+    const mayInheritSubject = (
+      isDependentCommercialSubjectQuery(effectiveMessage) &&
+      isCommerciallyPriceableContext(inheritedSubject, inheritedContentType)
+    );
+    const siblingSubject = informationalParts.find((part) =>
+      part.supported && isCommerciallyPriceableContext(part.subject, part.contentType));
+    const subject = explicitSubject ?? (explicitGenericProject
+      ? null
+      : siblingSubject?.subject ?? (mayInheritSubject ? inheritedSubject : null));
+    const composedInformationalParts = informationalParts.filter((part, index, all) => {
+      const primary = part.documents[0];
+      return !primary || all.findIndex((candidate) => candidate.documents[0]?.id === primary.id &&
+        candidate.documents[0]?.type === primary.type) === index;
+    });
+    const informationalDocuments = composedInformationalParts.flatMap(({ documents }) => documents)
+      .filter((document, index, all) => all.findIndex((candidate) =>
+        candidate.id === document.id && candidate.type === document.type) === index);
+    const informationalAnswer = composedInformationalParts.map(({ answer }) => answer).filter(Boolean).join("\n\n");
+    const informationalSuggestionActions = await groundedFacetSuggestionActions(
+      composedInformationalParts.flatMap((part) =>
+        part.documents[0] ? [{ document: part.documents[0], subject: part.subject }] : []),
+    );
+    try {
+      const item = (await fetchSuccessive("/pages/contact"))[0];
+      if (!item) throw new Error("Contact page is unavailable");
+      const document = buildSearchDocument(item);
+      const evidence: NormalizedContent[] = [{
+        id: document.id, type: document.type, slug: document.slug, title: document.title,
+        excerpt: document.descriptions[0] ?? "", plainText: document.textSegments.join("\n\n"),
+        url: document.url, image: document.image, modified: document.modified,
+        acfText: "", extractedUrls: [], service_type: document.service_type,
+      }];
+      let answer = commercialAnswer(subject, document.url || canonicalContactUrl, commercialIntents);
+      try {
+        const generated = await getLLMProvider().generateCommercialResponse({
+          message: commercialMessage, subject, intents: commercialIntents,
+          history: parsed.data.history, evidence,
+        });
+        const unsafe = /[$£€]\s*\d|\b\d+(?:\.\d+)?\s*(?:usd|inr|dollars?|hours?|weeks?)\b|(?:will|has been) (?:call|contact|reach)/i.test(generated);
+        const preservesSubject = !subject || normalizeSearchText(generated).includes(normalizeSearchText(subject));
+        if (!unsafe && preservesSubject) answer = `${generated.replace(/\s*\[?Contact Us\]?\([^)]*\)|https?:\/\/\S+/gi, "").trim()}\n\n${contactUsCta(document.url || canonicalContactUrl)}`;
+      } catch { /* Preserve the intent-specific grounded fallback. */ }
+      const commercialActions = followUpActions(
+        ["Discuss my requirements", "Request a cost estimate"],
+        subject ?? undefined,
+      );
+      const actions = [...informationalSuggestionActions, ...commercialActions]
+        .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
+        .slice(0, 5);
+      return NextResponse.json({ success: true, data: {
+        answer: informationalAnswer ? `${informationalAnswer}\n\n${answer}` : answer,
+        cards: [...informationalDocuments.map((item) => ({ type: cardType(item.type), title: item.title,
+          description: item.descriptions[0] ?? item.textSegments[0] ?? item.title,
+          url: item.url, image: item.image, badge: item.role.replace(/_/g, " ") })), { type: "page" as const, title: document.title,
+          description: document.descriptions[0] ?? "Contact Successive to discuss your requirements.",
+          url: document.url || canonicalContactUrl, image: document.image, badge: "page" }],
+        sources: [...informationalDocuments.map(({ title, url }) => ({ title, url })),
+          { title: document.title, url: document.url || canonicalContactUrl }],
+        suggestions: actions.map((action) => action.label), suggestionActions: actions,
+        confidence: "high", insufficientContext: false,
+        ...(process.env.NODE_ENV !== "production" ? { diagnostics: {
+          route: "commercial", facetCount: currentFacets.length,
+          informationalFacetCount: informationalFacets.length,
+          informationalPartCount: informationalParts.length,
+        } } : {}),
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    } catch (commercialError) {
+      const commercialActions = followUpActions(["Discuss my requirements", "Request a cost estimate"], subject ?? undefined);
+      const actions = [...informationalSuggestionActions, ...commercialActions]
+        .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
+        .slice(0, 5);
+      return NextResponse.json({ success: true, data: {
+        answer: [informationalAnswer, commercialAnswer(subject, canonicalContactUrl, commercialIntents)].filter(Boolean).join("\n\n"),
+        cards: [...informationalDocuments.map((item) => ({ type: cardType(item.type), title: item.title,
+          description: item.descriptions[0] ?? item.textSegments[0] ?? item.title,
+          url: item.url, image: item.image, badge: item.role.replace(/_/g, " ") })),
+          { type: "page" as const, title: "Contact Us", description: "Contact Successive to discuss your requirements.", url: canonicalContactUrl, badge: "page" }],
+        sources: [...informationalDocuments.map(({ title, url }) => ({ title, url })),
+          { title: "Contact Us", url: canonicalContactUrl }],
+        suggestions: actions.map((action) => action.label), suggestionActions: actions,
+        confidence: "high", insufficientContext: false,
+        ...(process.env.NODE_ENV !== "production" ? { diagnostics: {
+          route: "commercial_fallback", facetCount: currentFacets.length,
+          informationalFacetCount: informationalFacets.length,
+          informationalPartCount: informationalParts.length,
+          error: commercialError instanceof Error ? commercialError.message : "unknown",
+        } } : {}),
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    }
+  }
+  const careerReference = resolveCareerJobReference(
+    preparedQuery.englishQuery,
+    parsed.data.history,
+  );
+  if (careerReference) {
+    try {
+      const jobs = await fetchActiveCareerJobs();
+      const job = jobs.find((candidate) => candidate.id === careerReference.id);
+      if (job) {
+        const skills = (job.skillNames ?? []).filter(Boolean);
+        const locations = [...new Set((job.jobLocations ?? [])
+          .map((location) => location.name ?? location.city).filter(Boolean))];
+        const details = [
+          `**${job.title}** is a current Successive opening.`,
+          job.experience ? `Experience: **${job.experience}**.` : "The feed does not publish a normalized experience range for this opening.",
+          locations.length ? `Location: **${locations.join(", ")}**.` : "The feed does not publish a normalized location for this opening.",
+          skills.length ? `Published skills: ${skills.join(", ")}.` : undefined,
+        ].filter(Boolean).join("\n\n");
+        return NextResponse.json({ success: true, data: {
+          answer: `${details}\n\n[View the current opening](${careerJobUrl(job)})`,
+          cards: [{ type: "page" as const, title: job.title, description: careerJobSummary(job),
+            url: careerJobUrl(job), badge: "job opening" }],
+          sources: [{ title: job.title, url: careerJobUrl(job) }],
+          suggestions: ["What skills are needed?", "Where is it based?", "Show all current openings"],
+          confidence: "high", insufficientContext: false,
+        }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+      }
+    } catch {
+      return error(503, "CAREERS_UNAVAILABLE", "Successive’s live openings are temporarily unavailable. Please try again shortly.", cors.headers);
+    }
+  }
   const followUpScope = classifyFollowUpScope(
     deterministicUnderstanding,
     effectiveMessage,
   );
-  if (shouldUseCareerOpeningRoute(
+  const hasCareerResultHistory = parsed.data.history.some((item) =>
+    item.role === "assistant" && /successivesoftware\.keka\.com\/careers\/jobdetails\//i.test(item.content));
+  const dependentCareerTurn = hasCareerResultHistory &&
+    /^(?:what about|how about|in|from|only|any|show all|what experience|what skills|where|tell me about (?:the )?(?:first|second|third|last|next|other))\b|^(?:in\s+)?[a-z][a-z .'-]{1,50}\s+only$/i.test(preparedQuery.englishQuery.trim());
+  if (dependentCareerTurn || (!exactTitleLock && shouldUseCareerOpeningRoute(
     effectiveMessage,
     understanding.requestedContentType,
     followUpScope,
-  )) {
+  ))) {
     try {
       const jobs = await fetchActiveCareerJobs();
-      const matches = filterCareerJobs(jobs, effectiveMessage);
+      const careerFilterMessage = buildCareerFilterMessage(
+        jobs,
+        preparedQuery.englishQuery,
+        parsed.data.history,
+      );
+      const matches = filterCareerJobs(jobs, careerFilterMessage);
       const asksForCount = /\b(?:how many|count|total|number of)\b/i.test(
         effectiveMessage,
       );
@@ -887,6 +1496,9 @@ export async function POST(request: NextRequest) {
       const requestedPublishedDetails = /\b(?:phone|telephone|email|e-mail|number)\b/i.test(
         effectiveMessage,
       );
+      const requestedLocations = /\b(?:office|location|address|headquarters|hq)s?\b/i.test(
+        effectiveMessage,
+      );
       const details = extractPublishedContactDetails(item.acf);
       const description =
         document.textSegments.find(
@@ -899,7 +1511,9 @@ export async function POST(request: NextRequest) {
         {
           success: true,
           data: {
-            answer: requestedPublishedDetails
+            answer: requestedLocations
+              ? buildPublishedLocationAnswer(document.url, details)
+              : requestedPublishedDetails
               ? buildPublishedContactAnswer(document.url, details)
               : buildContactAnswer(
                   preparedQuery.contactAnswer,
@@ -1248,13 +1862,14 @@ export async function POST(request: NextRequest) {
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       literalUnderstanding,
     );
-    const mergedBaseMatches = [...retrieval.matches, ...literalRetrieval.matches]
-      .filter((match, index, all) => all.findIndex((candidate) =>
-        candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index)
-      .slice(0, 8);
-    const mergedBaseCandidates = [...(retrieval.candidates ?? []), ...(literalRetrieval.candidates ?? [])]
-      .filter((match, index, all) => all.findIndex((candidate) =>
-        candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
+    const strongestByDocument = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
+      const key = `${match.document.type}:${match.document.id}`;
+      const existing = best.get(key);
+      if (!existing || match.score > existing.score) best.set(key, match);
+      return best;
+    }, new Map<string, SearchMatch>()).values()].sort((a, b) => b.score - a.score);
+    const mergedBaseMatches = strongestByDocument([...retrieval.matches, ...literalRetrieval.matches]).slice(0, 8);
+    const mergedBaseCandidates = strongestByDocument([...(retrieval.candidates ?? []), ...(literalRetrieval.candidates ?? [])]);
     retrieval = {
       ...retrieval,
       reliableMatchFound: mergedBaseMatches.length > 0,
@@ -1262,16 +1877,23 @@ export async function POST(request: NextRequest) {
       candidates: mergedBaseCandidates,
     };
     const facets = extractQueryFacets(effectiveMessage);
-    const facetResults = facets.length > 1
-      ? await Promise.all(facets.map(async (facet) => {
+    const facetResults: Array<{ facet: typeof facets[number]; understanding: QueryUnderstanding;
+      result: Awaited<ReturnType<typeof retrieveFromIndex>>; matches: SearchMatch[] }> = [];
+    if (facets.length > 1) {
+      for (const facet of facets) {
+          const priorFacetUnderstanding = facetResults.at(-1)?.understanding;
+          const dependentFacet = isDependentFollowUp(facet.text) || isDependentFacetAction(facet.text);
+          const relationAction = isDependentFacetAction(facet.text);
           const facetUnderstanding: QueryUnderstanding = {
             ...facet.understanding,
-            topics: facet.understanding.topics.length ? facet.understanding.topics : understanding.topics,
-            entities: facet.understanding.entities.length ? facet.understanding.entities : understanding.entities,
-            industry: facet.understanding.industry ?? understanding.industry,
+            topics: relationAction ? priorFacetUnderstanding?.topics ?? [] : facet.understanding.topics.length ? facet.understanding.topics
+              : dependentFacet ? priorFacetUnderstanding?.topics ?? [] : [],
+            entities: relationAction ? priorFacetUnderstanding?.entities ?? [] : facet.understanding.entities.length ? facet.understanding.entities
+              : dependentFacet ? priorFacetUnderstanding?.entities ?? [] : [],
+            industry: facet.understanding.industry ?? (dependentFacet ? priorFacetUnderstanding?.industry ?? null : null),
             retrievalConcepts: facet.understanding.retrievalConcepts.length
               ? facet.understanding.retrievalConcepts
-              : understanding.retrievalConcepts,
+              : dependentFacet ? priorFacetUnderstanding?.retrievalConcepts ?? [] : [],
           };
           const facetQuery = buildRetrievalQuery(facetUnderstanding) || facet.text;
           const result = await retrieveFromIndex(
@@ -1288,9 +1910,9 @@ export async function POST(request: NextRequest) {
                 understanding: facetUnderstanding,
                 relation: facet.relation,
               });
-          return { facet, understanding: facetUnderstanding, result, matches: recovered };
-        }))
-      : [];
+          facetResults.push({ facet, understanding: facetUnderstanding, result, matches: recovered });
+      }
+    }
     if (facetResults.length) {
       const merged = [...retrieval.matches, ...facetResults.flatMap((item) => item.matches)]
         .filter((match, index, all) => all.findIndex((candidate) => candidate.document.id === match.document.id) === index)
@@ -1330,6 +1952,11 @@ export async function POST(request: NextRequest) {
       }
       const requestedType = understanding.requestedContentType;
       const requestedTypeLabel = requestedType?.replace("-", " ");
+      const contactableFallback = classifyContactableNoContent(understanding);
+      if (contactableFallback) {
+        const response = await contactableFallbackResponse(contactableFallback);
+        if (response) return response;
+      }
       return NextResponse.json(
         {
           success: true,
@@ -1353,16 +1980,20 @@ export async function POST(request: NextRequest) {
     // Retrieval already returns the globally ranked Top 5. Do not narrow that
     // set again here: every selected chunk must reach the grounded LLM prompt.
     const asksForUnseenResults = asksForAnotherResult(effectiveMessage);
+    const asksForSiblingEntities = asksForUnseenResults ||
+      /\b(?:other|another|different|next)\b.*\b(?:products?|services?|case studies?|blogs?|articles?|resources?|partners?|jobs?|webinars?|events?|solutions?|accelerators?)\b/i.test(effectiveMessage);
+    const asksForSingleSibling = /^(?:tell me (?:more )?about|explain|describe)\b/i.test(effectiveMessage);
     const previouslyPresented = parsed.data.history
       .filter((item) => item.role === "assistant")
       .map((item) => item.content.toLowerCase())
       .join("\n");
-    const initiallySelectedMatches = asksForUnseenResults
-      ? retrieval.matches.filter(
-          ({ document }) =>
-            !previouslyPresented.includes(document.url.toLowerCase()) &&
-            !previouslyPresented.includes(document.title.toLowerCase()),
-        )
+    const initiallySelectedMatches = asksForSiblingEntities
+      ? selectSiblingEntityMatches({
+          candidates: retrieval.candidates ?? retrieval.matches,
+          understanding,
+          previouslyPresented: asksForSingleSibling ? "" : previouslyPresented,
+          limit: asksForSingleSibling ? 1 : 8,
+        })
       : retrieval.matches;
     const exactNamedResource = namedResourceSubject
       ? initiallySelectedMatches.find(({ document }) => {
@@ -1410,7 +2041,7 @@ export async function POST(request: NextRequest) {
       : initiallySelectedMatches;
     // Preserve relevance order for semantic/problem discovery. Collection
     // branches above may still intentionally vary already-qualified items.
-    if (asksForUnseenResults && !selectedMatches.length) {
+    if (asksForSiblingEntities && !selectedMatches.length) {
       return NextResponse.json(
         {
           success: true,
@@ -1438,8 +2069,8 @@ export async function POST(request: NextRequest) {
       retrieval.collectionTotal !== undefined &&
       isExplicitListRequest(effectiveMessage)
     ) {
-      const presented = retrieval.matches.slice(0, 15);
       const total = retrieval.collectionTotal;
+      const presented = retrieval.matches.slice(0, Math.min(15, total));
       const label = retrieval.collectionLabel ?? "items";
       const listingSource = presented.find(({ document }) => document.role === "global_capabilities" ||
         document.role === "partners" || document.role === "page")?.document ?? presented[0]?.document;
@@ -1480,12 +2111,27 @@ export async function POST(request: NextRequest) {
       matches: selectedMatches,
       hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
     });
+    if (exactTitleLock) {
+      const locked = selectedMatches.find((match) =>
+        match.document.id === exactTitleLock.document.id,
+      ) ?? exactTitleLock;
+      evidenceValidation = {
+        status: "SUPPORTED",
+        confidence: "high",
+        subject: exactTitleLock.document.title,
+        requestedAttribute: currentExplicitSubject ? "capability" : "fact",
+        accepted: [locked],
+        rejected: [],
+        reason: "The explicit indexed title and its first-party record are an exact identity match.",
+      };
+      selectedMatches = [locked];
+    }
     const hasGroundedFollowUpTarget = parsed.data.suggestionAction?.intent === "FOLLOW_UP_QUERY" &&
       Boolean(exactNamedResource) &&
       /\b(?:help (?:my|our|a) business|business outcomes?|benefits?|value|implement|implementation|apply|adopt)\b/i.test(
         parsed.data.suggestionAction.query ?? effectiveMessage,
       );
-    if (["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status) && literalRetrieval.matches.length) {
+    if (!asksForSiblingEntities && ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status) && literalRetrieval.matches.length) {
       const literalValidation = validateEvidence({
         message: effectiveMessage,
         contextMessage: effectiveMessage,
@@ -1524,6 +2170,13 @@ export async function POST(request: NextRequest) {
       }
     }
     if (!hasGroundedFollowUpTarget && facets.length === 1 && ["INSUFFICIENT_EVIDENCE", "AMBIGUOUS"].includes(evidenceValidation.status)) {
+      const contactableFallback = evidenceValidation.status === "INSUFFICIENT_EVIDENCE"
+        ? classifyContactableNoContent(understanding)
+        : null;
+      if (contactableFallback) {
+        const response = await contactableFallbackResponse(contactableFallback);
+        if (response) return response;
+      }
       return NextResponse.json(
         {
           success: true,
@@ -1570,7 +2223,19 @@ export async function POST(request: NextRequest) {
       : evidenceValidation.accepted.length
       ? evidenceValidation.accepted
       : selectedMatches;
-    selectedMatches = validatedMatches;
+    selectedMatches = selectFacetAlignedMatches({
+      matches: validatedMatches,
+      understandings: facetResults.length
+        ? facetResults.map(({ understanding: facetUnderstanding }) => facetUnderstanding)
+        : [understanding],
+    });
+    if (!selectedMatches.length) {
+      return NextResponse.json({ success: true, data: {
+        answer: safeEvidenceResponse(evidenceValidation),
+        cards: [], sources: [], suggestions: [], suggestionActions: [],
+        confidence: "low", insufficientContext: true,
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    }
     const topScore = selectedMatches[0]?.score ?? 0;
     const isWhitepaperQuery =
       /\b(?:white ?papers?|whitepepers?|whtieperpers?)\b/i.test(
@@ -1584,6 +2249,15 @@ export async function POST(request: NextRequest) {
       understanding,
       limit: 4,
     });
+    if (!preGenerationAlignment.primary &&
+        (understanding.topics.length > 0 || understanding.entities.length > 0) &&
+        !["solve_problem", "recommendation"].includes(understanding.intent)) {
+      return NextResponse.json({ success: true, data: {
+        answer: safeEvidenceResponse(evidenceValidation),
+        cards: [], sources: [], suggestions: [], suggestionActions: [],
+        confidence: "low", insufficientContext: true,
+      }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    }
     const contextMatches = preGenerationAlignment.primary
       ? [preGenerationAlignment.primary, ...preGenerationAlignment.related]
       : validatedMatches.slice(0, 1);
@@ -1635,6 +2309,20 @@ export async function POST(request: NextRequest) {
     }
     let generatedAnswer =
       generatedData?.answer ?? buildGroundedRetrievalAnswer(selectedMatches);
+    if (generatedData?.answer && !isAnswerAlignedWithMatch(generatedData.answer, selectedMatches[0]))
+      generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
+    if (!answerAddressesRequestedAttribute(generatedAnswer, effectiveMessage, evidenceValidation.requestedAttribute)) {
+      const contactableFallback = classifyContactableNoContent(understanding);
+      if (contactableFallback) {
+        const response = await contactableFallbackResponse(contactableFallback);
+        if (response) return response;
+      }
+    }
+    const comparisonEvidence = selectedMatches.some(({ document }) =>
+      /\b(?:better|superior|outperform|compared (?:with|to)|versus)\b/i.test(document.combinedText));
+    if (evidenceValidation.requestedAttribute === "comparison" && !comparisonEvidence) {
+      generatedAnswer = `The available published Successive content describes the relevant capabilities, but it does not establish one option as universally better than the other.\n\n${buildGroundedRetrievalAnswer(selectedMatches)}`;
+    }
     if (
       shouldDeduplicate &&
       answerReferencesSeenContent(generatedAnswer, seenContentKeys)
@@ -1651,6 +2339,11 @@ export async function POST(request: NextRequest) {
       match.matchedFields.includes("low-query-coverage"),
     );
     if (explicitNoEvidence && onlyLowCoverageEvidence) {
+      const contactableFallback = classifyContactableNoContent(understanding);
+      if (contactableFallback) {
+        const response = await contactableFallbackResponse(contactableFallback);
+        if (response) return response;
+      }
       return NextResponse.json(
         {
           success: true,
@@ -1704,9 +2397,14 @@ export async function POST(request: NextRequest) {
     const facetCompleteAnswer = incompleteFacets.length
       ? `${categoryAnswer.trim()}\n\n${incompleteFacets.map(({ facet }) => `I couldn’t find authoritative published evidence for the requested ${facet.relation.toLowerCase().replace(/_/g, " ")} facet.`).join("\n")}`
       : categoryAnswer;
-    const finalAnswer = cta && !facetCompleteAnswer.includes(alignment.primary?.document.url ?? "")
+    const finalAnswerWithCta = cta && !facetCompleteAnswer.includes(alignment.primary?.document.url ?? "")
       ? `${facetCompleteAnswer.trim()}\n\n${cta}`
       : facetCompleteAnswer;
+    const finalAnswer = ensureRequestedRoleFraming(
+      finalAnswerWithCta,
+      alignment.primary,
+      understanding.requestedContentType,
+    );
     const cardMatches = alignedMatches.filter((match) =>
       cardEligibility(match, understanding, topScore).accepted,
     );
@@ -1716,7 +2414,8 @@ export async function POST(request: NextRequest) {
     const answerReferencedMatches = contextMatches.filter(({ document }) =>
       finalAnswer.includes(document.url) || finalAnswer.includes(document.url.replace(/\/$/, "")),
     );
-    const referencedAndEligibleCards = [...answerReferencedMatches, ...cardMatches]
+    const referencedAndEligibleCards = [alignment.primary, ...answerReferencedMatches, ...cardMatches]
+      .filter((match): match is SearchMatch => Boolean(match))
       .filter((match, index, all) => all.findIndex((candidate) =>
         candidate.document.id === match.document.id && candidate.document.type === match.document.type) === index);
     const presentedMatches =
@@ -1739,12 +2438,12 @@ export async function POST(request: NextRequest) {
       ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
           corpus: await getSuggestionCorpus(),
-          userSubject: understanding.entities[0] ?? understanding.topics[0] ?? alignment.primary.document.title,
+          userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           limit: 3,
         }) : buildGlobalRelatedContentActions({
           source: alignment.primary.document,
           corpus: await getSuggestionCorpus(),
-          userSubject: understanding.entities[0] ?? understanding.topics[0] ?? alignment.primary.document.title,
+          userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
           limit: 3,
         })
@@ -2117,7 +2816,7 @@ function buildContactAnswer(
 
 function buildPublishedContactAnswer(
   url: string,
-  details: { phones: string[]; emails: string[] },
+  details: { phones: string[]; emails: string[]; addresses: string[] },
 ): string {
   const phoneText = details.phones.length
     ? `Published phone numbers: ${details.phones.map((phone) => `**${phone}**`).join(" and ")}.`
@@ -2126,6 +2825,15 @@ function buildPublishedContactAnswer(
     ? `Published email addresses: ${details.emails.map((email) => `**${email}**`).join(" and ")}.`
     : `The current page does not publish a direct email address; use the official [Contact Us](${url}) form to send a message.`;
   return `${phoneText} ${emailText}`;
+}
+
+function buildPublishedLocationAnswer(
+  url: string,
+  details: { addresses: string[] },
+): string {
+  if (!details.addresses.length)
+    return `The current page does not publish a structured office address. Please use the official [Contact Us](${url}) page for current location information.`;
+  return `Successive publishes these office addresses:\n\n${details.addresses.map((address) => `- ${address}`).join("\n")}\n\n[View the official Contact Us page](${url})`;
 }
 
 async function buildCollectionStory(

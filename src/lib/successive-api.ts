@@ -30,10 +30,10 @@ type Collection = (typeof CONTENT_COLLECTIONS)[number];
 // network requests and makes the first chat request appear to hang.
 const PAGE_SIZE = 100;
 const WORDPRESS_CONCURRENCY = 4;
-const CORPUS_TTL_MS = 5 * 60 * 1000;
-const CORPUS_STALE_MS = 30 * 60 * 1000;
-const CANONICAL_TTL_MS = 5 * 60 * 1000;
-const CANONICAL_STALE_MS = 60 * 60 * 1000;
+const CORPUS_TTL_MS = 60 * 60 * 1000;
+const CORPUS_STALE_MS = 2 * 60 * 60 * 1000;
+const CANONICAL_TTL_MS = 60 * 60 * 1000;
+const CANONICAL_STALE_MS = 2 * 60 * 60 * 1000;
 
 export interface ContentLoadDiagnostics {
   cache: "hit" | "miss" | "stale";
@@ -116,7 +116,7 @@ async function fetchPage(
   try {
     const response = await fetch(endpoint(collection, query), {
       signal: controller.signal,
-      next: { revalidate: 300 },
+      next: { revalidate: 3600 },
       headers: { Accept: "application/json" },
     });
     if (!response.ok) {

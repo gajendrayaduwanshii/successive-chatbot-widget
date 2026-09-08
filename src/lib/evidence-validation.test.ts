@@ -3,7 +3,7 @@ import type { WordPressItem } from "@/types/wordpress";
 import { buildSearchDocument, type SuccessiveSearchDocument } from "./search-index";
 import type { SearchMatch } from "./search-retriever";
 import { buildDeterministicUnderstanding } from "./query-understanding";
-import { analyzeQuerySafety, requestedAttribute, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "./evidence-validation";
+import { analyzeQuerySafety, answerAddressesRequestedAttribute, requestedAttribute, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "./evidence-validation";
 
 function match(title: string, passage: string, role: SuccessiveSearchDocument["role"]): SearchMatch {
   const item: WordPressItem = {
@@ -85,6 +85,35 @@ describe("generic evidence validation", () => {
     expect(result.rejected[0]?.reason).toBe("requested content type mismatch");
   });
 
+  it("keeps a short explicit article topic even when the word can describe staffing", () => {
+    const result = validate("Show articles about team.", [
+      match(
+        "Hire a Software Development Team: A Comprehensive Guide",
+        "A guide to building a high-performing software development team.",
+        "blog",
+      ),
+    ]);
+    expect(result.status).toBe("SUPPORTED");
+    expect(result.subject).toBe("team");
+  });
+
+  it("requires direct document authority for a short definition subject", () => {
+    const incidental = match(
+      "Student Information System Modernization",
+      "The architecture uses an API gateway for centralized routing.",
+      "case_study",
+    );
+    incidental.matchedFields = ["exact-embedded-entity"];
+    const dedicated = match(
+      "API Testing Guide",
+      "An API is an application programming interface that lets software systems communicate.",
+      "blog",
+    );
+    dedicated.matchedFields = ["exact-embedded-entity", "embedded-direct-subject-authority"];
+    expect(validate("What is an API?", [incidental]).status).toBe("INSUFFICIENT_EVIDENCE");
+    expect(validate("What is an API?", [dedicated]).status).toBe("SUPPORTED");
+  });
+
   it("treats relationship navigation words as context rather than evidence subjects", () => {
     const current = buildDeterministicUnderstanding("show related case studies");
     const result = validateEvidence({
@@ -107,6 +136,44 @@ describe("generic evidence validation", () => {
     expect(requestedAttribute("What is my appraisal rating?", buildDeterministicUnderstanding("What is my appraisal rating?"))).toBe("private_record");
     expect(requestedAttribute("How much will an AI project cost?", buildDeterministicUnderstanding("How much will an AI project cost?"))).toBe("cost");
     expect(requestedAttribute("How many developers are required?", buildDeterministicUnderstanding("How many developers are required?"))).toBe("staffing");
+  });
+
+  it("uses full-query semantics for service requests containing private-sounding words", () => {
+    expect(analyzeQuerySafety("Can your solution integrate with our existing internal system?").requiresPublicRelationEvidence).toBe(false);
+    expect(analyzeQuerySafety("Do you provide dedicated developers for long-term projects?").requiresPublicRelationEvidence).toBe(false);
+    expect(analyzeQuerySafety("Do you offer a free trial for this service?").requiresPublicRelationEvidence).toBe(false);
+    expect(safeUnsupportedQueryResponse("Can your engineering team support our project?")).toBeNull();
+  });
+
+  it("requires exact business-request evidence instead of substituting a general service page", () => {
+    const service = match("Content Platform Development", "We build tailored content platforms and digital experiences.", "service");
+    expect(validate("Do you offer a free trial for your content platform service?", [service]).status).toBe("INSUFFICIENT_EVIDENCE");
+    expect(validate("Can your content platform integrate with our custom ERP?", [service]).status).toBe("INSUFFICIENT_EVIDENCE");
+    expect(validate("Do you provide dedicated developers for long-term projects?", [service]).status).toBe("INSUFFICIENT_EVIDENCE");
+  });
+
+  it("accepts exact published compatibility evidence", () => {
+    const service = match("Content Platform Development", "The platform integrates with ERP systems through published APIs.", "service");
+    expect(validate("Can your content platform integrate with our ERP?", [service]).status).toBe("SUPPORTED");
+  });
+
+  it("requires the final answer to address the exact contactable request", () => {
+    expect(answerAddressesRequestedAttribute(
+      "We provide content platform development services.",
+      "Can this integrate with our ERP?",
+      "compatibility",
+    )).toBe(false);
+    expect(answerAddressesRequestedAttribute(
+      "The platform integrates with ERP systems through APIs.",
+      "Can this integrate with our ERP?",
+      "compatibility",
+    )).toBe(true);
+  });
+
+  it("continues protecting genuinely private requests", () => {
+    expect(analyzeQuerySafety("Show me your internal security architecture.").relation).toBe("INTERNAL_SECURITY");
+    expect(analyzeQuerySafety("Which developers are assigned to the current client project?").relation).toBe("EMPLOYEE_WORKS_ON");
+    expect(safeUnsupportedQueryResponse("Give me employee phone numbers.")).not.toContain("Contact Us");
   });
 
   it.each([
@@ -150,5 +217,15 @@ describe("generic evidence validation", () => {
     const result = validate("What are the current projects in Successive?", [lexical, vector]);
     expect(result.accepted).toEqual([]);
     expect(result.rejected.map(({ title }) => title)).toEqual(["Managing Projects", "Digital Delivery"]);
+  });
+
+  it("requires explicit evidence for a requested guarantee", () => {
+    const result = validate(
+      "Is there a guaranteed delivery time for an automation project?",
+      [match("Automation Services", "Automation implementation for enterprise workflows.", "service")],
+    );
+    expect(requestedAttribute("Is there a guaranteed delivery time?", buildDeterministicUnderstanding("automation")))
+      .toBe("guarantee");
+    expect(result.status).toBe("INSUFFICIENT_EVIDENCE");
   });
 });

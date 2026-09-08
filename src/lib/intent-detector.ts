@@ -78,7 +78,7 @@ export function detectIntent(query: string): Intent {
       "what should i do next",
       "project estimate",
       "get an estimate",
-    ])
+    ]) || /\b(?:what|which|show|list)\b.*\b(?:office|location)s?\b/.test(q)
   )
     return "contact";
   if (

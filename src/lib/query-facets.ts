@@ -15,6 +15,27 @@ export interface QueryFacet {
   text: string;
   relation: QueryRelation;
   understanding: QueryUnderstanding;
+  subject: string | null;
+  requestedContentType: QueryUnderstanding["requestedContentType"];
+  dependent: boolean;
+}
+
+const RELATION_OBJECT = /^(?:(?:then|also)\s+)?(?:give|show|find|tell|explore|provide|share)(?:\s+me)?\s+(?:(?:an?|the)\s+)?(?:example|related|relevant|matching|associated|case stud(?:y|ies)|articles?|resources?|pages?|use cases?)\b/i;
+
+export function isDependentRelationClause(text: string): boolean {
+  const q = normalizeSearchText(text);
+  return RELATION_OBJECT.test(q) ||
+    /\b(?:related|relevant|matching|associated)\s+(?:services?|case stud(?:y|ies)|articles?|resources?|pages?|use cases?)\b/.test(q) ||
+    /^(?:give|show|find|tell)(?: me)? (?:an? )?example$/.test(q);
+}
+
+function explicitFacetSubject(text: string, understanding: QueryUnderstanding): string | null {
+  const wrapped = normalizeSearchText(text).match(
+    /^(?:(?:then|also)\s+)?(?:tell|show|explain|describe)(?: me)?(?: more)? (?:about|of) (.+)$/,
+  )?.[1]?.replace(/^(?:your|the)\s+/, "").trim();
+  if (wrapped && !isDependentRelationClause(text)) return wrapped;
+  const semantic = [...understanding.entities, ...understanding.topics].join(" ").trim();
+  return semantic || null;
 }
 
 export function inferQueryRelation(message: string): QueryRelation {
@@ -38,22 +59,35 @@ export function inferQueryRelation(message: string): QueryRelation {
 }
 
 function isFacetClause(clause: string): boolean {
-  return /\b(?:what|which|who|where|how|does|do|is|are|can|could|show|find|give|tell|explain|summarize|any|latest|newest|case stud(?:y|ies)|customer example|article|blog|news|service|partner)\b/i.test(clause);
+  return /\b(?:what|which|who(?:'s|s)?|where|how|does|do|is|are|can|could|show|find|give|tell|explain|summarize|any|latest|newest|case stud(?:y|ies)|customer example|article|blog|news|service|partner|cost|pricing|price)\b/i.test(clause);
 }
 
 export function extractQueryFacets(message: string): QueryFacet[] {
   const normalized = message.replace(/\s+/g, " ").trim();
   const clauses = normalized
-    .split(/\s*(?:[?;]+|,\s+(?=(?:(?:and|also)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b)|\s+and\s+(?=(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b))\s*/i)
+    .split(/\s*(?:[?;]+|[.!]\s+(?=(?:(?:then|also)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|explain|describe|list|any|what|which|who|where|how|latest|newest)\b)|,\s+(?=(?:(?:and|also|then)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b)|\s+and\s+(?=(?:(?:(?:then|also)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b|(?:show\s+)?(?:a\s+)?(?:relevant|related)\s+(?:case stud(?:y|ies)|resources?|articles?)|(?:project\s+)?(?:cost|pricing|price)\b|(?:cost|pricing|price)\s+of\b)))\s*/i)
     .map((clause) => clause.trim())
     .filter((clause) => clause.length >= 2 && isFacetClause(clause));
   const candidates = clauses.length >= 2 ? clauses : [normalized];
-  return candidates.slice(0, 4).map((text, index) => ({
-    id: `facet-${index + 1}`,
-    text,
-    relation: inferQueryRelation(text),
-    understanding: buildDeterministicUnderstanding(text),
-  }));
+  let activeSubject: string | null = null;
+  return candidates.slice(0, 4).map((text, index) => {
+    const parsed = buildDeterministicUnderstanding(text);
+    const dependent = isDependentRelationClause(text);
+    const explicitSubject = dependent ? null : explicitFacetSubject(text, parsed);
+    const subject = explicitSubject ?? (dependent ? activeSubject : null);
+    if (explicitSubject) activeSubject = explicitSubject;
+    const subjectTopics = subject ? normalizeSearchText(subject).split(" ")
+      .filter((token) => !/^(?:service|services|capability|capabilities|case|study|studies|article|articles|page|pages)$/.test(token)) : [];
+    const understanding = dependent && subjectTopics.length ? {
+      ...parsed,
+      topics: subjectTopics,
+      entities: [],
+      retrievalConcepts: subjectTopics,
+      targetScope: "topic" as const,
+    } : parsed;
+    return { id: `facet-${index + 1}`, text, relation: inferQueryRelation(text), understanding,
+      subject, requestedContentType: parsed.requestedContentType, dependent };
+  });
 }
 
 export function isMultiIntentQuery(message: string): boolean {
