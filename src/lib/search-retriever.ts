@@ -1,3 +1,6 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { unstable_cache } from "next/cache";
 import {
   fetchAllPublishedContent,
 } from "./successive-api";
@@ -90,10 +93,43 @@ const SYNONYM_GROUPS = [
   ["workflow automation", "intelligent automation", "manual process automation"],
 ];
 const INDEX_CACHE_MS = 60 * 60 * 1000;
+const PERSISTED_INDEX_PATH = path.join(process.cwd(), ".next", "cache", "successive-search-index.json");
 let cachedIndex:
   { expiresAt: number; documents: SuccessiveSearchDocument[] } | undefined;
 let indexBuildPromise: Promise<SuccessiveSearchDocument[]> | undefined;
 let lastIndexDiagnostics = { cache: "miss" as "hit" | "miss" | "shared", durationMs: 0, documents: 0 };
+
+async function readPersistedIndex(): Promise<SuccessiveSearchDocument[] | undefined> {
+  if (process.env.NODE_ENV === "test") return undefined;
+  try {
+    const parsed = JSON.parse(await readFile(PERSISTED_INDEX_PATH, "utf8")) as {
+      loadedAt?: number;
+      documents?: SuccessiveSearchDocument[];
+    };
+    if (!parsed.loadedAt || !Array.isArray(parsed.documents) ||
+        Date.now() - parsed.loadedAt >= INDEX_CACHE_MS)
+      return undefined;
+    return parsed.documents;
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistIndex(documents: SuccessiveSearchDocument[]): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await mkdir(path.dirname(PERSISTED_INDEX_PATH), { recursive: true });
+    await writeFile(PERSISTED_INDEX_PATH, JSON.stringify({ loadedAt: Date.now(), documents }));
+  } catch {
+    // A read-only deployment can still use the in-memory index safely.
+  }
+}
+
+const buildCachedSearchIndex = unstable_cache(
+  async () => buildSearchIndex(await fetchAllPublishedContent()),
+  ["successive-search-index-v1"],
+  { revalidate: 60 * 60 },
+);
 
 export function getIndexDiagnostics() {
   return { ...lastIndexDiagnostics };
@@ -1405,15 +1441,21 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
     lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: cachedIndex.documents.length };
     return cachedIndex.documents;
   }
+  const persisted = await readPersistedIndex();
+  if (persisted?.length) {
+    cachedIndex = { documents: persisted, expiresAt: Date.now() + INDEX_CACHE_MS };
+    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.length };
+    return persisted;
+  }
   if (indexBuildPromise) {
     lastIndexDiagnostics = { ...lastIndexDiagnostics, cache: "shared" };
     return indexBuildPromise;
   }
   const startedAt = Date.now();
-  indexBuildPromise = fetchAllPublishedContent()
-    .then(buildSearchIndex)
+  indexBuildPromise = buildCachedSearchIndex()
     .then((documents) => {
       cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
+      void persistIndex(documents);
       lastIndexDiagnostics = {
         cache: "miss",
         durationMs: Date.now() - startedAt,

@@ -161,7 +161,7 @@ export function buildGroundedEvidencePackage(args: {
   };
 }
 
-const EXCLUDED_ROLES = new Set(["blog", "resource", "ebook", "whitepaper", "case-study", "career", "company", "leadership"]);
+const EXCLUDED_ROLES = new Set(["blog", "whitepaper", "case-study", "career", "company", "leadership"]);
 
 /** Stage 2 remains deliberately limited to standalone substantial informational turns. */
 export function isEligibleGroundedComposer(primary: SearchMatch | undefined, understanding: QueryUnderstanding): primary is SearchMatch {
@@ -253,6 +253,10 @@ export function deterministicOverviewEligibility(args: {
   const { primary, evidence, understanding } = args;
   if (!primary || !evidence || !args.directEnglish || (args.hasPriorContext && !args.resolvedFollowUp) || args.hasAction || args.isCommercial || args.facetCount > 1)
     return { eligible: false, failedPredicate: !primary ? "primary" : !evidence ? "evidence" : !args.directEnglish ? "directEnglish" : args.hasPriorContext && !args.resolvedFollowUp ? "context" : args.hasAction ? "action" : args.isCommercial ? "commercial" : "multiFacet" };
+  const resourceIdentity = `${primary.document.slug} ${primary.document.url} ${primary.document.title}`;
+  if (["resource", "ebook"].includes(documentContentType(primary.document)) ||
+      /\b(?:ebook|resource|guide)\b/i.test(resourceIdentity))
+    return { eligible: false, failedPredicate: "resourceComposer" };
   if (understanding.isFollowUp && !args.resolvedFollowUp) return { eligible: false, failedPredicate: "followUp" };
   if (!["overview", "technology", "process", "capabilities", "benefits", "use_cases"].includes(evidence.questionFocus)) return { eligible: false, failedPredicate: "focus" };
   if (!["explore", "informational", "discovery", "solve_problem"].includes(understanding.intent)) return { eligible: false, failedPredicate: "intent" };

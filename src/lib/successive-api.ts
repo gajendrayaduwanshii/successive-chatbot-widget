@@ -1,3 +1,6 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { unstable_cache } from "next/cache";
 import { getEnv } from "./env";
 import type { WordPressItem } from "@/types/wordpress";
 
@@ -34,6 +37,7 @@ const CORPUS_TTL_MS = 60 * 60 * 1000;
 const CORPUS_STALE_MS = 2 * 60 * 60 * 1000;
 const CANONICAL_TTL_MS = 60 * 60 * 1000;
 const CANONICAL_STALE_MS = 2 * 60 * 60 * 1000;
+const PERSISTED_CORPUS_PATH = path.join(process.cwd(), ".next", "cache", "successive-corpus.json");
 
 export interface ContentLoadDiagnostics {
   cache: "hit" | "miss" | "stale";
@@ -56,6 +60,32 @@ let lastDiagnostics: ContentLoadDiagnostics = {
   partial: false,
   itemCount: 0,
 };
+
+async function readPersistedCorpus(): Promise<WordPressItem[] | undefined> {
+  if (process.env.NODE_ENV === "test") return undefined;
+  try {
+    const parsed = JSON.parse(await readFile(PERSISTED_CORPUS_PATH, "utf8")) as {
+      loadedAt?: number;
+      items?: WordPressItem[];
+    };
+    if (!parsed.loadedAt || !Array.isArray(parsed.items) ||
+        Date.now() - parsed.loadedAt >= CORPUS_TTL_MS)
+      return undefined;
+    return parsed.items;
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistCorpus(items: WordPressItem[]): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await mkdir(path.dirname(PERSISTED_CORPUS_PATH), { recursive: true });
+    await writeFile(PERSISTED_CORPUS_PATH, JSON.stringify({ loadedAt: Date.now(), items }));
+  } catch {
+    // A read-only deployment can still use the in-memory cache safely.
+  }
+}
 
 export function getContentLoadDiagnostics(): ContentLoadDiagnostics {
   return { ...lastDiagnostics, failedCollections: [...lastDiagnostics.failedCollections] };
@@ -228,8 +258,15 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
     partial: failedCollections.length > 0,
     itemCount: items.length,
   };
+  await persistCorpus(items);
   return items;
 }
+
+const fetchCachedCorpus = unstable_cache(
+  fetchAllPublishedContentUncached,
+  ["successive-corpus-v1"],
+  { revalidate: 60 * 60 },
+);
 
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
   if (process.env.NODE_ENV === "test") return fetchAllPublishedContentUncached();
@@ -238,6 +275,15 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
     lastDiagnostics = { ...corpusCache.diagnostics, cache: "hit", durationMs: 0 };
     return corpusCache.items;
   }
+  const persisted = await readPersistedCorpus();
+  if (persisted?.length) {
+    const diagnostics: ContentLoadDiagnostics = {
+      cache: "hit", durationMs: 0, failedCollections: [], partial: false, itemCount: persisted.length,
+    };
+    corpusCache = { items: persisted, loadedAt: now, diagnostics };
+    lastDiagnostics = diagnostics;
+    return persisted;
+  }
   if (corpusBuildPromise) {
     if (corpusCache && now - corpusCache.loadedAt < CORPUS_STALE_MS) {
       lastDiagnostics = { ...corpusCache.diagnostics, cache: "stale", durationMs: 0 };
@@ -245,7 +291,7 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
     }
     return corpusBuildPromise;
   }
-  corpusBuildPromise = fetchAllPublishedContentUncached()
+  corpusBuildPromise = fetchCachedCorpus()
     .then((items) => {
       corpusCache = { items, loadedAt: Date.now(), diagnostics: lastDiagnostics };
       return items;

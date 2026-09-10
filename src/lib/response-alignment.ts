@@ -357,9 +357,10 @@ export function supportsEvidenceDrivenDepth(match: SearchMatch, understanding: Q
   // a broad collection and can safely use the subject's bounded evidence.
   const isNarrowList = understanding.answerMode === "list" && !understanding.isBroadQuery;
   if (!['define', 'explain', 'details', 'summarize'].includes(understanding.answerMode) && !isNarrowList) return false;
-  if (['blog', 'case-study', 'whitepaper', 'ebook', 'webinar', 'event', 'press-release', 'media-coverage', 'career', 'company', 'leadership'].includes(documentContentType(match.document))) return false;
+  if (['blog', 'case-study', 'whitepaper', 'webinar', 'event', 'press-release', 'media-coverage', 'career', 'company', 'leadership'].includes(documentContentType(match.document))) return false;
   const type = documentContentType(match.document);
-  if (['service', 'sub-service', 'expertise', 'technology', 'product', 'kagen-product', 'accelerator', 'industry'].includes(type) ||
+  if (/\b(?:ebook|resource|guide)\b/i.test(`${match.document.slug} ${match.document.url}`)) return true;
+  if (['service', 'sub-service', 'expertise', 'technology', 'product', 'kagen-product', 'accelerator', 'industry', 'resource', 'ebook'].includes(type) ||
       match.document.role === 'global_capabilities' || match.matchedFields.includes('exact-structured-section')) return true;
   // Some canonical solution and implementation pages are retained as generic
   // pages by the source taxonomy. Their resolved title/role, not a topic list,
