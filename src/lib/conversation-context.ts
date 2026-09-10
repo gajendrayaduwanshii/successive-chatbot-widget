@@ -1,6 +1,6 @@
 import { normalizeSearchText } from "./search-index";
 import type { Intent } from "./intent-detector";
-import { buildDeterministicUnderstanding, buildRetrievalQuery } from "./query-understanding";
+import { buildDeterministicUnderstanding, buildRetrievalQuery, classifyFollowUpScope, isDependentFollowUp } from "./query-understanding";
 
 type HistoryMessage = { role: "user" | "assistant"; content: string };
 
@@ -26,13 +26,24 @@ function resourcesFromAnswer(content: string): PresentedResource[] {
 }
 
 export function buildStructuredConversationState(history: HistoryMessage[]): StructuredConversationState {
-  const userTurns = history.filter((item) => item.role === "user")
-    .map((item) => buildDeterministicUnderstanding(item.content));
-  const explicit = userTurns.filter((item) => item.topics.length || item.entities.length || item.industry);
+  const userMessages = history.filter((item) => item.role === "user");
+  const userTurns = userMessages.map((item) => buildDeterministicUnderstanding(item.content));
+  const explicit = userTurns.filter((item, index) => {
+    const message = userMessages[index]!.content;
+    const subjectlessDependency = isDependentFollowUp(message) &&
+      (!item.topics.length || /\b(?:this|that|it|its|these|those|they|them|their|one|ones|other|another)\b/i.test(message) ||
+        /^(?:any|another|other|next|first|second|third|last)\b/i.test(message.trim()));
+    return (item.topics.length || item.entities.length || item.industry) && !subjectlessDependency;
+  });
   const active = explicit.at(-1);
   const previous = explicit.length > 1 ? explicit.at(-2) : undefined;
-  const lastAssistant = history.findLast((item) => item.role === "assistant")?.content ?? "";
-  const resources = resourcesFromAnswer(lastAssistant).slice(0, 6);
+  const assistantTurns = history.filter((item) => item.role === "assistant");
+  const lastAssistant = assistantTurns.at(-1)?.content ?? "";
+  // A terse intervening answer may contain no cards/links. Retain the latest
+  // genuinely presented result set instead of falling back to user wording.
+  const resources = assistantTurns.toReversed()
+    .map((item) => resourcesFromAnswer(item.content))
+    .find((items) => items.length > 0)?.slice(0, 6) ?? [];
   const pending = /would you like me to summarize|related (?:article|resource|case study|alternative)/i.test(lastAssistant)
     ? resources[0] ?? null
     : null;
@@ -51,12 +62,56 @@ export function buildStructuredConversationState(history: HistoryMessage[]): Str
 
 export function resolveStructuredFollowUpMessage(message: string, history: HistoryMessage[]): string | undefined {
   const normalized = normalizeSearchText(message);
+  if (/^(?:what industries do (?:you|successive) serve|which sectors do (?:you|successive) work in)$/.test(normalized))
+    return "Show all industries";
+  const current = buildDeterministicUnderstanding(message);
+  const hasExplicitSubject = current.topics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
+  // A newly named subject owns the turn. Do not reinterpret it as a follow-up
+  // to a Contact Us card (or any other resource) from a prior commercial turn.
+  if (hasExplicitSubject && classifyFollowUpScope(current, normalized) === "SWITCH_TOPIC")
+    return undefined;
+  // A current lexical subject followed by a refinement marker is still new
+  // information (commonly a career location/skill), not an ordinal resource.
+  if (hasExplicitSubject && !/\b(?:this|that|it|its|these|those|one|ones)\b/.test(normalized) &&
+      !/\b(?:first|second|third|last|next|other)\b/.test(normalized))
+    return undefined;
   const state = buildStructuredConversationState(history);
   if (/^(?:go back|switch back|back) to (?:the )?previous (?:topic|one)$/.test(normalized))
     return state.previousTopic ? `Tell me about ${state.previousTopic}` : undefined;
-  if (/^(?:what can it do|who is it for|any latest news|latest news|any case studies|any articles|what do you do together)$/.test(normalized) && state.activeTopic)
-    return `${state.activeTopic} ${message}`;
+  if (/^(?:what can it do|what does it do|who is it for|any latest news|latest news|any case studies|any articles|what do you do together)$/.test(normalized)) {
+    const lastUser = history.findLast((item) => item.role === "user")?.content ?? "";
+    const selectedResource = isDependentFollowUp(lastUser) ? state.lastPresentedResources[0]?.title : undefined;
+    const subject = selectedResource ?? state.activeTopic;
+    if (selectedResource) {
+      const entity = selectedResource
+        .replace(/^successive digital['’]s\s+/i, "")
+        .replace(/\s+(?:recognized|wins?|receives?|awarded|named|announces?|launches?)\b.*$/i, "")
+        .trim();
+      return `What is ${entity || selectedResource}`;
+    }
+    if (subject) return `${subject} ${message}`;
+  }
+  if (isDependentFollowUp(message) && state.lastPresentedResources.length) {
+    const ordinal = normalized.match(/\b(first|second|third|last|next|other)(?: one| item| result| resource)?\b/)?.[1];
+    const index = ordinal === "second" || ordinal === "next" || ordinal === "other"
+      ? 1 : ordinal === "third" ? 2 : ordinal === "last" ? state.lastPresentedResources.length - 1 : 0;
+    const selected = state.lastPresentedResources[index] ??
+      (state.lastPresentedResources.length === 1 ? state.lastPresentedResources[0] : undefined);
+    if (!selected) return undefined;
+    if (/\bcase stud(?:y|ies)\b/.test(normalized))
+      return `Show case studies related to ${selected.title}`;
+    return `Tell me about ${selected.title}`;
+  }
   return undefined;
+}
+
+/** True only for a bare reference to a multi-item result set with no subject. */
+export function isAmbiguousResultSetReference(message: string, history: HistoryMessage[]): boolean {
+  const normalized = normalizeSearchText(message);
+  if (!/^(?:tell me more about (?:that|it|them)|what about (?:that|it|them)|which one is better|tell me more about those)$/.test(normalized))
+    return false;
+  const state = buildStructuredConversationState(history);
+  return !state.activeTopic && state.lastPresentedResources.length > 1;
 }
 
 export function rejectsPendingAlternative(message: string, history: HistoryMessage[]): boolean {
@@ -68,7 +123,7 @@ export function asksForAnotherResult(message: string): boolean {
   const normalized = normalizeSearchText(message);
   if (/^(?:tell me more about|tell me about|explain)\b/.test(normalized))
     return false;
-  return /^(?:(?:show|give|find) me )?(?:more|another|other|different|next)(?:\s+(?:one|result|item|option|example|service|serivce|serivces|case study|blog|article|webinar|event))?s?$/.test(
+  return /^(?:(?:show|give|find) me |are there )?(?:more|another|other|different|next)(?:\s+[a-z0-9.+#-]+){0,3}\s*(?:ones?|results?|items?|options?|examples?|services?|serivces?|products?|case studies?|blogs?|articles?|resources?|partners?|jobs?|webinars?|events?)?$/.test(
     normalized,
   );
 }
@@ -107,20 +162,33 @@ export function resolveOfferedResourceFollowUp(
 ): string | undefined {
   const normalized = normalizeSearchText(message);
   const affirmative = /^(?:yes|yes please|sure|okay|ok|please do|go ahead)$/.test(normalized);
-  const ordinal = normalized.match(/(?:summarize |show |open |tell me about )?(?:the )?(first|second|third)(?: one| item| article| resource)?/i)?.[1];
+  const ordinal = normalized.match(/(?:summarize |show |open |tell me about )?(?:the )?(first|second|third|last|next|other)(?: one| item| article| resource)?/i)?.[1];
   if (!affirmative && !ordinal) return undefined;
   const prior = history.findLast((item) => item.role === "assistant")?.content ?? "";
   const links = resourcesFromAnswer(prior);
   if (!links.length) return undefined;
   if (affirmative && !/would you like me to summarize|related (?:article|resource|case study|alternative)/i.test(prior))
     return undefined;
-  const index = ordinal === "second" ? 1 : ordinal === "third" ? 2 : 0;
-  const selected = links[index];
+  const index = ordinal === "second" || ordinal === "next" || ordinal === "other"
+    ? 1 : ordinal === "third" ? 2 : ordinal === "last" ? links.length - 1 : 0;
+  const selected = links[index] ?? (links.length === 1 ? links[0] : undefined);
   const offeredTypeRaw = prior.match(/related (blogs?|articles?|case stud(?:y|ies)|white ?papers?|e-?books?|webinars?|events?|press releases?|media coverage|products?|partner pages?|service pages?|industry pages?|guides?|resources?)/i)?.[1] ?? "resource";
   const offeredType = offeredTypeRaw
     .replace(/case studies/i, "case study")
     .replace(/s$/i, "");
   return selected ? `Summarize '${selected.title}' ${offeredType}` : undefined;
+}
+
+/** Keeps terse dependent turns inside a confidently off-topic conversation. */
+export function continuesOffTopicContext(message: string, history: HistoryMessage[]): boolean {
+  const current = buildDeterministicUnderstanding(message);
+  if (current.isOffTopic) return true;
+  if (/\b(?:successive|kagen|services?|products?|case stud(?:y|ies)|careers?|jobs?|cloud|data|api|ai|security|contact|sales)\b/i.test(message))
+    return false;
+  const dependent = current.isFollowUp || /^(?:what about .+|who (?:won|stars in it|is in it)|what (?:happened|was the result|about tomorrow)|what(?:'s| is) the (?:score|result)|tell me more|and tomorrow)[?.!\s]*$/i.test(message.trim());
+  if (!dependent) return false;
+  const priorUser = history.filter((item) => item.role === "user").at(-1);
+  return Boolean(priorUser && buildDeterministicUnderstanding(priorUser.content).isOffTopic);
 }
 
 export function resolveUnsupportedAlternativeFollowUp(

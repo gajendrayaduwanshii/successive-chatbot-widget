@@ -5,7 +5,10 @@ import { detectIntent, type Intent } from "./intent-detector";
 import { contentIdentity } from "./conversation-context";
 import {
   buildSearchIndex,
+  isServiceFamilySchemaType,
   normalizeSearchText,
+  normalizeServiceSchemaType,
+  servicePortfolioTaxonomyType,
   type SuccessiveSearchChunk,
   type SuccessiveSearchDocument,
 } from "./search-index";
@@ -86,7 +89,7 @@ const SYNONYM_GROUPS = [
   ["api engineering", "api management", "api governance", "integration architecture"],
   ["workflow automation", "intelligent automation", "manual process automation"],
 ];
-const INDEX_CACHE_MS = 5 * 60 * 1000;
+const INDEX_CACHE_MS = 60 * 60 * 1000;
 let cachedIndex:
   { expiresAt: number; documents: SuccessiveSearchDocument[] } | undefined;
 let indexBuildPromise: Promise<SuccessiveSearchDocument[]> | undefined;
@@ -136,15 +139,92 @@ export interface RetrievalResult {
   timings?: { indexLoadMs: number; relationshipScoringMs: number; rankingMs: number };
 }
 
+function requestedRoleRepresentationTier(
+  match: SearchMatch,
+  requested: QueryUnderstanding["requestedContentType"],
+): number {
+  if (!requested) return 1;
+  const role = match.document.role;
+  const direct = requested === "product" || requested === "kagen-product"
+    ? role === "product"
+    : requested === "service" || requested === "sub-service" || requested === "expertise" || requested === "solution"
+      ? role === "service" || role === "global_capabilities" || role === "technology"
+      : requested === "case-study"
+        ? role === "case_study"
+        : requested === "blog"
+          ? role === "blog"
+          : requested === "partner"
+            ? role === "partner"
+            : requested === "industry"
+              ? role === "industry"
+              : requested === "accelerator"
+                ? role === "accelerator"
+                : isRequestedContentTypeCompatible(match.document, requested);
+  if (direct) return 4;
+  if (match.matchedFields.includes("exact-embedded-entity")) return 3;
+  if (isRequestedContentTypeCompatible(match.document, requested)) return 2;
+  return 0;
+}
+
+/** Shared candidate source for plural and singular "other" requests. */
+export function selectSiblingEntityMatches(args: {
+  candidates: SearchMatch[];
+  understanding: QueryUnderstanding;
+  previouslyPresented: string;
+  limit?: number;
+}): SearchMatch[] {
+  const requested = args.understanding.requestedContentType;
+  const seen = args.previouslyPresented.toLowerCase();
+  const unique = new Set<string>();
+  return args.candidates
+    .filter((match) => match.score >= 48 && match.selectedPassages.length > 0)
+    .filter((match) => !match.matchedFields.some((field) => /entity-mismatch|incidental-body-only/.test(field)))
+    .filter((match) => requestedRoleRepresentationTier(match, requested) > 0)
+    .filter(({ document }) =>
+      !seen.includes(document.url.toLowerCase()) &&
+      !seen.includes(document.title.toLowerCase()),
+    )
+    .map((match) => {
+      if (!['product', 'kagen-product'].includes(requested ?? '')) return match;
+      const descriptive = [...match.document.chunks.map(({ text }) => text), ...match.selectedPassages]
+        .flatMap((passage) => [
+          ...(passage.match(/\b[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)+\s+is\s+[^.\n]{0,220}\b(?:product|platform|solution|tool)\b[^.\n]*\./g) ?? []),
+          ...passage.split(/(?<=[.!?])\s+/),
+        ])
+        .filter((sentence) =>
+          /\b(?:is|are)\s+(?:an?\s+)?[^.!?]{0,100}\b(?:product|platform|solution|tool)\b/i.test(sentence) ||
+          /\b(?:product|platform|solution|tool)\b.{0,100}\b(?:helps?|enables?|automates?|supports?)\b/i.test(sentence),
+        );
+      if (!descriptive.length) return match;
+      return {
+        ...match,
+        selectedPassages: descriptive.slice(0, 3),
+      };
+    })
+    .sort((left, right) =>
+      requestedRoleRepresentationTier(right, requested) - requestedRoleRepresentationTier(left, requested) ||
+      right.score - left.score ||
+      right.document.contentQuality - left.document.contentQuality,
+    )
+    .filter(({ document }) => {
+      const identity = `${document.role}:${document.normalizedTitle}`;
+      if (unique.has(identity)) return false;
+      unique.add(identity);
+      return true;
+    })
+    .slice(0, args.limit ?? 8);
+}
+
 export function requestedCollection(
   query: string,
 ):
   | { label: string; matches: (document: SuccessiveSearchDocument) => boolean }
   | undefined {
   const q = normalizeSearchText(query);
-  const requestsFullCollection = /\b(?:total|all|list|count|how many)\b/.test(
-    q,
-  );
+  const requestsFullCollection = /\b(?:total|all|list|count|how many)\b/.test(q) ||
+    /^(?:what|which)\s+(?:\w+\s+){0,2}(?:products?|accelerators?|awards?|recognitions?)\s+(?:are\s+)?available$/.test(q) ||
+    /^(?:show|give|provide)(?:\s+me)?\s+(?:the\s+)?available\s+(?:products?|accelerators?|awards?|recognitions?)$/.test(q) ||
+    /^(?:what|which)\s+(?:awards?|recognitions?)\s+(?:has|have|did)\b.*\b(?:receive|received|win|won|earn|earned)$/.test(q);
   const requestsNextPage =
     /\b(?:more|another|other|others|different|next)\b/.test(q);
   if (!requestsFullCollection && !requestsNextPage) return undefined;
@@ -176,6 +256,11 @@ export function requestedCollection(
       label: "accelerators",
       matches: (document) => document.type === "accelerators",
     };
+  if (/\bproducts?\b/.test(q))
+    return {
+      label: "products",
+      matches: (document) => document.role === "product" || document.productLike,
+    };
   if (/\b(?:press releases?|media coverage|newsroom)\b/.test(q))
     return {
       label: "PR and media coverage",
@@ -195,7 +280,7 @@ export function requestedCollection(
   if (/\b(?:awards|recognitions)\b/.test(q))
     return {
       label: "awards and recognitions",
-      matches: (document) => document.type === "award",
+      matches: (document) => document.type === "award" || document.role === "awards",
     };
   if (/\b(?:thought leadership|thought-leadership)\b/.test(q))
     return {
@@ -211,13 +296,13 @@ export function requestedCollection(
     return {
       label: "expertise pages",
       matches: (document) =>
-        normalizedServiceType(document.service_type) === "expertise",
+        servicePortfolioTaxonomyType(document.service_type) === "expertise",
     };
   if (/\b(?:pillar|pillars|piller|pillers)\b/.test(q))
     return {
       label: "service pillars",
       matches: (document) =>
-        normalizedServiceType(document.service_type) === "pillar",
+        servicePortfolioTaxonomyType(document.service_type) === "pillar",
     };
   // A paginated service request can carry a topic from prior turns (for
   // example, "AI services" -> "more services"), so keep it in semantic
@@ -226,7 +311,7 @@ export function requestedCollection(
     return {
       label: "services",
       matches: (document) =>
-        normalizedServiceType(document.service_type) === "service",
+        servicePortfolioTaxonomyType(document.service_type) === "service",
     };
   return undefined;
 }
@@ -243,21 +328,111 @@ function isWhitepaperDocument(document: SuccessiveSearchDocument): boolean {
   );
 }
 
+export function extractExplicitInformationalSubject(query: string): string | undefined {
+  const normalized = normalizeSearchText(query)
+    .replace(/^switch (?:topics?|subject)\s+/, "");
+  const wrapped = [
+    /^(?:please|pls)\s+tell(?: me)?\s+(?:about|abt)\s+(.+)$/,
+    /^(?:can|could|would)\s+you\s+tell\s+me\s+about\s+(.+)$/,
+    /^what\s+about\s+(.+)$/,
+    /^(?:explain|describe|show me)\s+(?:the\s+)?(.+)$/,
+    /^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)?\s*(.+)$/,
+    /^(?:tell me (?:more )?about|do you have information about)\s+(.+)$/,
+    // Keep the wrapper suffix structural. An optional suffix can otherwise be
+    // skipped and become part of the captured entity.
+    /^what\s+(?:is|are)\s+(?:the\s+)?(.+)\s+used for$/,
+    /^what\s+does\s+(.+)\s+(?:do|discuss|cover)$/,
+    /^what\s+(.+?\s+(?:services?|capabilities|solutions?|products?))\s+does\s+.+\s+(?:provide|offer)$/,
+    /^how\s+does\s+(.+)\s+work$/,
+    /^what\s+(?:is|are)\s+(?:the\s+)?(.+)$/,
+  ].map((pattern) => normalized.match(pattern)?.[1]?.trim()).find(Boolean);
+  const bare = !wrapped && normalized.split(" ").length <= 10 &&
+    !/^(?:what|which|who|where|when|why|how|can|could|would|should|do|does|did|is|are|show|find|list|give|please)\b/.test(normalized)
+    ? normalized : undefined;
+  const subject = (wrapped ?? bare)
+    ?.replace(/^\s*(?:your|our|the)\s+/, "")
+    ?.replace(/^\s*(?:the\s+)?(?:blog|article|post)\s+/, "")
+    .replace(/\s+(?:address|addresses)$/, "")
+    .trim();
+  return subject || undefined;
+}
+
+/** Removes grammar which must not make a short technical subject look specific. */
+export function semanticInformationalSubject(subject: string): string {
+  return normalizeSearchText(subject)
+    .replace(/^(?:a|an|the)\s+/, "")
+    .trim();
+}
+
+export function isShortSemanticSubject(subject: string): boolean {
+  const semantic = semanticInformationalSubject(subject);
+  return semantic.split(" ").filter(Boolean).length === 1 && semantic.length >= 2 && semantic.length <= 4;
+}
+
+function subjectTokensMatch(value: string, subject: string): boolean {
+  const subjectTokens = semanticInformationalSubject(subject).split(" ").filter(Boolean);
+  const valueTokens = new Set(normalizeSearchText(value).split(" ").filter(Boolean)
+    .map((token) => token.length > 3 ? token.replace(/s$/, "") : token));
+  return subjectTokens.length > 0 && subjectTokens.every((token) =>
+    valueTokens.has(token.length > 3 ? token.replace(/s$/, "") : token));
+}
+
+/**
+ * A short explicit subject needs document-level proof that it is the subject,
+ * rather than a coincidental occurrence in prose. This intentionally uses
+ * title/slug or a title-local acronym, never body or recursively extracted ACF
+ * labels (which can include decorative icon/media names).
+ */
+export function hasDirectSubjectAuthority(document: SuccessiveSearchDocument, subject: string): boolean {
+  const semantic = semanticInformationalSubject(subject);
+  if (!semantic) return false;
+  const slug = document.slug.replace(/-/g, " ");
+  if (subjectTokensMatch(document.title, semantic) || subjectTokensMatch(slug, semantic)) return true;
+  // Index aliases can include acronyms lifted from arbitrary section headings.
+  // Only a title-local parenthetical acronym is document identity evidence.
+  if (new RegExp(`\\(${semantic.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`, "i").test(document.title)) return true;
+  return false;
+}
+
 function extractDirectLookupSubject(query: string): string {
-  return normalizeSearchText(query)
-    .replace(/^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)\s+/, "")
-    .replace(/^(?:tell me (?:more )?about|do you have information about|show me (?:the )?(?:customer story|case study)|what business needs does)\s+/, "")
-    .replace(/^(?:what|who)\s+(?:is|are)\s+(?:the\s+)?/, "")
+  return (extractExplicitInformationalSubject(query) ?? normalizeSearchText(query))
+    .replace(/^\s*(?:the\s+)?(?:blog|article|post)\s+/, "")
     .replace(/\s+(?:address|addresses)$/, "")
     .trim();
 }
 
-function directIdentityStrength(document: SuccessiveSearchDocument, subject: string): number {
+function directIdentityStrength(
+  document: SuccessiveSearchDocument,
+  subject: string,
+  requestedContentType?: QueryUnderstanding["requestedContentType"],
+): number {
   if (!subject) return 0;
   const slug = normalizeSearchText(document.slug.replace(/-/g, " "));
   if (document.normalizedTitle === subject) return 1;
   if (slug === subject) return 0.99;
   if (document.aliases.includes(subject)) return 0.98;
+  const acronym = subject.replace(/[^a-z0-9]/g, "");
+  const parentheticalAcronyms = [...document.title.matchAll(/\(([A-Za-z0-9]{2,8})\)/g)];
+  if (acronym.length >= 2 && acronym.length <= 8 &&
+      parentheticalAcronyms.some((match) => normalizeSearchText(match[1] ?? "") === acronym)) {
+    const prefix = document.title.slice(0, parentheticalAcronyms.find((match) =>
+      normalizeSearchText(match[1] ?? "") === acronym)?.index ?? 0);
+    const initials = normalizeSearchText(prefix).split(" ").filter(Boolean)
+      .slice(-acronym.length).map((term) => term[0]).join("");
+    if (initials === acronym) return 0.985;
+  }
+  if (slug.startsWith(`${subject} `) &&
+      /^(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities)\s*){1,8}$/.test(slug.slice(subject.length + 1)))
+    return 0.97;
+  if (document.normalizedTitle.startsWith(`${subject} `) &&
+      /^(?=.*\b(?:review|services?|solutions?|platform|product|company|consulting|capabilities)\b)(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities)\s*){1,8}$/.test(document.normalizedTitle.slice(subject.length + 1)))
+    return 0.97;
+  if (subject.split(" ").length >= 2 && ["product", "kagen-product"].includes(requestedContentType ?? "") &&
+      (document.productLike || document.role === "product")) {
+    const escaped = subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const productIdentity = new RegExp(`(?:\\b${escaped}\\b.{0,80}\\b(?:product|platform)\\b|\\b(?:product|platform)\\b.{0,80}\\b${escaped}\\b)`, "i");
+    if (document.structuredFields.some(({ value }) => productIdentity.test(normalizeSearchText(value)))) return 0.97;
+  }
   if (subject.split(" ").length < 2) return 0;
   const meaningfulSubject = subject
     .replace(/\b(?:successive|digital|company|about us)\b/g, " ")
@@ -273,6 +448,114 @@ function directIdentityStrength(document: SuccessiveSearchDocument, subject: str
   if ((document.normalizedTitle.includes(subject) || subject.includes(document.normalizedTitle)) && coverage >= 0.72)
     return 0.9 + coverage * 0.08;
   return coverage >= 0.88 ? coverage : 0;
+}
+
+const ENTITY_DESCRIPTION_TERMS = /\b(?:is|are|platform|product|service|solution|offering|program|system|tool|technology|capability|helps?|enables?|provides?|uses?|powered|designed|built|delivers?|supports?|automates?|accelerates?|orchestrates?)\b/;
+const MENTION_ONLY_TERMS = /\b(?:mention(?:ed|s)?|referenc(?:e|ed|es)|named|cited|announc(?:e|ed|ement))\b/;
+
+function embeddedEntityPassages(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): { passages: string[]; strength: number } | undefined {
+  const normalizedSubject = semanticInformationalSubject(subject);
+  const subjectTerms = normalizedSubject.split(" ").filter(Boolean);
+  const shortSubject = isShortSemanticSubject(subject);
+  if ((!shortSubject && (subjectTerms.length < 2 || normalizedSubject.length < 5)) ||
+      (shortSubject && !hasDirectSubjectAuthority(document, normalizedSubject))) return undefined;
+  // Do not elevate a short acronym from incidental body copy merely because an
+  // article in the user phrasing made the raw subject appear multi-word.
+
+  const exact = ` ${normalizedSubject} `;
+  const structuredPassages = document.structuredFields
+    .map(({ value }) => ({ text: value.trim(), normalizedText: normalizeSearchText(value) }))
+    .filter(({ text, normalizedText }) => text.length >= 40 &&
+      ` ${normalizedText} `.includes(exact) && ENTITY_DESCRIPTION_TERMS.test(normalizedText) &&
+      !MENTION_ONLY_TERMS.test(normalizedText));
+  const candidates = document.chunks
+    .filter((chunk) => ` ${chunk.normalizedText} `.includes(exact))
+    .map((chunk) => {
+      const position = chunk.normalizedText.indexOf(normalizedSubject);
+      const nearby = chunk.normalizedText.slice(
+        Math.max(0, position - 180),
+        Math.min(chunk.normalizedText.length, position + normalizedSubject.length + 420),
+      );
+      const descriptive = ENTITY_DESCRIPTION_TERMS.test(nearby) &&
+        !MENTION_ONLY_TERMS.test(nearby);
+      const structured = document.structuredFields.some(({ value }) => {
+        const normalized = normalizeSearchText(value);
+        return ` ${normalized} `.includes(exact) && ENTITY_DESCRIPTION_TERMS.test(normalized);
+      });
+      const heading = document.headings.some((value) =>
+        ` ${normalizeSearchText(value)} `.includes(exact),
+      );
+      return {
+        chunk,
+        score: (descriptive ? 60 : 0) + (structured ? 35 : 0) + (heading ? 25 : 0),
+        descriptive,
+      };
+    })
+    .filter((candidate) => candidate.descriptive)
+    .sort((a, b) => b.score - a.score || a.chunk.position - b.chunk.position);
+  if (!candidates.length) return undefined;
+
+  const representationRole = ["product", "service", "technology", "partner", "industry", "accelerator", "company", "global_capabilities", "page"].includes(document.role);
+  const supportingRole = ["press_release", "media", "editorial", "blog", "case_study", "resource"].includes(document.role);
+  const roleStrength = representationRole ? 30 : supportingRole ? 12 : 0;
+  return {
+    passages: [...structuredPassages.map(({ text }) => text), ...candidates.map(({ chunk }) => chunk.text)]
+      .filter((passage, index, all) => all.findIndex((other) => normalizeSearchText(other) === normalizeSearchText(passage)) === index)
+      .slice(0, 2),
+    strength: Math.min(1, 0.55 + candidates[0]!.score / 200 + roleStrength / 100),
+  };
+}
+
+export function rankEmbeddedEntityEvidence(
+  index: SuccessiveSearchDocument[],
+  currentMessage: string,
+  understanding: QueryUnderstanding | undefined,
+  excludedContent: Set<string>,
+): SearchMatch[] {
+  if (!understanding || !["define", "explain", "details", "summarize"].includes(understanding.answerMode)) return [];
+  const subject = withoutServiceTypeTerms(extractDirectLookupSubject(currentMessage));
+  if (!subject || /\b(?:other|another|more|else)\b/.test(normalizeSearchText(currentMessage))) return [];
+
+  return index
+    .map((document) => ({ document, evidence: embeddedEntityPassages(document, subject) }))
+    .filter((item): item is { document: SuccessiveSearchDocument; evidence: NonNullable<typeof item.evidence> } =>
+      Boolean(item.evidence) &&
+      !contentIdentity(item.document.title, item.document.url).some((key) => excludedContent.has(key)),
+    )
+    .map(({ document, evidence }): SearchMatch => {
+      const dedicated = directIdentityStrength(document, subject, understanding.requestedContentType) >= 0.9;
+      const shortSubjectAuthority = isShortSemanticSubject(subject) &&
+        hasDirectSubjectAuthority(document, subject);
+      const roleAligned = isRequestedContentTypeCompatible(document, understanding.requestedContentType);
+      const representation = !["post", "press-release", "media-coverage"].includes(document.type);
+      const priority = dedicated ? 400 : representation && roleAligned ? 300 : representation ? 230 : roleAligned ? 170 : 110;
+      return {
+        document,
+        score: Math.round((priority + evidence.strength * 100 + document.contentQuality / 10) * 100) / 100,
+        matchedFields: [
+          dedicated ? "exact-entity-authority" : "exact-embedded-entity",
+          ...(shortSubjectAuthority ? ["embedded-direct-subject-authority"] : []),
+          roleAligned ? "requested-role-representation" : "requested-role-supporting-evidence",
+        ],
+        selectedPassages: evidence.passages,
+        confidence: evidence.strength >= 0.8 ? "high" : "medium",
+        scoreBreakdown: {
+          title: dedicated ? 400 : 0,
+          headings: 0,
+          metadata: Math.round(evidence.strength * 100),
+          body: 100,
+          contentType: roleAligned ? 80 : 0,
+          penalties: 0,
+          authorityCoverage: 1,
+          entity: 1,
+        },
+      };
+    })
+    .sort((a, b) => b.score - a.score || b.document.contentQuality - a.document.contentQuality)
+    .slice(0, 5);
 }
 
 function canonicalPageMatch(
@@ -322,33 +605,45 @@ export function isRequestedContentTypeCompatible(
   if (requested === "accelerator") return document.type === "accelerators" || /accelerator/.test(identity);
   if (requested === "award") return document.role === "awards";
   if (requested === "product" || requested === "kagen-product")
-    return (document.role === "product" || document.productLike) && (requested !== "kagen-product" || /kagen/.test(identity));
+    return (document.role === "product" || document.productLike) &&
+      (requested !== "kagen-product" || /kagen/.test(`${identity} ${document.normalizedTitle} ${document.combinedText}`));
   if (requested === "technology") return document.role === "technology" || document.role === "global_capabilities";
   if (requested === "company" || requested === "leadership") return document.role === "company";
   if (requested === "culture") return document.role === "culture" || document.role === "company";
-  if (requested === "sub-service") return normalizedServiceType(document.service_type) === "sub service";
-  if (requested === "expertise") return normalizedServiceType(document.service_type) === "expertise";
+  if (requested === "sub-service") return normalizeServiceSchemaType(document.service_type) === "sub-service";
+  if (requested === "expertise") return normalizeServiceSchemaType(document.service_type) === "expertise";
   if (requested === "solution") return document.role === "service" || /solution/.test(identity);
-  if (requested === "resource") return document.role === "resource";
+  if (requested === "resource") return ["resource", "blog", "editorial"].includes(document.role) || document.type === "post" ||
+    (document.type === "page" && /\b(?:resource|guide|report|white ?paper|e-?book|download)\b/.test(
+      `${identity} ${document.descriptions.slice(0, 3).join(" ")}`,
+    ));
   if (requested === "thought-leadership")
     return ["thought-leadership", "employee-perspective"].includes(document.type);
   if (requested === "partner") return document.type === "partners";
   if (requested === "industry") return document.type === "industries";
   if (requested === "career") return document.type === "careers" || document.slug === "careers";
-  if (requested === "service")
-    return ["service", "expertise", "pillar"].includes(normalizedServiceType(document.service_type));
+  if (requested === "service") {
+    if (document.role === "service" || document.role === "global_capabilities" ||
+        isServiceFamilySchemaType(document.service_type)) return true;
+    // Some current and future published pages omit the legacy service taxonomy. A
+    // page is still service-compatible when its own structured copy clearly
+    // presents an offering/program and describes what the company delivers.
+    if (document.type !== "page" || document.role !== "page") return false;
+    const offeringText = normalizeSearchText(`${document.title} ${document.headings.join(" ")} ${document.descriptions.slice(0, 4).join(" ")}`);
+    return /\b(?:services?|consulting|development|implementation|proof of concept|workshop|program|solution)\b/.test(offeringText) &&
+      /\b(?:we|our|successive)\b/.test(offeringText);
+  }
   return document.type === "page";
 }
 
 export function normalizeQuery(query: string): string {
   const normalized = normalizeSearchText(query);
-  // Recover a known high-level topic even when visitors add misspellings or
-  // accidental keyboard noise around it (for example, "ai servies fhfghf").
-  const recognizedTopic = /\bai\b.*\b(?:service|services|servies|solution|solutions)\b/.test(
-          normalized,
-        )
-      ? "ai services"
-      : normalized;
+  // Remove obvious keyboard-noise tokens without collapsing a specific topic
+  // into a broader known phrase. This preserves unseen compound subjects while
+  // retaining typo/noise tolerance for every category.
+  const recognizedTopic = normalized.split(" ")
+    .filter((token) => token.length < 5 || /[aeiouy0-9]/.test(token))
+    .join(" ");
   // Short topic prompts need enough meaning to retrieve the corresponding
   // website page. This keeps answers grounded while supporting the terse
   // queries people naturally enter in a chat widget.
@@ -384,6 +679,56 @@ export function normalizeQuery(query: string): string {
   return [...new Set(corrected)].join(" ");
 }
 
+function editDistanceAtMostOne(left: string, right: string): boolean {
+  if (left === right) return true;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) { i++; j++; continue; }
+    if (left.length === right.length && left[i] === right[j + 1] && left[i + 1] === right[j]) {
+      if (++edits > 1) return false;
+      i += 2; j += 2; continue;
+    }
+    if (++edits > 1) return false;
+    if (left.length > right.length) i++;
+    else if (right.length > left.length) j++;
+    else { i++; j++; }
+  }
+  return edits + Number(i < left.length || j < right.length) <= 1;
+}
+
+function boundedTitleTypoStrength(document: SuccessiveSearchDocument, subject: string): number {
+  const subjectTokens = normalizeSearchText(subject).split(" ").filter(Boolean);
+  const identities = [document.normalizedTitle, normalizeSearchText(document.slug.replace(/-/g, " ")), ...document.aliases];
+  return identities.some((identity) => {
+    const identityTokens = normalizeSearchText(identity).split(" ").filter(Boolean);
+    if (identityTokens.length !== subjectTokens.length || identityTokens.length < 2) return false;
+    const mismatches = identityTokens.filter((token, index) => token !== subjectTokens[index]);
+    if (mismatches.length !== 1) return false;
+    const position = identityTokens.findIndex((token, index) => token !== subjectTokens[index]);
+    return editDistanceAtMostOne(identityTokens[position]!, subjectTokens[position]!);
+  }) ? 0.97 : 0;
+}
+
+/** Corrects one-edit tokens only when the correction is owned by indexed identities. */
+function correctMinorTyposFromIndex(query: string, index: SuccessiveSearchDocument[]): string {
+  const vocabulary = new Map<string, number>();
+  index.forEach((document) => {
+    const identity = `${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.headings.join(" ")}`;
+    normalizeSearchText(identity).split(" ").filter((token) => token.length >= 5)
+      .forEach((token) => vocabulary.set(token, (vocabulary.get(token) ?? 0) + 1));
+  });
+  return normalizeSearchText(query).split(" ").map((token) => {
+    if (token.length < 5 || vocabulary.has(token)) return token;
+    const candidates = [...vocabulary.entries()]
+      .filter(([candidate]) => editDistanceAtMostOne(token, candidate))
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    // Never guess between multiple corpus identities. Frequency is not
+    // identity evidence and must not turn a typo into an unrelated entity.
+    return candidates.length === 1 ? candidates[0]![0] : token;
+  }).join(" ");
+}
+
 type RequestedServiceType = "service" | "pillar" | "expertise";
 
 export function detectRequestedServiceTypes(
@@ -402,15 +747,6 @@ export function detectRequestedServiceTypes(
   if (/\b(?:expert|experts|expertise|exper)\b/.test(normalized))
     requested.push("expertise");
   return requested;
-}
-
-function normalizedServiceType(value: string | undefined): string {
-  const normalized = normalizeSearchText(value ?? "").replace(/\s+/g, "-");
-  // WordPress currently stores the dropdown values as `Sub-service` and the
-  // misspelled `Piller`. Visitors use the cleaner words service and pillar.
-  if (normalized === "sub-service") return "service";
-  if (normalized === "piller") return "pillar";
-  return normalized;
 }
 
 export function isBroadAiServicesQuery(query: string): boolean {
@@ -481,8 +817,7 @@ function explicitlyRequestsLegalContent(query: string): boolean {
 }
 
 function isAiPortfolioDocument(document: SuccessiveSearchDocument): boolean {
-  const serviceType = normalizedServiceType(document.service_type);
-  if (!["service", "expertise", "pillar"].includes(serviceType)) return false;
+  if (!isServiceFamilySchemaType(document.service_type)) return false;
   const identityText = normalizeSearchText(
     [
       document.title,
@@ -500,12 +835,9 @@ export function matchesRequestedServiceType(
   serviceType: string | undefined,
 ): boolean {
   const requested = detectRequestedServiceTypes(query);
-  return (
-    requested.length === 0 ||
-    requested.includes(
-      normalizedServiceType(serviceType) as RequestedServiceType,
-    )
-  );
+  const normalized = servicePortfolioTaxonomyType(serviceType);
+  return requested.length === 0 || Boolean(normalized) &&
+    requested.includes(normalized as RequestedServiceType);
 }
 
 export function requestsSpecificServiceTaxonomy(query: string): boolean {
@@ -714,7 +1046,7 @@ function buildInverseDocumentFrequency(
 }
 
 async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
-  // WordPress content is already revalidated every five minutes. Reusing the
+  // WordPress content is already revalidated every hour. Reusing the
   // derived index avoids repeated recursive ACF traversal and chunk generation
   // on every chat request while preserving the same freshness window.
   if (process.env.NODE_ENV === "test")
@@ -743,6 +1075,112 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
       indexBuildPromise = undefined;
     });
   return indexBuildPromise;
+}
+
+/**
+ * Resolves only explicit lookup wrappers around a known indexed identity.
+ * Intent-looking words inside the captured title remain part of that identity.
+ */
+export function matchExactIndexedTitle(
+  index: SuccessiveSearchDocument[],
+  message: string,
+): SearchMatch | undefined {
+  const explicitSubject = extractExplicitInformationalSubject(message);
+  if (!explicitSubject) return undefined;
+  const subject = correctMinorTyposFromIndex(explicitSubject, index);
+  const familyTerms = subject.split(" ").filter((term) =>
+    !/^(?:service|services|capability|capabilities|solution|solutions|offering|offerings|technology|technologies)$/.test(term));
+  const broadFamilyLookup = familyTerms.length === 1 &&
+    /\b(?:services?|capabilities|solutions?|offerings?|technolog(?:y|ies))\b/.test(subject);
+  if (broadFamilyLookup) return undefined;
+  const candidates = index
+    .map((document) => ({ document, strength: Math.max(
+      directIdentityStrength(document, subject), boundedTitleTypoStrength(document, subject),
+    ) }))
+    .filter(({ document, strength }) =>
+      strength >= 0.96 &&
+      (document.normalizedTitle.split(" ").length >= 2 || strength >= 0.99),
+    )
+    .sort((a, b) => {
+      const authority = (document: SuccessiveSearchDocument) =>
+        ["service", "technology", "product", "global_capabilities"].includes(document.role) ||
+          (document.role === "page" && /\b(?:services?|solutions?|consulting)\b/.test(
+            normalizeSearchText(`${document.title} ${document.slug.replace(/-/g, " ")} ${document.service_type ?? ""}`),
+          )) ? 3
+          : document.role === "case_study" ? 2
+          : ["partner", "partners", "blog", "editorial"].includes(document.role) ? 0 : 1;
+      const literalDelta = Number(b.strength >= 0.99) - Number(a.strength >= 0.99);
+      return literalDelta || authority(b.document) - authority(a.document) || b.strength - a.strength ||
+      b.document.normalizedTitle.length - a.document.normalizedTitle.length ||
+      b.document.contentQuality - a.document.contentQuality;
+    });
+  const selected = candidates[0];
+  const identityAuthority = (document: SuccessiveSearchDocument) =>
+    ["service", "technology", "product", "global_capabilities"].includes(document.role) ||
+      (document.role === "page" && /\b(?:services?|solutions?|consulting)\b/.test(
+        normalizeSearchText(`${document.title} ${document.slug.replace(/-/g, " ")} ${document.service_type ?? ""}`),
+      )) ? 3
+      : document.role === "case_study" ? 2
+      : ["partner", "partners", "blog", "editorial"].includes(document.role) ? 0 : 1;
+  if (selected && candidates[1]?.strength === selected.strength &&
+      identityAuthority(candidates[1].document) === identityAuthority(selected.document)) return undefined;
+  if (!selected) return undefined;
+  return {
+    document: selected.document,
+    score: Math.round((700 + selected.strength * 100) * 100) / 100,
+    matchedFields: [selected.strength >= 0.99 ? "exact-title-lock" : "near-exact-title-lock"],
+    selectedPassages: [selected.document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+    confidence: "high",
+    scoreBreakdown: {
+      title: 700, headings: 0, metadata: 0, body: 0, contentType: 0,
+      penalties: 0, authorityCoverage: selected.strength, entity: 1,
+    },
+  };
+}
+
+export async function resolveExactIndexedTitle(message: string): Promise<SearchMatch | undefined> {
+  return matchExactIndexedTitle(await loadSearchIndex(), message);
+}
+
+export function isExplicitRequestedRoleRelation(message: string): boolean {
+  return /^(?:show|find|give me|do you have|any)\s+(?:related\s+)?(?:services?|capabilities|case studies|customer stories|blogs?|articles?|resources?|products?|partners?|industries|accelerators?)\s+(?:related to|for|about)\s+.+$/i
+    .test(normalizeSearchText(message));
+}
+
+export function matchValidatedRequestedRole(
+  index: SuccessiveSearchDocument[],
+  message: string,
+  requested: QueryUnderstanding["requestedContentType"],
+): SearchMatch[] {
+  if (!requested) return [];
+  const normalized = normalizeSearchText(message);
+  const subject = normalized.match(
+    /^(?:show|find|give me|do you have|any)\s+(?:related\s+)?(?:services?|capabilities|case studies|customer stories|blogs?|articles?|resources?|products?|partners?|industries|accelerators?)\s+(?:related to|for|about)\s+(.+)$/,
+  )?.[1]?.trim();
+  if (!subject) return [];
+  const base = index
+    .map((document) => ({ document, strength: directIdentityStrength(document, subject) }))
+    .filter(({ strength }) => strength >= 0.96)
+    .sort((a, b) => b.strength - a.strength)[0]?.document;
+  if (!base) return [];
+  const byId = new Map(index.map((document) => [document.id, document]));
+  return base.relatedCapabilities
+    .filter((relation) => relation.evidence.some((item) =>
+      ["explicit-reference", "internal-link", "taxonomy"].includes(item),
+    ))
+    .map((relation) => ({ relation, document: byId.get(relation.documentId) }))
+    .filter((item): item is { relation: SuccessiveSearchDocument["relatedCapabilities"][number]; document: SuccessiveSearchDocument } =>
+      Boolean(item.document) && isRequestedContentTypeCompatible(item.document!, requested),
+    )
+    .sort((a, b) => b.relation.score - a.relation.score || b.document.contentQuality - a.document.contentQuality)
+    .slice(0, 5)
+    .map(({ document, relation }, position) => ({
+      document, score: Math.round((620 + relation.score * 100 - position) * 100) / 100,
+      matchedFields: ["validated-role-relation", "requested-role-representation"],
+      selectedPassages: [document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+      confidence: "high" as const,
+      scoreBreakdown: { title: 0, headings: 0, metadata: 620, body: 0, contentType: 100, penalties: 0, authorityCoverage: relation.score, entity: 1 },
+    }));
 }
 
 function scoreChunk(
@@ -1032,7 +1470,7 @@ export async function retrieveFromIndex(
   const retrievalStartedAt = performance.now();
   const baseIndex = await loadSearchIndex();
   const indexLoadedAt = performance.now();
-  const normalizedQuery = normalizeQuery(query);
+  const normalizedQuery = correctMinorTyposFromIndex(normalizeQuery(query), baseIndex);
   const interpretedIntent: Intent | undefined =
     understanding?.requestedContentType === "case-study" || understanding?.intent === "evidence"
       ? "case_studies"
@@ -1129,6 +1567,64 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
+  const exactTitleLock = matchExactIndexedTitle(index, currentMessage);
+  if (exactTitleLock &&
+      !contentIdentity(exactTitleLock.document.title, exactTitleLock.document.url)
+        .some((key) => excludedContent.has(key))) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: true,
+      matches: [exactTitleLock],
+      isProductList,
+      candidates: [exactTitleLock],
+    };
+  }
+  const validatedRoleMatches = matchValidatedRequestedRole(
+    index,
+    currentMessage,
+    understanding?.requestedContentType ?? null,
+  ).filter((match) => !contentIdentity(match.document.title, match.document.url)
+    .some((key) => excludedContent.has(key)));
+  if (validatedRoleMatches.length) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: true,
+      matches: validatedRoleMatches,
+      isProductList,
+      candidates: validatedRoleMatches,
+    };
+  }
+  // "Related to" asks for an edge, not another rendering of the base entity.
+  // If no structural edge validates the requested role, stop before lexical
+  // ranking can return the base subject itself as apparent relationship proof.
+  if (isExplicitRequestedRoleRelation(currentMessage)) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: false,
+      matches: [],
+      isProductList,
+      candidates: [],
+    };
+  }
+  const embeddedMatches = rankEmbeddedEntityEvidence(
+    index,
+    currentMessage,
+    understanding,
+    excludedContent,
+  );
+  if (embeddedMatches.length) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: true,
+      matches: embeddedMatches,
+      isProductList,
+      candidates: embeddedMatches,
+    };
+  }
   if (understanding?.temporalIntent && understanding.requestedContentType) {
     const dated = index
       .filter((document) => isRequestedContentTypeCompatible(document, understanding.requestedContentType))
@@ -1158,17 +1654,16 @@ export async function retrieveFromIndex(
     return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: matches.length > 0, matches, isProductList };
   }
   const directSubject = withoutServiceTypeTerms(extractDirectLookupSubject(currentMessage));
-  const explicitlyTypedLookup =
-    /^(?:show me (?:the )?(?:customer story|case study)|(?:find|show|do you have) (?:me )?(?:a |an |the )?(?:white ?paper|e-?book|webinar|event|blog|article|thought leadership|case stud(?:y|ies)))\b/i.test(
-      currentMessage.trim(),
-    );
   const directMatches = index
-    .map((document) => ({ document, strength: directIdentityStrength(document, directSubject) }))
+    .map((document) => ({ document, strength: directIdentityStrength(
+      document,
+      directSubject,
+      understanding?.requestedContentType,
+    ) }))
     .filter(({ document, strength }) =>
       strength >= 0.9 &&
-      (strength >= 0.99 ||
-        !explicitlyTypedLookup ||
-        isRequestedContentTypeCompatible(document, understanding?.requestedContentType ?? null)) &&
+      (!understanding?.requestedContentType ||
+        isRequestedContentTypeCompatible(document, understanding.requestedContentType)) &&
       !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)),
     )
     .sort((a, b) => b.strength - a.strength || b.document.contentQuality - a.document.contentQuality);
@@ -1177,11 +1672,28 @@ export async function retrieveFromIndex(
       document,
       score: Math.round((500 + strength * 100 - position) * 100) / 100,
       matchedFields: [strength >= 0.99 ? "normalized-exact-title" : "near-exact-title"],
-      selectedPassages: document.chunks[0]?.text ? [document.chunks[0].text] : [],
+      selectedPassages: [document.chunks.find(({ normalizedText }) =>
+        document.productLike && /\b(?:is|are)\s+(?:an?\s+)?[^.!?]{0,140}\b(?:product|platform|solution|tool)\b/.test(normalizedText))?.text ??
+        document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
       confidence: "high",
       scoreBreakdown: { title: 500, headings: 0, metadata: 0, body: 0, contentType: 0, penalties: 0, authorityCoverage: strength },
     }));
     return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches, isProductList };
+  }
+  // An explicit "X services/capabilities" request is an identity lookup, not
+  // permission to enumerate otherwise unrelated services whose body mentions
+  // X. If no compatible canonical identity was found, fail closed before the
+  // broad lexical scorer. Untyped topic discovery continues unchanged.
+  if (understanding?.requestedContentType === "service" && directSubject &&
+      extractExplicitInformationalSubject(currentMessage)) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: false,
+      matches: [],
+      candidates: [],
+      isProductList,
+    };
   }
   const broadServiceRequest = understanding?.targetScope === "portfolio" &&
     understanding.requestedContentType === "service" && !understanding.businessProblem &&
@@ -1192,11 +1704,11 @@ export async function retrieveFromIndex(
       .filter((document) => !isLegalDocument(document))
       .filter((document) => !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)))
       .sort((a, b) => {
-        const aType = normalizedServiceType(a.service_type) === "pillar" ? 1 : 0;
-        const bType = normalizedServiceType(b.service_type) === "pillar" ? 1 : 0;
+        const aType = normalizeServiceSchemaType(a.service_type) === "pillar" ? 1 : 0;
+        const bType = normalizeServiceSchemaType(b.service_type) === "pillar" ? 1 : 0;
         return bType - aType || b.contentQuality - a.contentQuality;
       });
-    const authoritative = portfolio.filter((document) => normalizedServiceType(document.service_type) === "pillar");
+    const authoritative = portfolio.filter((document) => normalizeServiceSchemaType(document.service_type) === "pillar");
     const chosen = authoritative.length ? authoritative : portfolio;
     const matches = chosen.slice(0, 8).map((document, position) => ({
       document,
@@ -1546,9 +2058,10 @@ export async function retrieveFromIndex(
     return true;
   });
   const idf = buildInverseDocumentFrequency(categoryIndex);
+  const correctedTopicalInput = correctMinorTyposFromIndex(query, categoryIndex);
   const topicalQuery =
     intent === "case_studies"
-      ? normalizeSearchText(query)
+      ? normalizeSearchText(correctedTopicalInput)
           .replace(
             /\b(?:find|show|tell|case|study|studies|success|story|stories|about)\b/g,
             " ",
@@ -1556,8 +2069,8 @@ export async function retrieveFromIndex(
           .replace(/\s+/g, " ")
           .trim()
       : requestedServiceTypes.length
-        ? withoutServiceTypeTerms(query)
-        : query;
+        ? withoutServiceTypeTerms(correctedTopicalInput)
+        : correctedTopicalInput;
   const semanticQuery = understanding ? buildRetrievalQuery(understanding) : "";
   const scoringQuery = intent === "about" ? "about us" : semanticQuery || topicalQuery || query;
   const scoringPlans = understanding

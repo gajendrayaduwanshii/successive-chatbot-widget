@@ -1,9 +1,303 @@
 import { describe, expect, it } from "vitest";
-import { buildCategoryNavigationActions, buildCollectionMemberActions, buildEvidenceBackedSuggestionActions, buildFollowUpQueryActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, classifySuggestionContext, hasSuggestionActionExecutor, resolveEligibleActionDocuments, resolveSuggestionAction } from "./suggestion-actions";
-import { buildSearchDocument } from "./search-index";
+import { buildCategoryNavigationActions, buildCollectionMemberActions, buildEvidenceBackedSuggestionActions, buildFollowUpQueryActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, classifySuggestionContext, hasSuggestionActionExecutor, noRelatedContentMessage, parseRelatedContentRequest, resolveEligibleActionDocuments, resolveSuggestionAction } from "./suggestion-actions";
+import { buildSearchDocument, buildSearchIndex } from "./search-index";
 import type { WordPressItem } from "@/types/wordpress";
 
 describe("global suggestion action registry", () => {
+  describe("validated authored internal links", () => {
+    it("indexes a relative content link and permits its eligible capability page", () => {
+      const source: WordPressItem = {
+        id: 801, type: "post", slug: "public-health-response", link: "https://example.test/blog/public-health-response/",
+        title: { rendered: "Public Health Technology Response" },
+        content: { rendered: '<p>Read about <a href="/healthcare-platform-development/">healthcare delivery</a>.</p><img src="/wp-content/uploads/hero.png">' },
+      };
+      const destination: WordPressItem = {
+        id: 802, type: "page", slug: "healthcare-platform-development", link: "https://example.test/healthcare-platform-development/",
+        title: { rendered: "Healthcare Platform Development Company" },
+        content: { rendered: "Published healthcare platform engineering information for organizations." },
+      };
+      const [article, capability] = buildSearchIndex([source, destination]);
+      expect(article!.internalLinks).toEqual(["/healthcare-platform-development"]);
+      expect(article!.relatedCapabilities).toContainEqual(expect.objectContaining({ documentId: capability!.id, evidence: ["internal-link"] }));
+      expect(buildIndividualPageNavigationActions({ source: article!, corpus: [article!, capability!], userSubject: article!.title }))
+        .toEqual([expect.objectContaining({ targetResourceId: `${capability!.type}:${capability!.id}` })]);
+    });
+
+    it("permits a direct linked topical service without requiring its full source title", () => {
+      const source: WordPressItem = {
+        id: 803, type: "page", slug: "cloud-advisory", link: "https://example.test/cloud-advisory/",
+        title: { rendered: "Cloud Advisory for Enterprise Transformation" },
+        content: { rendered: '<a href="/cloud-migration-services/">Cloud migration</a>' },
+        acf: { service_type: "Service" },
+      };
+      const destination: WordPressItem = {
+        id: 804, type: "page", slug: "cloud-migration-services", link: "https://example.test/cloud-migration-services/",
+        title: { rendered: "Cloud Migration Services" }, content: { rendered: "Cloud migration planning and delivery." },
+        acf: { service_type: "Service" },
+      };
+      const [advisory, migration] = buildSearchIndex([source, destination]);
+      expect(buildIndividualPageNavigationActions({ source: advisory!, corpus: [advisory!, migration!], userSubject: advisory!.title }))
+        .toEqual([expect.objectContaining({ targetResourceId: `${migration!.type}:${migration!.id}` })]);
+    });
+  });
+
+  describe("structured related-content routing", () => {
+    const doc = (id: number, title: string, role: "page" | "service" | "blog" | "resource" | "case_study") => {
+      const type = role === "blog" ? "post" : role === "case_study" ? "case-study" : "page";
+      const result = buildSearchDocument({ id, type, slug: title.toLowerCase().replace(/\W+/g, "-"),
+        link: `https://example.test/${id}/`, title: { rendered: title },
+        content: { rendered: `${title} provides workflow automation evidence.` } });
+      result.role = role;
+      return result;
+    };
+
+    it("parses related pages as a role rather than a subject", () => {
+      expect(parseRelatedContentRequest("Explore related pages")?.requestedRoles).toEqual(["page"]);
+    });
+
+    it("preserves the subject while restricting related services", () => {
+      const source = doc(201, "Workflow Automation", "page");
+      const service = doc(202, "Workflow Automation Service", "service");
+      const article = doc(203, "Workflow Automation Guide", "blog");
+      const actions = buildGlobalRelatedContentActions({ source, corpus: [source, service, article], userSubject: "workflow automation", limit: 10 });
+      expect(actions.find((action) => action.targetContentType === "service"))
+        .toMatchObject({ subject: "workflow automation", resultKeys: [`${service.type}:${service.id}`] });
+    });
+
+    it("requires article/resource role plus same-subject evidence", () => {
+      expect(parseRelatedContentRequest("Read related articles")?.requestedRoles).toEqual(["blog", "editorial"]);
+      expect(parseRelatedContentRequest("Show related resources")?.requestedRoles).toEqual(["resource", "whitepaper", "report"]);
+    });
+
+    it("filters a requested content type when its topic is different", () => {
+      const source = doc(204, "Workflow Automation", "page");
+      const unrelated = doc(205, "Retail Commerce Article", "blog");
+      unrelated.descriptions = ["Retail storefront merchandising."];
+      const action = { id: "related", intent: "CONTENT_DISCOVERY" as const, label: "Visible label",
+        relation: "RELATED_TO_SOURCE" as const, subject: "workflow automation", sourceContext: `${source.type}:${source.id}`,
+        targetContentType: "blog", resultKeys: [`${unrelated.type}:${unrelated.id}`] };
+      expect(resolveEligibleActionDocuments(action, [source, unrelated])).toEqual([]);
+    });
+
+    it("rejects non-page content sharing only broad subject tokens", () => {
+      const source = doc(260, "Atlas Engineering", "service");
+      const adjacent = doc(261, "Geographic Projection Guide", "blog");
+      adjacent.descriptions = ["Engineering geographic data for map projections."];
+      const action = { id: "broad-related", intent: "CONTENT_DISCOVERY" as const, label: "Explore Geographic Projection Guide",
+        relation: "RELATED_TO_SOURCE" as const, subject: "atlas engineering", sourceContext: `${source.type}:${source.id}`,
+        targetContentType: "blog", resultKeys: [`${adjacent.type}:${adjacent.id}`] };
+      expect(resolveEligibleActionDocuments(action, [source, adjacent])).toEqual([]);
+    });
+
+    it("retains candidate-owned multi-word subject evidence", () => {
+      const source = doc(262, "Atlas Engineering", "service");
+      const related = doc(263, "Governed Delivery Guide", "blog");
+      related.descriptions = ["Atlas engineering practices for governed delivery."];
+      const action = { id: "strong-related", intent: "CONTENT_DISCOVERY" as const, label: "Explore Governed Delivery Guide",
+        relation: "RELATED_TO_SOURCE" as const, subject: "atlas engineering", sourceContext: `${source.type}:${source.id}`,
+        targetContentType: "blog", resultKeys: [`${related.type}:${related.id}`] };
+      expect(resolveEligibleActionDocuments(action, [source, related])).toEqual([related]);
+    });
+
+    it("rejects a navigation-heavy page that lacks direct subject evidence", () => {
+      const source = doc(206, "Workflow Automation", "page");
+      const index = doc(207, "Website Directory", "page");
+      index.descriptions = ["Browse the website."];
+      index.textSegments = ["Browse the website."];
+      index.internalLinks = Array.from({ length: 14 }, (_, value) => `https://example.test/item-${value}/`);
+      index.internalLinks.push(source.url);
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, index], userSubject: "workflow automation" }))
+        .toEqual([]);
+    });
+
+    it("rejects an index-identity page even when its early copy lists the subject", () => {
+      const source = doc(246, "Process Capability", "page");
+      const index = doc(247, "Content Directory", "page");
+      index.descriptions = ["Browse workflow automation and other topics."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, index],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("retains a page with direct evidence for the distinguishing subject terms", () => {
+      const source = doc(220, "Process Capability", "page");
+      const related = doc(221, "Orchestration Operations", "page");
+      related.descriptions = ["Workflow automation patterns for operating teams."];
+      const action = buildGlobalRelatedContentActions({ source, corpus: [source, related],
+        userSubject: "workflow automation" }).find((candidate) => candidate.targetContentType === "page");
+      expect(action?.resultKeys).toEqual([`${related.type}:${related.id}`]);
+      expect(resolveEligibleActionDocuments(action!, [source, related])).toEqual([related]);
+    });
+
+    it("filters an unrelated normal page independently", () => {
+      const source = doc(222, "Process Capability", "page");
+      const unrelated = doc(223, "Retail Operations", "page");
+      unrelated.descriptions = ["Store merchandising and inventory planning."];
+      unrelated.textSegments = ["Store merchandising and inventory planning."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, unrelated],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("filters a page that shares only generic company boilerplate", () => {
+      const source = doc(224, "Modern Platform Capability", "page");
+      const boilerplate = doc(225, "Organization Overview", "page");
+      boilerplate.descriptions = ["Our company provides application delivery, enterprise consulting, transformation strategy, and engineering services."];
+      boilerplate.textSegments = [...boilerplate.descriptions];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, boilerplate],
+        userSubject: "application engineering" })).toEqual([]);
+    });
+
+    it("filters a page supported only by a weak internal link", () => {
+      const source = doc(226, "Process Capability", "page");
+      const linked = doc(227, "Organization Directory", "page");
+      linked.descriptions = ["Browse organization information."];
+      linked.textSegments = ["Browse organization information."];
+      source.internalLinks.push(linked.url);
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, linked],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("does not treat subject terms found only in full-page footer content as topical evidence", () => {
+      const source = doc(232, "Process Capability", "page");
+      const footerMatch = doc(233, "Organization Overview", "page");
+      footerMatch.descriptions = ["Organization profile and locations."];
+      footerMatch.textSegments = ["Organization profile.", "Explore workflow automation in the site footer."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, footerMatch],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("does not treat subject terms found only in navigation or site-wide copy as topical evidence", () => {
+      const source = doc(234, "Process Capability", "page");
+      const navigationMatch = doc(235, "Organization Overview", "page");
+      navigationMatch.descriptions = ["Organization profile and locations."];
+      navigationMatch.textSegments = ["Navigation: Workflow", "Site links: Automation"];
+      navigationMatch.internalLinks = ["https://example.test/a/", "https://example.test/b/"];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, navigationMatch],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("does not treat a late directory heading as a canonical page heading", () => {
+      const source = doc(244, "Process Capability", "page");
+      const directory = doc(245, "Organization Directory", "page");
+      directory.headings = ["Organization", "Locations", "Browse Topics", "Workflow Automation"];
+      directory.descriptions = ["Organization directory and topic links."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, directory],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("retains canonical heading and primary-description evidence", () => {
+      const source = doc(236, "Process Capability", "page");
+      const headingMatch = doc(237, "Operations Guide", "page");
+      headingMatch.headings = ["Workflow Automation Architecture"];
+      headingMatch.descriptions = ["Operational guidance."];
+      const descriptionMatch = doc(238, "Operations Blueprint", "page");
+      descriptionMatch.headings = [];
+      descriptionMatch.descriptions = ["A workflow automation blueprint for operating teams."];
+      const action = buildGlobalRelatedContentActions({ source,
+        corpus: [source, headingMatch, descriptionMatch], userSubject: "workflow automation" })
+        .find((candidate) => candidate.targetContentType === "page");
+      expect(new Set(action?.resultKeys)).toEqual(new Set([
+        `${headingMatch.type}:${headingMatch.id}`, `${descriptionMatch.type}:${descriptionMatch.id}`,
+      ]));
+    });
+
+    it("accepts a validated structural page relation without lexical fallback", () => {
+      const source = doc(248, "Process Capability", "page");
+      const related = doc(249, "Operational Blueprint", "page");
+      related.descriptions = ["A focused operating blueprint."];
+      source.relatedCapabilities = [{ documentId: related.id, score: 80, evidence: ["explicit-reference"] }];
+      const action = buildGlobalRelatedContentActions({ source, corpus: [source, related],
+        userSubject: "workflow automation" }).find((candidate) => candidate.targetContentType === "page");
+      expect(action?.resultKeys).toEqual([`${related.type}:${related.id}`]);
+      expect(resolveEligibleActionDocuments(action!, [source, related])).toEqual([related]);
+    });
+
+    it("requires a short acronym subject in title or a primary heading", () => {
+      const source = doc(250, "Automation Capability", "page");
+      const weak = doc(251, "Organization Overview", "page");
+      weak.descriptions = ["The organization also provides AI consulting."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, weak], userSubject: "AI" }))
+        .toEqual([]);
+    });
+
+    it("rejects a multi-word subject when only one token is localized", () => {
+      const source = doc(239, "Process Capability", "page");
+      const partial = doc(240, "Workflow Operations", "page");
+      partial.descriptions = ["Workflow guidance for operating teams."];
+      partial.textSegments = [...partial.descriptions];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, partial],
+        userSubject: "workflow automation" })).toEqual([]);
+    });
+
+    it("uses identical localized eligibility during generation and click-time validation", () => {
+      const source = doc(241, "Process Capability", "page");
+      const valid = doc(242, "Workflow Automation Blueprint", "page");
+      const footerOnly = doc(243, "Organization Overview", "page");
+      footerOnly.descriptions = ["Organization profile."];
+      footerOnly.textSegments = ["Workflow automation footer link."];
+      const corpus = [source, valid, footerOnly];
+      const action = buildGlobalRelatedContentActions({ source, corpus, userSubject: "workflow automation" })
+        .find((candidate) => candidate.targetContentType === "page");
+      expect(action?.resultKeys).toEqual([`${valid.type}:${valid.id}`]);
+      expect(resolveEligibleActionDocuments(action!, corpus)).toEqual([valid]);
+    });
+
+    it("keeps only the independently valid page from a mixed candidate set", () => {
+      const source = doc(228, "Process Capability", "page");
+      const valid = doc(229, "Workflow Automation Operations", "page");
+      const unrelated = doc(230, "Retail Operations", "page");
+      unrelated.descriptions = ["Store merchandising."];
+      unrelated.textSegments = ["Store merchandising."];
+      const broad = doc(231, "Organization Directory", "page");
+      broad.descriptions = ["Browse company information and services."];
+      broad.textSegments = ["Browse company information and services."];
+      source.internalLinks.push(unrelated.url, broad.url);
+      const action = buildGlobalRelatedContentActions({ source, corpus: [source, valid, unrelated, broad],
+        userSubject: "workflow automation" }).find((candidate) => candidate.targetContentType === "page");
+      expect(action?.resultKeys).toEqual([`${valid.type}:${valid.id}`]);
+      expect(resolveEligibleActionDocuments(action!, [source, valid, unrelated, broad])).toEqual([valid]);
+    });
+
+    it("provides a safe role-specific empty response with no fallback results", () => {
+      const action = { id: "empty-pages", intent: "CONTENT_DISCOVERY" as const,
+        relation: "RELATED_TO_SOURCE" as const, targetContentType: "page" as const,
+        resultKeys: ["page:999"] };
+      expect(resolveEligibleActionDocuments(action, [])).toEqual([]);
+      expect(noRelatedContentMessage(action)).toBe(
+        "No clearly supported related pages were found for this topic in the available Successive content.",
+      );
+    });
+
+    it("returns no executable action when no related content is valid", () => {
+      const source = doc(208, "Workflow Automation", "page");
+      const unrelated = doc(209, "Unrelated Operations", "service");
+      unrelated.descriptions = ["Separate operating model."];
+      expect(buildGlobalRelatedContentActions({ source, corpus: [source, unrelated], userSubject: "workflow automation" }))
+        .toEqual([]);
+    });
+
+    it("does not interpret an explicit new subject as a related action", () => {
+      expect(parseRelatedContentRequest("Tell me about a different engineering topic")).toBeNull();
+    });
+
+    it("leaves explicit careers requests to Careers routing", () => {
+      expect(parseRelatedContentRequest("Show current job openings")).toBeNull();
+    });
+
+    it("retains multiple valid same-subject related items", () => {
+      const source = doc(210, "Workflow Automation", "page");
+      const first = doc(211, "Workflow Automation Patterns", "blog");
+      const second = doc(212, "Workflow Automation Guide", "blog");
+      const action = buildGlobalRelatedContentActions({ source, corpus: [source, first, second], userSubject: "workflow automation", limit: 10 })
+        .find((candidate) => candidate.targetContentType === "blog");
+      expect(action?.resultKeys).toEqual([`${first.type}:${first.id}`, `${second.type}:${second.id}`]);
+      expect(resolveEligibleActionDocuments(action!, [source, first, second])).toEqual([first, second]);
+    });
+
+    it("preserves the existing normal follow-up executor", () => {
+      const [action] = buildFollowUpQueryActions(["Tell me more"], 1, "Workflow Automation");
+      expect(resolveSuggestionAction(action)).toBe("Tell me more related to Workflow Automation");
+    });
+  });
   it("builds an executable next question instead of repeating a displayed evidence card", () => {
     const [action] = buildFollowUpQueryActions(["Show me a related case study"]);
     expect(action).toMatchObject({ label: "Show me a related case study", intent: "FOLLOW_UP_QUERY",
@@ -156,6 +450,85 @@ describe("global suggestion action registry", () => {
     expect(actions.every((action) => action.subject === "Jordan Reed")).toBe(true);
     expect(actions.map((action) => action.label).join(" ")).toMatch(/culture/i);
     expect(actions.some((action) => /award|great places|deloitte|vega/i.test(action.label))).toBe(false);
+  });
+
+  it("requires local role evidence for leadership-answer navigation and permits fewer results", () => {
+    const source = buildSearchDocument({ id: 74, type: "page", slug: "about-us", link: "https://example.test/about-us/",
+      title: { rendered: "About Us" }, content: { rendered: "Company information." },
+      acf: { executive_management: [{ name: "Jordan Reed", designation: "Founder & CEO" }] } });
+    const ceoArticle = buildSearchDocument({ id: 75, type: "post", slug: "ceo-interview", link: "https://example.test/ceo-interview/",
+      title: { rendered: "A Conversation with CEO Jordan Reed" }, content: { rendered: "Leadership interview." } });
+    const sitemap = buildSearchDocument({ id: 76, type: "page", slug: "site-map", link: "https://example.test/site-map/",
+      title: { rendered: "Site Map" }, content: { rendered: "Browse all company pages." } });
+    const partner = buildSearchDocument({ id: 77, type: "post", slug: "cloud-partnership", link: "https://example.test/cloud-partnership/",
+      title: { rendered: "Cloud Platform Partnership" }, content: { rendered: "A strategic technology partnership." } });
+    source.internalLinks = [ceoArticle.url, sitemap.url, partner.url];
+
+    const actions = buildIndividualPageNavigationActions({
+      source, corpus: [source, ceoArticle, sitemap, partner], userSubject: "ceo", limit: 3,
+      leadershipContext: { relation: "leadership", requestedRole: "ceo", resolvedPerson: "Jordan Reed" },
+    });
+
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.targetResourceId).toBe(`${ceoArticle.type}:${ceoArticle.id}`);
+    expect(resolveEligibleActionDocuments(actions[0]!, [source, ceoArticle, sitemap, partner]))
+      .toEqual([ceoArticle]);
+  });
+
+  it("keeps board suggestions locally board-related and rejects unrelated linked articles", () => {
+    const source = buildSearchDocument({ id: 78, type: "page", slug: "about-us", link: "https://example.test/about-us/",
+      title: { rendered: "About Us" }, content: { rendered: "Company information." } });
+    const boardArticle = buildSearchDocument({ id: 79, type: "post", slug: "board-appointments", link: "https://example.test/board-appointments/",
+      title: { rendered: "Industry Leaders Appointed to the Board" }, content: { rendered: "Board appointment announcement." } });
+    const shipment = buildSearchDocument({ id: 791, type: "post", slug: "shipment-tracking", link: "https://example.test/shipment-tracking/",
+      title: { rendered: "Automated Shipment Tracking Systems" }, content: { rendered: "Logistics automation guide." } });
+    source.internalLinks = [boardArticle.url, shipment.url];
+
+    const actions = buildIndividualPageNavigationActions({
+      source, corpus: [source, boardArticle, shipment], userSubject: "board directors", limit: 3,
+      leadershipContext: { relation: "board" },
+    });
+    expect(actions.map((action) => action.targetResourceId)).toEqual([`${boardArticle.type}:${boardArticle.id}`]);
+  });
+
+  it("does not fill executive-management suggestions with unrelated linked services", () => {
+    const source = buildSearchDocument({ id: 792, type: "page", slug: "about-us", link: "https://example.test/about-us/",
+      title: { rendered: "About Us" }, content: { rendered: "Company information." } });
+    const cloud = buildSearchDocument({ id: 793, type: "page", slug: "cloud-resale", link: "https://example.test/cloud-resale/",
+      title: { rendered: "Cloud Re-Sales" }, content: { rendered: "Managed cloud commercials and governance." } });
+    cloud.role = "service";
+    source.internalLinks = [cloud.url];
+    expect(buildIndividualPageNavigationActions({
+      source, corpus: [source, cloud], userSubject: "executive management", limit: 3,
+      leadershipContext: { relation: "executives" },
+    })).toEqual([]);
+  });
+
+  it.each([
+    ["Jordan Reed", "Senior Manager BU Head (Frontend)", "Frontend Engineering", "frontend"],
+    ["Priya Nair", "Head of Data Science", "Applied Data Science", "data science"],
+  ])("uses dynamic published role/domain evidence for exact-person suggestions: %s", (person, role, relatedTitle, domain) => {
+    const source = buildSearchDocument({ id: 800 + person.length, type: "page", slug: `about-${person.length}`,
+      link: `https://example.test/about-${person.length}/`, title: { rendered: "About Us" },
+      content: { rendered: "Published leadership profiles." } });
+    const related = buildSearchDocument({ id: 820 + person.length, type: "post", slug: `related-${person.length}`,
+      link: `https://example.test/related-${person.length}/`, title: { rendered: relatedTitle },
+      content: { rendered: `A detailed article about ${domain}.` } });
+    const unrelated = buildSearchDocument({ id: 840 + person.length, type: "post", slug: `unrelated-${person.length}`,
+      link: `https://example.test/unrelated-${person.length}/`, title: { rendered: "Unrelated Operations Article" },
+      content: { rendered: "A logistics operations article." } });
+    // Simulate a site-wide/footer mention. It must not count as page-local evidence.
+    unrelated.combinedText += ` ${person} ${role}`;
+    unrelated.textSegments.push(`${person} ${role}`);
+    source.internalLinks = [related.url, unrelated.url];
+
+    const actions = buildIndividualPageNavigationActions({
+      source, corpus: [source, related, unrelated], userSubject: person, limit: 3,
+      leadershipContext: { relation: "leadership", resolvedPerson: person, publishedRole: role, teamRelation: "leadership team" },
+    });
+    expect(actions.map((action) => action.targetResourceId)).toEqual([`${related.type}:${related.id}`]);
+    expect(actions[0]?.subject).toBe(person);
+    expect(resolveEligibleActionDocuments(actions[0]!, [source, related, unrelated])).toEqual([related]);
   });
 
   it("does not suggest unrelated award pages from a capabilities page", () => {

@@ -160,10 +160,30 @@ export function normalizeSearchText(value: string): string {
     .trim();
 }
 
+export type ServiceSchemaType = "service" | "sub-service" | "expertise" | "pillar";
+
+/** One source-schema vocabulary for every service-family eligibility gate. */
+export function normalizeServiceSchemaType(value: string | undefined): ServiceSchemaType | null {
+  const normalized = normalizeSearchText(value ?? "").replace(/\s+/g, "-");
+  if (normalized === "piller") return "pillar";
+  if (["service", "sub-service", "expertise", "pillar"].includes(normalized))
+    return normalized as ServiceSchemaType;
+  return null;
+}
+
+export function isServiceFamilySchemaType(value: string | undefined): boolean {
+  return normalizeServiceSchemaType(value) !== null;
+}
+
+/** Maps a source subtype to the public portfolio taxonomy without losing its display subtype. */
+export function servicePortfolioTaxonomyType(value: string | undefined): "service" | "expertise" | "pillar" | null {
+  const normalized = normalizeServiceSchemaType(value);
+  return normalized === "sub-service" ? "service" : normalized;
+}
+
 function documentRole(item: WordPressItem, slug: string, serviceType?: string): SuccessiveSearchDocument["role"] {
   const type = item.type ?? "page";
   const identity = normalizeSearchText(`${typeof item.title === "string" ? item.title : item.title?.rendered ?? ""} ${slug}`);
-  const normalizedService = normalizeSearchText(serviceType ?? "");
   const acf = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
     ? item.acf as Record<string, unknown>
     : {};
@@ -171,6 +191,10 @@ function documentRole(item: WordPressItem, slug: string, serviceType?: string): 
   if (Array.isArray(acf.capabilities_categories)) return "global_capabilities";
   if (Array.isArray(acf.partnerships_repeater)) return "partners";
   if (Array.isArray(acf.advantage_slider)) return "careers";
+  // Current and future service landing pages may omit the legacy
+  // `service_type` field. Their structured offering collection is a stronger,
+  // topic-independent service signal than a page title convention.
+  if (Array.isArray(acf.services_repeater) && acf.services_repeater.length > 0) return "service";
   if (slug === "our-culture") return "culture";
   if (slug === "awards") return "awards";
   if (slug === "contact") return "contact";
@@ -194,7 +218,7 @@ function documentRole(item: WordPressItem, slug: string, serviceType?: string): 
   if (["post", "thought-leadership", "employee-perspective", "press-release", "media-coverage"].includes(type))
     return "editorial";
   if (/whitepaper|ebook|webinar|event|resource/.test(`${type} ${slug}`)) return "resource";
-  if (["service", "sub service", "pillar", "piller", "expertise"].includes(normalizedService)) return "service";
+  if (isServiceFamilySchemaType(serviceType)) return "service";
   if (["about", "about-us", "home"].includes(slug)) return "company";
   return "page";
 }
@@ -359,6 +383,37 @@ export function normalizeWordPressUrl(value: string): string {
   }
 }
 
+/**
+ * Keep only navigable, first-party destinations from authored content. Media
+ * paths and arbitrary ACF metadata are not resource relationships.
+ */
+function firstPartyContentPath(value: string): string | undefined {
+  try {
+    const publicSite = new URL(getEnv().SUCCESSIVE_PUBLIC_SITE_URL);
+    const target = new URL(value.replace(/&amp;/g, "&"), publicSite);
+    const sameHost = target.hostname === publicSite.hostname ||
+      target.hostname.replace(/^www\./, "") === publicSite.hostname.replace(/^www\./, "");
+    if (!sameHost) return undefined;
+    const path = target.pathname.replace(/\/$/, "");
+    if (!path || /^\/(?:wp-content|wp-includes)\b/i.test(path) ||
+        /\.(?:avif|gif|jpe?g|png|svg|webp|pdf|mp4|webm)$/i.test(path)) return undefined;
+    return path;
+  } catch {
+    return undefined;
+  }
+}
+
+function authoredInternalLinks(content: string, acfLinks: Array<{ url: string }>): string[] {
+  const contentUrls = [
+    ...(content.match(/\bhref\s*=\s*["']([^"']+)["']/gi) ?? [])
+      .map((attribute) => attribute.match(/["']([^"']+)["']/)?.[1] ?? ""),
+    ...(content.match(/https?:\/\/[^\s"'<>\\]+/gi) ?? []),
+  ];
+  return [...new Set([...contentUrls, ...acfLinks.map(({ url }) => url)]
+    .map(firstPartyContentPath)
+    .filter((path): path is string => Boolean(path)))];
+}
+
 export function buildSearchDocument(
   item: WordPressItem,
   deepAnalysis = true,
@@ -449,13 +504,7 @@ export function buildSearchDocument(
   );
   // Structural navigation links remain necessary even when expensive semantic
   // cross-document analysis is disabled for the full corpus.
-  const internalLinks = [rendered(item.content), JSON.stringify(item.acf ?? {})]
-    .flatMap((value) => value.match(/https?:\/\/[^\s"'<>\\]+/g) ?? [])
-    .map((value) => {
-      try { return new URL(value.replace(/&amp;/g, "&")).pathname.replace(/\/$/, ""); }
-      catch { return ""; }
-    })
-    .filter(Boolean);
+  const internalLinks = authoredInternalLinks(rendered(item.content), extracted.links);
   // Title/headings lead the first chunk, while every editor and recursive ACF
   // text segment remains searchable in the subsequent overlapping chunks.
   const chunks = buildSearchChunks(item.id, [
@@ -580,7 +629,35 @@ export function buildSearchIndex(
   const documents = items
     .map((item) => buildSearchDocument(item, deepAnalysis))
     .filter((doc) => doc.url && doc.title !== "Untitled");
-  if (!deepAnalysis) return documents;
+  // Preserve authoritative outgoing WordPress/ACF links even for the full
+  // corpus. Semantic cross-document analysis is intentionally bounded, but a
+  // direct link from the exact base record is cheap structural evidence and
+  // must not disappear merely because the corpus exceeds the deep-analysis
+  // limit.
+  const attachStructuralRelations = () => {
+    const byPath = new Map(documents.map((document) => {
+      try { return [new URL(document.url).pathname.replace(/\/$/, ""), document] as const; }
+      catch { return ["", document] as const; }
+    }).filter(([path]) => path));
+    for (const document of documents) {
+      const linked = document.internalLinks
+        .map((path) => byPath.get(path.replace(/\/$/, "")))
+        .filter((candidate): candidate is SuccessiveSearchDocument => Boolean(candidate) && candidate!.id !== document.id);
+      const structural = [...new Map(linked.map((candidate) => [candidate.id, {
+        documentId: candidate.id,
+        score: 0.92,
+        evidence: ["internal-link" as const],
+      }])).values()];
+      document.relatedCapabilities = [...new Map([
+        ...document.relatedCapabilities,
+        ...structural,
+      ].map((relation) => [relation.documentId, relation])).values()];
+    }
+  };
+  if (!deepAnalysis) {
+    attachStructuralRelations();
+    return documents;
+  }
   const services = documents.filter((document) => document.role === "service");
   const meaningful = (terms: string[]) => new Set(
     terms.filter((term) => term.length > 3 && !GENERIC_RELATION_TERMS.has(term)),
@@ -702,5 +779,6 @@ export function buildSearchIndex(
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
   }
+  attachStructuralRelations();
   return documents;
 }

@@ -3,9 +3,10 @@ import { buildSearchDocument, normalizeSearchText, type SuccessiveSearchDocument
 import type { WordPressItem } from "@/types/wordpress";
 import type { SuggestionAction } from "./llm/schemas";
 import { buildDeterministicUnderstanding, classifyFollowUpScope } from "./query-understanding";
+import { designationHasRole, requestedPersonRole, type PersonRoleConcept } from "./person-roles";
 
 export type StructuredAttribute =
-  | "company_overview" | "founded" | "values" | "leadership" | "executives" | "board"
+  | "company_overview" | "founded" | "values" | "ownership" | "leadership" | "executives" | "board"
   | "advisors" | "certifications" | "company_location" | "global_presence" | "capabilities"
   | "technologies" | "culture" | "career_benefits" | "partners" | "awards"
   | "employee_policy" | "person";
@@ -15,6 +16,7 @@ export interface StructuredRequest {
   mode: "list" | "count" | "detail" | "overview" | "latest";
   subject: string;
   normalizedQuery: string;
+  requestedRole?: PersonRoleConcept;
 }
 
 export interface StructuredAnswer {
@@ -228,6 +230,7 @@ function isCompanyLocationQuery(query: string): boolean {
     /\bwhere can (?:i|we) visit\b/.test(query) ||
     /\bwhich (?:city|cities|country|countries)\b.*\b(?:located|based|operate|offices?|presence)\b/.test(query) ||
     /\bdo (?:you|successive) (?:have offices?|operate) in\b/.test(query) ||
+    /\b(?:us|u s|united states)[ -]?only company\b|\bonly (?:a )?(?:us|u s|united states) company\b/.test(query) ||
     /\b(?:located|based|operate|operates|presence) (?:in|at|outside)\b/.test(query) ||
     /^(?:location|locations|address|presence|which (?:city|country|cities|countries))$/.test(query)
   );
@@ -240,8 +243,25 @@ function isCompanyCertificationQuery(query: string): boolean {
     /\bwhat (?:certifications?|standards?) (?:do|does|are)\b/.test(query);
 }
 
+export function isOwnershipQuery(query: string): boolean {
+  const q = normalizeVisitorQuery(query);
+  if (/\b(?:data|content|code|project|task|account|asset|vehicle|home|property)(?: s)? ownership\b|\bownership (?:mindset|culture|experience)\b/.test(q))
+    return false;
+  return /\bwho (?:owns|controls)\b/.test(q) ||
+    /\bwho (?:is|are) (?:the )?owners?\b/.test(q) ||
+    /\b(?:company|business) owners?\b/.test(q) ||
+    /\bowners? of\b/.test(q) ||
+    /\bownership of\b/.test(q) ||
+    /\bs ownership\b/.test(q) ||
+    /\b(?:is|was) .{1,80}\bowned by\b/.test(q) ||
+    /\b(?:does|do) .{1,80}\bown\b/.test(q) ||
+    /^(?:the )?owners?(?: of (?:the )?company)?$/.test(q);
+}
+
 export function understandStructuredRequest(message: string): StructuredRequest | null {
   const q = normalizeVisitorQuery(message);
+  const ownershipIntent = isOwnershipQuery(q);
+  const requestedRole = ownershipIntent ? null : requestedPersonRole(q);
   const mode = /\b(?:how many|count|number of|total)\b/.test(q) ? "count"
     : /\b(?:latest|recent|newest|most recent|current)\b/.test(q) ? "latest"
       : /\b(?:what are|which|who are|list|show|any)\b/.test(q) ? "list"
@@ -262,14 +282,15 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     : undefined;
   let attribute: StructuredAttribute | undefined;
   if (/\b(?:appraisals?|performance reviews?|promotion|salary|hike|bonus|leave|notice period|probation|attendance|employee id|my manager|personal (?:phone|address)|private|confidential|internal .*?(?:forecast|policy|record)|absent today)\b/.test(q)) attribute = "employee_policy";
-  else if (person) attribute = "person";
+  else if (ownershipIntent) attribute = "ownership";
+  else if (person && !requestedRole) attribute = "person";
   else if (/\b(?:core values?|values?|principles?)\b/.test(q)) attribute = "values";
   else if (isCompanyCertificationQuery(q)) attribute = "certifications";
   else if (/\b(?:board(?: of directors)?|board members?)\b/.test(q)) attribute = "board";
   else if (/\b(?:executives?|executive management|management team)\b/.test(q)) attribute = "executives";
   else if (/\b(?:advisors?|partners and advisors)\b/.test(q)) attribute = "advisors";
-  else if (q === "owner" || /\b(?:ceo|chief executive(?: officer)?|founder|who owns(?: successive| the company)?|owner(?:ship)? of (?:successive|the company)|who founded|founded by|who runs|company head|head of (?:successive|the company)|managing partner|cro|chief revenue officer|cto|chief technology officer|coo|chief operating officer|cfo|chief financial officer|leadership|leaders?|who leads)\b/.test(q)) attribute = "leadership";
-  else if (/\b(?:how old|founded|founding year|established|started|company age|company history|history of successive|get started)\b/.test(q)) attribute = "founded";
+  else if (requestedRole || /\b(?:leadership|leaders?|who leads|management)\b/.test(q)) attribute = "leadership";
+  else if (/\b(?:how old|how long (?:the )?company (?:has been|is) in business|founded|founding year|established|started|company age|company history|history of successive|get started)\b/.test(q)) attribute = "founded";
   else if (isCompanyLocationQuery(q)) attribute = "company_location";
   else if (/\b(?:global enterprises?|global clients?|international clients?|support global)\b/.test(q)) attribute = "global_presence";
   else if (/\b(?:work culture|workplace|life at successive|employee culture|inclusive workplace|continuous learning|employee growth)\b/.test(q)) attribute = "culture";
@@ -281,10 +302,10 @@ export function understandStructuredRequest(message: string): StructuredRequest 
     !/\b(?:companies|businesses|organizations|organisations|industry|sector)\b/.test(q)
   )) attribute = "technologies";
   else if (/\b(?:global capabilities|technical capabilities|technical expertise|ai capabilities|digital experience capabilities|creative capabilities|devops capabilities|automation capabilities|your capabilities)\b/.test(q)) attribute = "capabilities";
-  else if (/^(?:what is successive(?: digital)?|what does successive(?: digital)? do|tell me about successive(?: digital)?|about successive(?: digital)?|company info(?:rmation)?|what kind of company is successive(?: digital)?)\??$/.test(q) ||
+  else if (/^(?:what is successive(?: digital)?|what does (?:successive(?: digital)?|(?:the|your|our) company) do|tell me about (?:successive(?: digital)?|(?:the|your|our) company)|about successive(?: digital)?|company info(?:rmation)?|what kind of company is successive(?: digital)?|is successive(?: digital)? (?:a )?(?:product|services?) company|or (?:a )?services? company)\??$/.test(q) ||
     /\b(?:successive advantage|what makes successive different|company differentiators?|why (?:choose|successive))\b/.test(q)) attribute = "company_overview";
   if (!attribute) return null;
-  return { attribute, mode, subject: person ?? subject, normalizedQuery: q };
+  return { attribute, mode, subject: person ?? subject, normalizedQuery: q, requestedRole: requestedRole ?? undefined };
 }
 
 /** Connects only a terse location refinement to the existing location path. */
@@ -307,6 +328,32 @@ export function understandContextualStructuredRequest(
     .filter((topic) => !/^(?:only|instead|specifically)$/.test(topic))
     .join(" ");
   return subject ? understandStructuredRequest(`${subject} office`) : null;
+}
+
+export type UnsupportedCompanyInformation = "operational_hours" | "financial_metrics" | "industry_superlative" | "company_type";
+
+export function requestedCompanyFactLabel(message: string): string {
+  const withoutPossessiveMarker = message.replace(/([\p{L}\p{N}])(?:['\u2019]s)\b/giu, "$1");
+  const normalized = normalizeSearchText(withoutPossessiveMarker)
+    .replace(/\b(?:what|which|how many|how much|does|do|did|is|are|was|were|has|have|had|tell me|show me|find|confirm|publicly|current|currently|latest|last year)\b/g, " ")
+    .replace(/\b(?:successive|digital|the company|company(?: s)?|its|your|their|a|an|the|of|for|previous year)\b/g, " ")
+    .replace(/^(?:['\u2019]+|[^\p{L}\p{N}]+)|(?:['\u2019]+|[^\p{L}\p{N}]+)$/gu, " ")
+    .replace(/\s+/g, " ").trim();
+  return normalized || "requested company information";
+}
+
+/** Classifies company questions that require explicit published evidence and must never fall through to lexical retrieval. */
+export function classifyUnsupportedCompanyInformation(message: string): UnsupportedCompanyInformation | null {
+  const q = normalizeSearchText(message);
+  if (/\b(?:office|business|working) (?:hours?|timings?|schedule)|\bopen (?:on )?(?:weekends?|saturdays?|sundays?)\b/.test(q))
+    return "operational_hours";
+  if (/\b(?:stock price|share price|market cap|valuation|(?:annual|yearly|company|its|your|successive(?: digital)?)?\s*(?:revenue|turnover|profit|earnings|income)|employee (?:count|total)|number of employees|how many employees|office count|number of offices|how many offices)\b/.test(q))
+    return "financial_metrics";
+  if (/\b(?:biggest|largest|main|primary|top) (?:industry|sector|focus)\b|\bwhich is (?:your|the) (?:biggest|largest|main|primary) focus\b/.test(q))
+    return "industry_superlative";
+  if (/\b(?:product|services?) company\b/.test(q) && (/\bsuccessive\b/.test(q) || /^(?:or|is it)\b/.test(q)))
+    return "company_type";
+  return null;
 }
 
 function roleDocument(items: WordPressItem[], role: SuccessiveSearchDocument["role"]) {
@@ -503,12 +550,25 @@ function pageAnswer(document: SuccessiveSearchDocument, answer: string, evidence
   return { answer, document, evidencePaths, suggestions };
 }
 
+function publishedOwnershipEvidence(document: SuccessiveSearchDocument): { value: string; path: string } | null {
+  const structured = document.structuredFields.find(({ path, label, value }) =>
+    /\b(?:owner|ownership|owned by|parent company|controlling (?:company|entity))\b/i.test(`${path.replace(/[_-]+/g, " ")} ${label}`) &&
+    value.trim().length > 1,
+  );
+  if (structured) return { value: structured.value.trim(), path: structured.path };
+
+  const explicitRelation = [...document.descriptions, ...document.textSegments]
+    .flatMap((value) => value.split(/(?<=[.!?])\s+/))
+    .find((value) => /\b(?:is (?:wholly |majority |privately )?owned by|ownership (?:is|belongs to)|parent company is|controlled by)\b/i.test(value));
+  return explicitRelation ? { value: explicitRelation.trim(), path: "published_company_content" } : null;
+}
+
 export function answerStructuredRequest(
   items: WordPressItem[],
   request: StructuredRequest,
 ): StructuredAnswer | null {
   const company = roleDocument(items, "company");
-  if (["company_overview", "founded", "values", "leadership", "executives", "board", "advisors", "certifications", "company_location", "global_presence", "person"].includes(request.attribute)) {
+  if (["company_overview", "founded", "values", "ownership", "leadership", "executives", "board", "advisors", "certifications", "company_location", "global_presence", "person"].includes(request.attribute)) {
     if (!company) return null;
     const { item, document } = company;
     if (request.attribute === "company_overview") {
@@ -535,10 +595,17 @@ export function answerStructuredRequest(
       }
       const currentYear = new Date().getUTCFullYear();
       const approximateAge = currentYear - Number(foundingYear);
-      const answer = request.normalizedQuery.includes("how old")
+      const answer = /\b(?:how old|how long|company age)\b/.test(request.normalizedQuery)
         ? `Successive Digital was founded in **${foundingYear}**, so it is approximately **${approximateAge} years old** in ${currentYear}.`
         : `Successive Digital was founded in **${foundingYear}**.`;
       return pageAnswer(document, answer, ["worldwide_footprint"], ["Tell me about Successive Digital", "Who founded Successive?"]);
+    }
+    if (request.attribute === "ownership") {
+      const evidence = publishedOwnershipEvidence(document);
+      const answer = evidence
+        ? `Successive Digital’s published company content states: ${evidence.value}`
+        : "I couldn’t confirm Successive Digital’s ownership from the current published Successive content.";
+      return pageAnswer(document, answer, evidence ? [evidence.path] : [], ["Tell me about Successive Digital"]);
     }
     if (request.attribute === "values") {
       const values = collection(item.acf, "core_values").map((entry) => ({
@@ -553,7 +620,8 @@ export function answerStructuredRequest(
       return pageAnswer(document, answer, ["core_values"], ["What does agility mean at Successive?", "Tell me about Successive’s culture"]);
     }
     const explicitLeadershipTeam = /\bleadership team\b/.test(request.normalizedQuery);
-    const peopleKeys = request.attribute === "board" ? ["board-directors"]
+    const peopleKeys = request.requestedRole ? ["executive_management", "leadership_team", "board-directors", "partners_and_advisors"]
+      : request.attribute === "board" ? ["board-directors"]
       : request.attribute === "executives" ? ["executive_management"]
         : request.attribute === "advisors" ? ["partners_and_advisors"]
           : request.attribute === "leadership" ? [explicitLeadershipTeam ? "leadership_team" : "executive_management"]
@@ -573,28 +641,21 @@ export function answerStructuredRequest(
       // The query names a published section, not a designation filter. For
       // example, "Executive Management" must not select only people whose
       // designation happens to contain the word "Executive".
-      const requestedExecutiveRole = /\bceo\b|chief executive(?: officer)?|who runs|company head|head of (?:successive|the company)/.test(request.normalizedQuery)
-        ? /\bceo\b|chief executive officer/i
-        : /\b(?:founder|owners?|ownership|who owns|who founded|founded by)\b/.test(request.normalizedQuery)
-          ? /\bfounder\b/i
-          : /\b(?:managing partner)\b/.test(request.normalizedQuery)
-            ? /\bmanaging partner\b/i
-            : /\b(?:cro|chief revenue officer)\b/.test(request.normalizedQuery)
-              ? /\b(?:cro|chief revenue officer)\b/i
-              : /\b(?:cto|chief technology officer)\b/.test(request.normalizedQuery)
-                ? /\b(?:cto|chief technology officer)\b/i
-                : /\b(?:coo|chief operating officer)\b/.test(request.normalizedQuery)
-                  ? /\b(?:coo|chief operating officer)\b/i
-                  : /\b(?:cfo|chief financial officer)\b/.test(request.normalizedQuery)
-                    ? /\b(?:cfo|chief financial officer)\b/i
-          : undefined;
+      const requestedExecutiveRole = request.requestedRole;
       const roleMatches = requestedExecutiveRole
-        ? people.filter(({ designation }) => requestedExecutiveRole.test(designation))
+        ? people.map((person) => ({
+          person,
+          priority: designationHasRole(person.designation, requestedExecutiveRole) ? 2
+            : requestedExecutiveRole === "board_member" && person.group === "board directors" ? 1
+              : 0,
+        })).filter(({ priority }) => priority > 0)
+          .sort((left, right) => right.priority - left.priority)
+          .map(({ person }) => person)
         : [];
       if (requestedExecutiveRole && !roleMatches.length) {
         return pageAnswer(
           document,
-          "I couldn’t confirm that executive role from Successive’s current published Executive Management API records.",
+          "I couldn’t confirm the requested role from Successive’s current published leadership records.",
           [],
           ["Show Successive’s executives", "Show the Leadership Team"],
         );
@@ -768,12 +829,16 @@ export function answerStructuredRequest(
     const source = roleDocument(items, "awards");
     if (!source) return null;
     if (request.mode === "latest") {
-      const awards = items.filter((item) => item.type === "award")
-        .sort((a, b) => Date.parse(b.date ?? b.modified ?? "") - Date.parse(a.date ?? a.modified ?? ""));
-      if (awards[0]) {
+      const awards = items.filter((item) => item.type === "award" && Number.isFinite(Date.parse(item.date ?? "")))
+        .sort((a, b) => Date.parse(b.date!) - Date.parse(a.date!));
+      const latestDate = awards[0]?.date ? Date.parse(awards[0].date) : NaN;
+      const hasUniqueLatest = Number.isFinite(latestDate) &&
+        (!awards[1]?.date || Date.parse(awards[1].date) < latestDate);
+      if (awards[0] && hasUniqueLatest) {
         const latest = buildSearchDocument(awards[0]);
         return pageAnswer(source.document, `The newest published award record in the current API is **${latest.title}**${awards[0].date ? ` (${awards[0].date.slice(0, 10)})` : ""}.`, ["award.date", "award.title"], ["Show all awards and recognitions", "What is Successive recognized for?"]);
       }
+      return pageAnswer(source.document, "The available published content confirms Successive’s awards collection, but it does not provide a unique, reliable award date that establishes which item is latest.", ["title", "description"], ["Show all awards and recognitions", "What is Successive recognized for?"]);
     }
     return pageAnswer(source.document, source.document.descriptions.slice(0, 5).join("\n\n"), ["title", "description", "title2", "description2"], ["What is Successive recognized for?", "What is Successive’s latest award?"]);
   }

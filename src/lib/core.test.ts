@@ -35,6 +35,7 @@ import {
 import {
   detectRequestedServiceTypes,
   isBroadAiServicesQuery,
+  isRequestedContentTypeCompatible,
   isUseCaseQuery,
   matchesRequestedServiceType,
   normalizeQuery,
@@ -46,6 +47,7 @@ import {
 import { fetchAllPublishedContent } from "./successive-api";
 import {
   canUseEnglishQueryDirectly,
+  normalizeInformalEnglish,
   prepareEnglishQuery,
 } from "./query-language";
 import {
@@ -65,12 +67,30 @@ import {
   shouldDeduplicateDiscoveryResults,
   resolveOfferedResourceFollowUp,
   resolveUnsupportedAlternativeFollowUp,
+  isAmbiguousResultSetReference,
+  continuesOffTopicContext,
 } from "./conversation-context";
 import { buildDeterministicUnderstanding, resolveConversationUnderstanding } from "./query-understanding";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+});
+
+describe("off-topic conversation context", () => {
+  it.each([
+    ["Who won yesterday's cricket match?", "What's the score?"],
+    ["Will it rain today?", "What about tomorrow?"],
+    ["Tell me about that movie", "Who stars in it?"],
+  ])("retains off-topic scope: %s -> %s", (first, followUp) => {
+    expect(continuesOffTopicContext(followUp, [{ role: "user", content: first }])).toBe(true);
+  });
+
+  it("allows an explicit Successive topic switch", () => {
+    expect(continuesOffTopicContext("What cloud services does Successive offer?", [
+      { role: "user", content: "What's the weather?" },
+    ])).toBe(false);
+  });
 });
 
 describe("named resource follow-ups", () => {
@@ -87,6 +107,13 @@ describe("named resource follow-ups", () => {
       .toBe("Summarize 'Second' article");
   });
 
+  it.each([
+    ["the last one", "Third"], ["the next one", "Second"], ["the other one", "Second"],
+  ])("resolves extended ordinal selection: %s", (message, title) => {
+    const prior = "Results: [First](https://successive.tech/first/) [Second](https://successive.tech/second/) [Third](https://successive.tech/third/).";
+    expect(resolveOfferedResourceFollowUp(message, [{ role: "assistant", content: prior }])).toContain(title);
+  });
+
   it("does not let a generic yes inherit an arbitrary old link", () => {
     expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: "See [About](https://successive.tech/about-us/)." }]))
       .toBeUndefined();
@@ -96,6 +123,21 @@ describe("named resource follow-ups", () => {
     const prior = "I couldn’t confirm Successive’s current internal projects from the available public content. I can instead show you Successive’s published case studies or publicly announced customer work.";
     expect(resolveUnsupportedAlternativeFollowUp("yes", [{ role: "assistant", content: prior }]))
       .toBe("Show me Successive published case studies");
+  });
+});
+
+describe("ambiguous result-set references", () => {
+  it("clarifies a bare reference when a listing has multiple validated targets", () => {
+    expect(isAmbiguousResultSetReference("Tell me more about that", [
+      { role: "user", content: "Show services" },
+      { role: "assistant", content: "[Cloud](https://successive.tech/cloud/) and [Data](https://successive.tech/data/)" },
+    ])).toBe(true);
+  });
+  it("keeps a dependent reference when the user has an active subject", () => {
+    expect(isAmbiguousResultSetReference("What about it?", [
+      { role: "user", content: "Tell me about DevSecOps" },
+      { role: "assistant", content: "[DevSecOps](https://successive.tech/devsecops/) and [Security](https://successive.tech/security/)" },
+    ])).toBe(false);
   });
 });
 
@@ -114,6 +156,8 @@ describe("intent detection", () => {
     expect(detectIntent("show case stduy")).toBe("case_studies");
     expect(detectIntent("we need app devlopment")).toBe("products");
     expect(detectIntent("Book a demo")).toBe("contact");
+    expect(detectIntent("What locations do you have?")).toBe("contact");
+    expect(detectIntent("Show office locations")).toBe("contact");
     expect(detectIntent("I need help")).toBe("general");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
@@ -149,13 +193,14 @@ describe("published contact details", () => {
     expect(
       extractPublishedContactDetails({
         offices: [
-          { phone: "+1 (315) 818-3656" },
+          { phone: "+1 (315) 818-3656", address: "325 N Saint Paul St, Dallas" },
           { phone: "+91 (120) 425-9482", email: "hello@example.com" },
         ],
       }),
     ).toEqual({
       phones: ["+1 (315) 818-3656", "+91 (120) 425-9482"],
       emails: ["hello@example.com"],
+      addresses: ["325 N Saint Paul St, Dallas"],
     });
   });
 });
@@ -277,6 +322,11 @@ describe("multi-turn conversation context", () => {
       true,
     );
   });
+
+  it.each(["other Kagen products", "Are there other Kagen products?", "more cloud services", "another healthcare case study"])(
+    "recognizes subject-qualified requests for another result: %s", (query) => {
+      expect(asksForAnotherResult(query)).toBe(true);
+    });
 
   it("resets retrieval context when the visitor explicitly changes topic", () => {
     expect(
@@ -544,6 +594,11 @@ describe("collection pagination requests", () => {
   it("keeps more services available for topic-aware semantic retrieval", () => {
     expect(requestedCollection("more services")).toBeUndefined();
     expect(requestedCollection("list all services")?.label).toBe("services");
+    expect(requestedCollection("What products are available?")?.label).toBe("products");
+    expect(requestedCollection("Show available accelerators.")?.label).toBe("accelerators");
+    const awards = requestedCollection("What awards has Successive received?");
+    expect(awards?.label).toBe("awards and recognitions");
+    expect(awards?.matches({ type: "page", role: "awards" } as never)).toBe(true);
   });
 });
 describe("short topic query normalization", () => {
@@ -1175,6 +1230,36 @@ describe("widget configuration", () => {
   });
 });
 describe("complete ACF search indexing", () => {
+  it("recognizes a structured offering page as a service without a legacy service_type", () => {
+    const document = buildSearchDocument({
+      id: 2602,
+      type: "page",
+      slug: "new-capability-offering",
+      link: "https://successive.ai/new-capability-offering/",
+      title: { rendered: "New Capability Offering" },
+      acf: {
+        hero_description: "A published business capability.",
+        services_repeater: [{ heading: "Strategy and implementation" }],
+      },
+    });
+    expect(document.role).toBe("service");
+  });
+
+  it("accepts an untyped structured offering page for generic service discovery", () => {
+    const document = buildSearchDocument({
+      id: 2601,
+      type: "page",
+      slug: "future-offering",
+      link: "https://successive.ai/future-offering/",
+      title: { rendered: "Future Capability Proof of Concept" },
+      acf: {
+        hero_description: "Our program helps organizations validate ideas and implement scalable solutions.",
+      },
+    });
+    expect(document.role).toBe("page");
+    expect(isRequestedContentTypeCompatible(document, "service")).toBe(true);
+  });
+
   it("preserves the service type used by service story cards", () => {
     const document = buildSearchDocument({
       id: 2603,
@@ -1563,6 +1648,17 @@ describe("complete ACF search indexing", () => {
     expect(result.matches[0]?.document.id).toBe(900);
     expect(result.matches[0]?.matchedFields).toContain("semantic-expansion");
   });
+  it("normalizes bounded routing language and strips explicit reset wrappers", () => {
+    expect(normalizeInformalEnglish("Switching topics, tell me about platform engineering"))
+      .toBe("tell me about platform engineering");
+    expect(normalizeInformalEnglish("leaving careers aside, tell me about data services"))
+      .toBe("tell me about data services");
+    expect(normalizeInformalEnglish("need a qoute for integration work"))
+      .toBe("need a quote for integration work");
+    expect(normalizeInformalEnglish("do u support native apps rn?"))
+      .toBe("do you support native apps right now?");
+  });
+
   it.skip("surfaces legacy custom WordPress API failures", async () => {
     vi.stubGlobal(
       "fetch",
