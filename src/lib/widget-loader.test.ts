@@ -50,23 +50,54 @@ describe("public direct-DOM widget loader", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("renders and submits only the structured action payload", async () => {
+  it("keeps structured response data while hiding demo-only result UI", async () => {
     const dom = createWidget();
     const fetchMock = vi.mocked(dom.window.fetch);
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: {
-      answer: "Service response", cards: [], sources: [], suggestions: ["Unsafe legacy label"], suggestionActions: [{
+      answer: "## Service response\n\nGrounded **inline content** is retained.", cards: [{
+        type: "page", title: "Published detail", description: "A validated result.",
+        url: "https://successive.tech/published-detail/", image: "https://successive.tech/image.jpg",
+      }], sources: [{ title: "Published detail", url: "https://successive.tech/published-detail/" }], suggestions: ["Unsafe legacy label"], suggestionActions: [{
         id: "content-page-42", label: "Explore published detail", intent: "CONTENT_DISCOVERY",
         relation: "RELATED_TO_SOURCE", resultKeys: ["page:42"], topic: "Published detail",
       }],
     } }) } as Response);
-    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: { answer: "Exact detail", cards: [], sources: [], suggestions: [], suggestionActions: [] } }) } as Response);
     (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat.sendMessage("service overview");
-    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLButtonElement>(".suggestions button")?.textContent).toContain("Explore published detail"));
-    expect(dom.window.document.querySelector(".suggestions")?.textContent).not.toContain("Unsafe legacy label");
-    dom.window.document.querySelector<HTMLButtonElement>(".suggestions button")!.click();
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    const body = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
-    expect(body.suggestionAction).toMatchObject({ id: "content-page-42", intent: "CONTENT_DISCOVERY", resultKeys: ["page:42"] });
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".conversation")?.textContent).toContain("Grounded inline content"));
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".contextual-link"))
+      .toBeNull(), { timeout: 3000 });
+    expect(dom.window.document.querySelector(".card-grid")).toBeNull();
+    expect(dom.window.document.querySelector(".result-card")).toBeNull();
+    expect(dom.window.document.querySelector(".sources")).toBeNull();
+    expect(dom.window.document.querySelector(".suggestions")).toBeNull();
+    expect(source).toContain("var renderSuggestions");
+    expect(source).toContain("executableSuggestions(message.response)");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds one validated contextual link without changing the answer or restoring result UI", async () => {
+    const dom = createWidget();
+    const fetchMock = vi.mocked(dom.window.fetch);
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ data: {
+      answer: "Jordan Lee is listed in Successive's leadership team section.",
+      cards: [{ type: "page", title: "Leadership Team", url: "https://successive.tech/leadership/" }],
+      sources: [
+        { title: "Unrelated external", url: "https://example.test/not-allowed/" },
+        { title: "Leadership Team", url: "https://successive.tech/leadership/" },
+      ],
+      suggestions: ["Explore related pages"], suggestionActions: [{
+        id: "leadership", label: "Explore leadership", intent: "CONTENT_DISCOVERY", resultKeys: ["page:1"],
+      }],
+    } }) } as Response);
+    (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat.sendMessage("Jordan Lee");
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".conversation")?.textContent)
+      .toContain("Jordan Lee is listed in Successive's leadership team section."));
+    await vi.waitFor(() => expect(dom.window.document.querySelector(".contextual-link"))
+      .toBeNull(), { timeout: 3000 });
+    const bubbles = dom.window.document.querySelectorAll(".message-row.assistant .bubble");
+    expect(bubbles[bubbles.length - 1]?.textContent)
+      .toContain("Jordan Lee is listed in Successive's leadership team section.");
+    expect(dom.window.document.querySelector(".card-grid, .sources, .suggestions")).toBeNull();
   });
   it("renders the chat UI directly without an iframe", () => {
     const dom = createWidget();
@@ -227,6 +258,23 @@ describe("public direct-DOM widget loader", () => {
         ),
       ).not.toBeNull(),
     );
+  });
+
+  it("renders a server-supplied inline CTA in the same assistant bubble as its definition", async () => {
+    const dom = createWidget();
+    vi.mocked(dom.window.fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: {
+        answer: "Generic definition.\n\nExplore [API Development Company](https://successive.tech/api-development/) for more details.",
+        cards: [], sources: [], suggestions: [],
+      } }),
+    } as Response);
+    (dom.window as unknown as { SuccessiveChat: { sendMessage(value: string): boolean } }).SuccessiveChat.sendMessage("What is an API?");
+    await vi.waitFor(() => {
+      const bubble = dom.window.document.querySelectorAll<HTMLElement>(".message-row.assistant .bubble").item(1);
+      expect(bubble?.textContent).toContain("Generic definition.");
+      expect(bubble?.querySelector("a")?.getAttribute("href")).toBe("https://successive.tech/api-development/");
+    });
   });
 
   it("renders structured headings, bold labels, and use-case bullets", async () => {

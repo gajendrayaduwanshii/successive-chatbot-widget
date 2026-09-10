@@ -104,6 +104,12 @@ export interface SearchMatch {
   score: number;
   matchedFields: string[];
   selectedPassages: string[];
+  /**
+   * A bounded unit recovered from a repeated/embedded structured record.
+   * This is deliberately carried separately from the source document: the
+   * source may be an aggregate page, while the answer subject is one card.
+   */
+  localEvidence?: { groupPath: string; passages: string[]; heading?: string; url?: string };
   scoreBreakdown?: {
     title: number;
     headings: number;
@@ -335,6 +341,12 @@ export function extractExplicitInformationalSubject(query: string): string | und
     /^(?:please|pls)\s+tell(?: me)?\s+(?:about|abt)\s+(.+)$/,
     /^(?:can|could|would)\s+you\s+tell\s+me\s+about\s+(.+)$/,
     /^what\s+about\s+(.+)$/,
+    /^(?:show(?: me)?|find|give me|list|do you have)\s+(?:the\s+)?(?:related\s+)?(?:blogs?|articles?|posts?|resources?|guides?|case studies|reports?|white ?papers?|e-?books?)\s+(?:related to|about|on|for)\s+(.+)$/,
+    // A leading factual/commercial predicate qualifies the following subject;
+    // it is not part of the entity identity. This is a bounded query shape,
+    // not global adjective removal.
+    /^(?:free|paid|pricing|price|cost|trial|subscription|included|available|certified|partnered|supported|guaranteed|unlimited)\s+(.+)$/,
+    /^(?:is|are)\s+(.+?)\s+(?:free|paid|included|available|certified|partnered|supported|guaranteed|unlimited)$/,
     /^(?:explain|describe|show me)\s+(?:the\s+)?(.+)$/,
     /^(?:summarize|summarise|give me a summary of)\s+(?:the\s+)?(?:blog|article|post)?\s*(.+)$/,
     /^(?:tell me (?:more )?about|do you have information about)\s+(.+)$/,
@@ -342,6 +354,7 @@ export function extractExplicitInformationalSubject(query: string): string | und
     // skipped and become part of the captured entity.
     /^what\s+(?:is|are)\s+(?:the\s+)?(.+)\s+used for$/,
     /^what\s+does\s+(.+)\s+(?:do|discuss|cover)$/,
+    /^what\s+(?:capabilities|features?)\s+(?:are|is)\s+(?:included|available|offered)\s+(?:in|with|for)\s+(.+)$/,
     /^what\s+(.+?\s+(?:services?|capabilities|solutions?|products?))\s+does\s+.+\s+(?:provide|offer)$/,
     /^how\s+does\s+(.+)\s+work$/,
     /^what\s+(?:is|are)\s+(?:the\s+)?(.+)$/,
@@ -367,6 +380,96 @@ export function semanticInformationalSubject(subject: string): string {
 export function isShortSemanticSubject(subject: string): boolean {
   const semantic = semanticInformationalSubject(subject);
   return semantic.split(" ").filter(Boolean).length === 1 && semantic.length >= 2 && semantic.length <= 4;
+}
+
+export function isDirectDefinitionQuery(message: string): boolean {
+  return /^(?:what\s+(?:is|are)|define|explain|what\s+does\s+.+\s+mean)\b/i.test(message.trim());
+}
+
+export function isCompactDefinitionSubject(subject: string): boolean {
+  const terms = semanticInformationalSubject(subject).split(" ").filter(Boolean);
+  return terms.length <= 2 && terms.join("").length <= 12;
+}
+
+/**
+ * Identity is not definition evidence. A direct-definition response may only
+ * compose a subject-focused explanatory sentence from the selected record.
+ */
+export function definitionEvidencePassages(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): string[] {
+  const normalizedSubject = semanticInformationalSubject(subject);
+  if (!normalizedSubject) return [];
+  const escaped = normalizedSubject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const explanatory = new RegExp(
+    `\\b${escaped}\\b(?:\\s+(?:is|are)\\s+(?:an?|the)\\b|(?:\\s*,?\\s*(?:our|an?|the)\\s+)?(?:(?:ai|cloud|enterprise|digital|native|agentic)[ -]){0,3}(?:platform|product|service|capability|accelerator)\\b|\\s+(?:refers?\\s+to|means?|enables?|allows?|helps?|provides?)\\b)`,
+    "i",
+  );
+  const contextualOnly = /\b(?:offline|unavailable|failure|fails?|failing|latency|fallback|error|errors|exception|troubleshoot(?:ing)?|retry|timeout|outage)\b/i;
+  // A generic subject must be the local thing being explained. "This API"
+  // inherits its identity from its preceding section, which may be a vendor
+  // or product API, and therefore cannot define generic API.
+  const equivalentLead = new RegExp(`^(?:(?:an?|the)\\s+)?${escaped}\\b`, "i");
+  const sources = [
+    ...document.structuredFields.filter((field) => field.kind === "text").map((field) => field.value),
+    ...document.descriptions,
+    ...document.textSegments,
+    ...document.chunks.map((chunk) => chunk.text),
+  ];
+  const seen = new Set<string>();
+  return sources.flatMap((source) => source.split(/(?<=[.!?])\s+/))
+    .map((sentence) => sentence.replace(/\s+/g, " ").trim())
+    .filter((sentence) => sentence.length >= 20 && equivalentLead.test(sentence) &&
+      explanatory.test(sentence) && !contextualOnly.test(sentence))
+    .filter((sentence) => {
+      const key = normalizeSearchText(sentence);
+      if ([...seen].some((existing) => existing.includes(key) || key.includes(existing))) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 3);
+}
+
+/**
+ * A direct entity question can be answered from first-party, subject-specific
+ * capability evidence even when the publisher did not write a dictionary
+ * sentence. Identity remains title/slug/alias-bound; this never searches
+ * arbitrary body text to discover an entity.
+ */
+export function semanticSynthesisEvidencePassages(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): string[] {
+  const normalizedSubject = semanticInformationalSubject(subject);
+  const subjectTerms = normalizedSubject.split(" ").filter((term) => term.length >= 2);
+  if (!subjectTerms.length || !hasDirectSubjectAuthority(document, normalizedSubject)) return [];
+  const seen = new Set<string>();
+  const factual = /\b(?:develop(?:ment|ers?|ing)?|build(?:ing|s)?|engineer(?:ing|ed|s)?|implement(?:ation|ing|s)?|frontend|interface|application|platform|framework|component|experience|integrat(?:e|ion|ing)|support(?:s|ing)?|enabl(?:e|es|ing)|help(?:s|ing)?|use(?:d|s)?|scal(?:e|able|ing)|moderniz(?:e|ation|ing))\b/i;
+  const sources = [
+    ...document.descriptions,
+    ...document.textSegments,
+    ...document.structuredFields.filter((field) => field.kind === "text").map((field) => field.value),
+    ...document.chunks.map((chunk) => chunk.text),
+  ];
+  return sources.flatMap((source) => source.split(/(?<=[.!?])\s+|\n+/))
+    .map((sentence) => sentence.replace(/\s+/g, " ").trim())
+    .filter((sentence) => sentence.length >= 30 && factual.test(sentence))
+    .filter((sentence) => {
+      const terms = new Set(normalizeSearchText(sentence).split(" "));
+      // The title/slug has already established identity for this canonical
+      // record, so its own authored factual copy is locally attributable even
+      // when the copy uses a pronoun such as "this framework".
+      return subjectTerms.every((term) => terms.has(term)) ||
+        hasDirectSubjectAuthority(document, normalizedSubject);
+    })
+    .filter((sentence) => {
+      const key = normalizeSearchText(sentence);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 4);
 }
 
 function subjectTokensMatch(value: string, subject: string): boolean {
@@ -395,7 +498,7 @@ export function hasDirectSubjectAuthority(document: SuccessiveSearchDocument, su
 }
 
 function extractDirectLookupSubject(query: string): string {
-  return (extractExplicitInformationalSubject(query) ?? normalizeSearchText(query))
+  return semanticInformationalSubject(extractExplicitInformationalSubject(query) ?? normalizeSearchText(query))
     .replace(/^\s*(?:the\s+)?(?:blog|article|post)\s+/, "")
     .replace(/\s+(?:address|addresses)$/, "")
     .trim();
@@ -422,11 +525,18 @@ function directIdentityStrength(
     if (initials === acronym) return 0.985;
   }
   if (slug.startsWith(`${subject} `) &&
-      /^(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities)\s*){1,8}$/.test(slug.slice(subject.length + 1)))
+      /^(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities|development|framework)\s*){1,8}$/.test(slug.slice(subject.length + 1)))
     return 0.97;
   if (document.normalizedTitle.startsWith(`${subject} `) &&
-      /^(?=.*\b(?:review|services?|solutions?|platform|product|company|consulting|capabilities)\b)(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities)\s*){1,8}$/.test(document.normalizedTitle.slice(subject.length + 1)))
+      /^(?=.*\b(?:review|services?|solutions?|platform|product|company|consulting|capabilities|development|framework)\b)(?:(?:and|for|of|the|review|services?|solutions?|platform|product|company|consulting|capabilities|development|framework)\s*){1,8}$/.test(document.normalizedTitle.slice(subject.length + 1)))
     return 0.97;
+  // Canonical technology pages may put a short implementation qualifier
+  // between the subject and their role-bearing suffix. The subject remains a
+  // literal title prefix and the suffix is deliberately bounded.
+  if (subject.length >= 4 && document.normalizedTitle.startsWith(`${subject} `) &&
+      /^(?:(?:[a-z0-9+#.-]{1,16})\s+){0,3}(?:services?|solutions?|platform|product|company|consulting|capabilities|development|framework)(?:\s+(?:company|services?|solutions?))?$/.test(
+        document.normalizedTitle.slice(subject.length + 1),
+      )) return 0.97;
   if (subject.split(" ").length >= 2 && ["product", "kagen-product"].includes(requestedContentType ?? "") &&
       (document.productLike || document.role === "product")) {
     const escaped = subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -450,13 +560,148 @@ function directIdentityStrength(
   return coverage >= 0.88 ? coverage : 0;
 }
 
-const ENTITY_DESCRIPTION_TERMS = /\b(?:is|are|platform|product|service|solution|offering|program|system|tool|technology|capability|helps?|enables?|provides?|uses?|powered|designed|built|delivers?|supports?|automates?|accelerates?|orchestrates?)\b/;
+// These are intent facets, not topic aliases: a canonical strategy/advisory
+// page can answer an adoption-strategy request only when the rest of the
+// explicit multi-word subject remains title-local as well.
+const EQUIVALENT_SUBJECT_FACETS = [
+  ["adopt", "adoption", "adopting", "implement", "implementation", "consult", "consulting", "advisory", "readiness"],
+  ["strategy", "strategic", "roadmap", "planning"],
+];
+
+function sameEquivalentFacet(left: string, right: string): boolean {
+  return EQUIVALENT_SUBJECT_FACETS.some((facet) => facet.includes(left) && facet.includes(right));
+}
+
+/**
+ * Conservative title-level equivalence for an explicit compound subject.
+ * It is intentionally unavailable to editorial/announcement records and
+ * requires all but one subject facet to remain literal canonical identity.
+ */
+export function canonicalEquivalentSubjectStrength(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): number {
+  const subjectTerms = [...new Set(semanticInformationalSubject(subject).split(" ").filter((term) => term.length > 1))];
+  if (subjectTerms.length < 3 || ["post", "press-release", "media-coverage"].includes(document.type)) return 0;
+  const canonicalRepresentation = ["service", "technology", "product", "global_capabilities", "industry", "page"].includes(document.role) &&
+    document.type === "page";
+  if (!canonicalRepresentation) return 0;
+  const titleTerms = new Set(normalizeSearchText(`${document.title} ${document.slug.replace(/-/g, " ")}`).split(" "));
+  const literal = subjectTerms.filter((term) => titleTerms.has(term));
+  if (literal.length < subjectTerms.length - 1) return 0;
+  const missing = subjectTerms.filter((term) => !titleTerms.has(term));
+  const replacements = [...titleTerms].filter((term) => !subjectTerms.includes(term));
+  if (missing.length !== 1 || !replacements.some((term) => sameEquivalentFacet(missing[0]!, term))) return 0;
+  return 0.9 + literal.length / subjectTerms.length * 0.08;
+}
+
 const MENTION_ONLY_TERMS = /\b(?:mention(?:ed|s)?|referenc(?:e|ed|es)|named|cited|announc(?:e|ed|ement))\b/;
+const MAJOR_SECTION_COLLECTION = /(?:^|[._-])(?:capabilit(?:y|ies)|services?|offerings?|solutions?|products?|accelerators?|strateg(?:y|ies)|engineering|business(?:_areas?)?)(?:\[\d+\]|\.\d+)(?:\.|$)/i;
+const SECTION_TITLE_FIELD = /(?:^|[._-])(?:title|heading|label|name)$/i;
+
+function sectionPrefix(path: string): string | undefined {
+  const match = path.match(/^(.*?(?:\[\d+\]|\.\d+))\./);
+  return match?.[1];
+}
+
+function isFirstPartySuccessiveUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      (url.hostname === "successive.tech" || url.hostname.endsWith(".successive.tech"));
+  } catch {
+    return false;
+  }
+}
+
+function subjectHasLocalDescription(text: string, normalizedSubject: string): boolean {
+  const escaped = normalizedSubject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `\\b${escaped}\\b(?:\\s*,?\\s*(?:our|an?|the))?\\s+(?:(?:ai|cloud|enterprise|digital|native|agentic)[ -]){0,3}(?:is|are|was|were|helps?|enables?|provides?|supports?|delivers?|uses?|offers?|accelerates?|automates?|orchestrates?|powers?|platform|product|service|capability)\\b`,
+    "i",
+  ).test(normalizeSearchText(text));
+}
+
+function entityFieldPrefix(path: string): string | undefined {
+  const match = path.match(/^(.*?)(?:[._-](?:title|heading|label|name))$/i);
+  return match?.[1];
+}
+
+function entityCanonicalLink(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): string | undefined {
+  const normalizedSubject = semanticInformationalSubject(subject);
+  const prefixes = document.structuredFields
+    .filter((field) => field.kind === "text" && SECTION_TITLE_FIELD.test(field.path) &&
+      normalizeSearchText(field.value) === normalizedSubject)
+    .map((field) => entityFieldPrefix(field.path))
+    .filter((prefix): prefix is string => Boolean(prefix));
+  for (const prefix of prefixes) {
+    const link = document.structuredLinks.find((candidate) =>
+      candidate.path.startsWith(prefix) &&
+      (isFirstPartySuccessiveUrl(candidate.url) ||
+        normalizeSearchText(new URL(candidate.url).pathname.replace(/[-_/]+/g, " "))
+          .includes(normalizedSubject)),
+    );
+    if (link) return link.url;
+  }
+  return undefined;
+}
+
+/**
+ * Repeated ACF cards are semantic units. Their field path is the boundary:
+ * a matching card title may use only its own copy and authored link, never a
+ * neighbouring card or an unrelated Home-page block.
+ */
+function structuredMajorSectionEvidence(
+  document: SuccessiveSearchDocument,
+  subject: string,
+): { document: SuccessiveSearchDocument; passages: string[]; strength: number; localEvidence: NonNullable<SearchMatch["localEvidence"]> } | undefined {
+  const normalizedSubject = semanticInformationalSubject(subject);
+  if (normalizedSubject.split(" ").length < 2) return undefined;
+  const titleField = document.structuredFields.find((field) =>
+    field.kind === "text" && SECTION_TITLE_FIELD.test(field.path) &&
+    normalizeSearchText(field.value) === normalizedSubject &&
+    Boolean(sectionPrefix(field.path)) && MAJOR_SECTION_COLLECTION.test(field.path),
+  );
+  if (!titleField) return undefined;
+  const prefix = sectionPrefix(titleField.path)!;
+  const localFields = document.structuredFields.filter((field) =>
+    field.kind === "text" && field.path.startsWith(`${prefix}.`),
+  );
+  const details = localFields
+    .filter((field) => field.path !== titleField.path && normalizeSearchText(field.value) !== normalizedSubject)
+    .map((field) => field.value.trim())
+    .filter((value, index, all) => value.length >= 24 && /[a-z]/i.test(value) &&
+      all.findIndex((candidate) => normalizeSearchText(candidate) === normalizeSearchText(value)) === index)
+    .slice(0, 3);
+  if (!details.length) return undefined;
+  const localLink = document.structuredLinks.find((link) =>
+    link.path.startsWith(`${prefix}.`) && isFirstPartySuccessiveUrl(link.url),
+  );
+  const title = titleField.value.trim();
+  return {
+    document: {
+      ...document,
+      title,
+      normalizedTitle: normalizeSearchText(title),
+      aliases: [...new Set([...document.aliases, normalizeSearchText(title)])],
+      // A structured capability card is represented as a capability while its
+      // originating page remains the evidence record and carries the content.
+      role: "service",
+      url: localLink?.url ?? document.url,
+    },
+    passages: [title, ...details],
+    strength: localLink ? 1 : 0.94,
+    localEvidence: { groupPath: prefix, passages: [title, ...details], heading: title, url: localLink?.url },
+  };
+}
 
 function embeddedEntityPassages(
   document: SuccessiveSearchDocument,
   subject: string,
-): { passages: string[]; strength: number } | undefined {
+): { passages: string[]; strength: number; structuredDefinitionAuthority: boolean; structuralDestination?: string; displayEntity?: string; localEvidence?: NonNullable<SearchMatch["localEvidence"]> } | undefined {
   const normalizedSubject = semanticInformationalSubject(subject);
   const subjectTerms = normalizedSubject.split(" ").filter(Boolean);
   const shortSubject = isShortSemanticSubject(subject);
@@ -466,11 +711,34 @@ function embeddedEntityPassages(
   // article in the user phrasing made the raw subject appear multi-word.
 
   const exact = ` ${normalizedSubject} `;
-  const structuredPassages = document.structuredFields
+  const localTitleField = document.structuredFields.find((field) =>
+    field.kind === "text" && SECTION_TITLE_FIELD.test(field.path) &&
+    normalizeSearchText(field.value) === normalizedSubject,
+  );
+  // A flat field-name prefix (for example `kagen_card_heading`) does not
+  // establish a sibling boundary. Only an indexed/nested ACF path carries a
+  // structural container we can safely use to exclude distant fields.
+  const inferredPrefix = localTitleField ? entityFieldPrefix(localTitleField.path) : undefined;
+  const localPrefix = inferredPrefix && /(?:\[\d+\]|\.)/.test(inferredPrefix)
+    ? inferredPrefix
+    : undefined;
+  const localStructuredFields = localPrefix
+    ? document.structuredFields.filter((field) => field.kind === "text" && field.path.startsWith(`${localPrefix}.`))
+    : document.structuredFields.filter((field) => field.kind === "text");
+  const structuredPassages = localStructuredFields
     .map(({ value }) => ({ text: value.trim(), normalizedText: normalizeSearchText(value) }))
     .filter(({ text, normalizedText }) => text.length >= 40 &&
-      ` ${normalizedText} `.includes(exact) && ENTITY_DESCRIPTION_TERMS.test(normalizedText) &&
+      ` ${normalizedText} `.includes(exact) && subjectHasLocalDescription(normalizedText, normalizedSubject) &&
       !MENTION_ONLY_TERMS.test(normalizedText));
+  // A named entity does not need a standalone CMS record when the same
+  // authoritative structured record gives it both a bounded label and a
+  // local product/platform/service-style definition. Keeping these as two
+  // separate structured fields is common in Home-page card/hero schemas.
+  const structuredDefinitionAuthority = Boolean(localTitleField) && structuredPassages.length > 0;
+  const structuralDestination = structuredDefinitionAuthority
+    ? entityCanonicalLink(document, normalizedSubject)
+    : undefined;
+  const displayEntity = structuredDefinitionAuthority ? localTitleField?.value.trim() : undefined;
   const candidates = document.chunks
     .filter((chunk) => ` ${chunk.normalizedText} `.includes(exact))
     .map((chunk) => {
@@ -479,11 +747,11 @@ function embeddedEntityPassages(
         Math.max(0, position - 180),
         Math.min(chunk.normalizedText.length, position + normalizedSubject.length + 420),
       );
-      const descriptive = ENTITY_DESCRIPTION_TERMS.test(nearby) &&
+      const descriptive = subjectHasLocalDescription(nearby, normalizedSubject) &&
         !MENTION_ONLY_TERMS.test(nearby);
       const structured = document.structuredFields.some(({ value }) => {
         const normalized = normalizeSearchText(value);
-        return ` ${normalized} `.includes(exact) && ENTITY_DESCRIPTION_TERMS.test(normalized);
+        return ` ${normalized} `.includes(exact) && subjectHasLocalDescription(normalized, normalizedSubject);
       });
       const heading = document.headings.some((value) =>
         ` ${normalizeSearchText(value)} `.includes(exact),
@@ -496,7 +764,7 @@ function embeddedEntityPassages(
     })
     .filter((candidate) => candidate.descriptive)
     .sort((a, b) => b.score - a.score || a.chunk.position - b.chunk.position);
-  if (!candidates.length) return undefined;
+  if (!candidates.length && !structuredPassages.length) return undefined;
 
   const representationRole = ["product", "service", "technology", "partner", "industry", "accelerator", "company", "global_capabilities", "page"].includes(document.role);
   const supportingRole = ["press_release", "media", "editorial", "blog", "case_study", "resource"].includes(document.role);
@@ -505,7 +773,20 @@ function embeddedEntityPassages(
     passages: [...structuredPassages.map(({ text }) => text), ...candidates.map(({ chunk }) => chunk.text)]
       .filter((passage, index, all) => all.findIndex((other) => normalizeSearchText(other) === normalizeSearchText(passage)) === index)
       .slice(0, 2),
-    strength: Math.min(1, 0.55 + candidates[0]!.score / 200 + roleStrength / 100),
+    strength: Math.min(1, 0.55 + (candidates[0]?.score ?? 95) / 200 + roleStrength / 100),
+    structuredDefinitionAuthority,
+    structuralDestination,
+    displayEntity,
+    localEvidence: localPrefix
+      ? {
+        groupPath: localPrefix,
+        passages: [localTitleField!.value.trim(), ...structuredPassages.map(({ text }) => text)]
+          .filter((value, index, all) => all.findIndex((other) => normalizeSearchText(other) === normalizeSearchText(value)) === index)
+          .slice(0, 3),
+        heading: localTitleField!.value.trim(),
+        url: structuralDestination,
+      }
+      : undefined,
   };
 }
 
@@ -515,32 +796,76 @@ export function rankEmbeddedEntityEvidence(
   understanding: QueryUnderstanding | undefined,
   excludedContent: Set<string>,
 ): SearchMatch[] {
-  if (!understanding || !["define", "explain", "details", "summarize"].includes(understanding.answerMode)) return [];
+  // A named capability question is a bounded entity request, even when the
+  // answer mode is represented as a list. Broad collections remain outside
+  // this entity-local path.
+  if (!understanding || !["define", "explain", "details", "summarize", "list"].includes(understanding.answerMode) ||
+      (understanding.answerMode === "list" && understanding.isBroadQuery)) return [];
   const subject = withoutServiceTypeTerms(extractDirectLookupSubject(currentMessage));
+  const definitionQuery = isDirectDefinitionQuery(currentMessage) && isCompactDefinitionSubject(subject);
   if (!subject || /\b(?:other|another|more|else)\b/.test(normalizeSearchText(currentMessage))) return [];
+
+  const structuredSections = index
+    .map((document) => ({ source: document, evidence: structuredMajorSectionEvidence(document, subject) }))
+    .filter((item): item is { source: SuccessiveSearchDocument; evidence: NonNullable<typeof item.evidence> } =>
+      Boolean(item.evidence) && !contentIdentity(item.source.title, item.source.url)
+        .some((key) => excludedContent.has(key)),
+    )
+    .map(({ evidence }): SearchMatch => ({
+      document: evidence.document,
+      score: Math.round((400 + evidence.strength * 100 + evidence.document.contentQuality / 10) * 100) / 100,
+      matchedFields: ["exact-structured-section", "exact-embedded-entity", "embedded-direct-subject-authority"],
+      selectedPassages: evidence.passages,
+      localEvidence: evidence.localEvidence,
+      confidence: "high",
+      scoreBreakdown: { title: 400, headings: 100, metadata: 100, body: 100, contentType: 80, penalties: 0, authorityCoverage: 1, entity: 1 },
+    }));
+  if (structuredSections.length) return structuredSections.slice(0, 5);
 
   return index
     .map((document) => ({ document, evidence: embeddedEntityPassages(document, subject) }))
     .filter((item): item is { document: SuccessiveSearchDocument; evidence: NonNullable<typeof item.evidence> } =>
       Boolean(item.evidence) &&
+      // A bounded structured entity has already proven its local identity,
+      // role-bearing description, and structural destination. Unlike generic
+      // prose, its authored description may lead with value language before
+      // naming the entity, so the compact-definition sentence-start guard does
+      // not apply to that independently validated structured record.
+      (!definitionQuery || item.evidence?.structuredDefinitionAuthority || definitionEvidencePassages(item.document, subject).length > 0) &&
       !contentIdentity(item.document.title, item.document.url).some((key) => excludedContent.has(key)),
     )
     .map(({ document, evidence }): SearchMatch => {
       const dedicated = directIdentityStrength(document, subject, understanding.requestedContentType) >= 0.9;
-      const shortSubjectAuthority = isShortSemanticSubject(subject) &&
-        hasDirectSubjectAuthority(document, subject);
+      const directSubjectAuthority = hasDirectSubjectAuthority(document, subject);
+      const boundedStructuredAuthority = evidence.structuredDefinitionAuthority;
       const roleAligned = isRequestedContentTypeCompatible(document, understanding.requestedContentType);
       const representation = !["post", "press-release", "media-coverage"].includes(document.type);
-      const priority = dedicated ? 400 : representation && roleAligned ? 300 : representation ? 230 : roleAligned ? 170 : 110;
+      const canonicalSubjectRepresentation = directSubjectAuthority &&
+        ["service", "technology", "product", "global_capabilities", "company", "industry"].includes(document.role);
+      const priority = dedicated ? 400 : canonicalSubjectRepresentation ? 400 : directSubjectAuthority || boundedStructuredAuthority ? 360 : representation && roleAligned ? 300 : representation ? 230 : roleAligned ? 170 : 110;
       return {
-        document,
+        document: evidence.structuralDestination ? {
+          ...document,
+          url: evidence.structuralDestination,
+          role: "product",
+          productLike: true,
+          title: evidence.displayEntity ?? document.title,
+          normalizedTitle: normalizeSearchText(evidence.displayEntity ?? document.title),
+          aliases: evidence.displayEntity
+            ? [...new Set([...document.aliases, normalizeSearchText(evidence.displayEntity)])]
+            : document.aliases,
+        } : document,
         score: Math.round((priority + evidence.strength * 100 + document.contentQuality / 10) * 100) / 100,
         matchedFields: [
           dedicated ? "exact-entity-authority" : "exact-embedded-entity",
-          ...(shortSubjectAuthority ? ["embedded-direct-subject-authority"] : []),
+          ...(directSubjectAuthority || boundedStructuredAuthority ? ["embedded-direct-subject-authority"] : []),
+          ...(evidence.structuralDestination ? ["embedded-structural-parent"] : []),
           roleAligned ? "requested-role-representation" : "requested-role-supporting-evidence",
         ],
-        selectedPassages: evidence.passages,
+        selectedPassages: definitionQuery && !evidence.structuredDefinitionAuthority
+          ? definitionEvidencePassages(document, subject)
+          : evidence.passages,
+        localEvidence: evidence.localEvidence,
         confidence: evidence.strength >= 0.8 ? "high" : "medium",
         scoreBreakdown: {
           title: dedicated ? 400 : 0,
@@ -619,9 +944,12 @@ export function isRequestedContentTypeCompatible(
     ));
   if (requested === "thought-leadership")
     return ["thought-leadership", "employee-perspective"].includes(document.type);
-  if (requested === "partner") return document.type === "partners";
-  if (requested === "industry") return document.type === "industries";
-  if (requested === "career") return document.type === "careers" || document.slug === "careers";
+  // Specialized portfolio records are sometimes published as generic pages.
+  // Their indexed semantic role is the stable compatibility contract; the
+  // underlying WordPress type is only an implementation detail.
+  if (requested === "partner") return ["partner", "partners"].includes(document.role);
+  if (requested === "industry") return document.role === "industry";
+  if (requested === "career") return ["career", "careers"].includes(document.role);
   if (requested === "service") {
     if (document.role === "service" || document.role === "global_capabilities" ||
         isServiceFamilySchemaType(document.service_type)) return true;
@@ -700,6 +1028,22 @@ function editDistanceAtMostOne(left: string, right: string): boolean {
 function boundedTitleTypoStrength(document: SuccessiveSearchDocument, subject: string): number {
   const subjectTokens = normalizeSearchText(subject).split(" ").filter(Boolean);
   const identities = [document.normalizedTitle, normalizeSearchText(document.slug.replace(/-/g, " ")), ...document.aliases];
+  // One misspelled entity token may resolve only against a title/slug/alias
+  // identity token. Ambiguity is rejected by matchExactIndexedTitle below;
+  // arbitrary body vocabulary is never eligible for this recovery.
+  if (subjectTokens.length === 1 && subjectTokens[0]!.length >= 4) {
+    const normalizedSubject = subjectTokens[0]!.replace(/(?:ies|s)$/i, (suffix) => suffix === "ies" ? "y" : "");
+    const tokenMatches = (identity: string) => normalizeSearchText(identity).split(" ").some((token) => {
+      const normalizedToken = token.replace(/(?:ies|s)$/i, (suffix) => suffix === "ies" ? "y" : "");
+      return editDistanceAtMostOne(normalizedSubject, normalizedToken);
+    });
+    // A normalized slug is a document-owned canonical identity and is more
+    // specific than a coincidental title/alias token. This only breaks a tie
+    // among already one-edit, authoritative candidates; it never consults
+    // body text or lowers the edit-distance rule.
+    if (tokenMatches(document.slug.replace(/-/g, " "))) return 0.98;
+    return identities.some(tokenMatches) ? 0.97 : 0;
+  }
   return identities.some((identity) => {
     const identityTokens = normalizeSearchText(identity).split(" ").filter(Boolean);
     if (identityTokens.length !== subjectTokens.length || identityTokens.length < 2) return false;
@@ -779,6 +1123,7 @@ function extractUseCaseTopic(query: string): string {
       /\b(?:i|we|want|need|show|give|tell|find|some|me|us|the|a|an|of|for|in|about|please|business)\b/g,
       " ",
     )
+    .replace(/\band its\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -847,11 +1192,16 @@ export function requestsSpecificServiceTaxonomy(query: string): boolean {
 }
 
 function withoutServiceTypeTerms(query: string): string {
-  return normalizeSearchText(query)
-    .replace(
-      /\b(?:services?|servires?|serivces?|expertise|experts?|exper|pillars?|pillers?)\b/g,
-      " ",
-    )
+  const normalized = normalizeSearchText(query);
+  // Strategy/approach are meaningful facets in compound capability names
+  // (for example, an adoption strategy). They are wrappers only for a short
+  // named subject such as "DevSecOps approach".
+  const wrapperTerms = normalized.split(" ").filter(Boolean).length > 2
+    ? /\b(?:services?|servires?|serivces?|expertise|experts?|exper|pillars?|pillers?)\b/g
+    : /\b(?:services?|servires?|serivces?|expertise|experts?|exper|pillars?|pillers?|approach|strategy)\b/g;
+  return normalized
+    .replace(wrapperTerms, " ")
+    .replace(/\band its\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1084,22 +1434,52 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
 export function matchExactIndexedTitle(
   index: SuccessiveSearchDocument[],
   message: string,
+  requestedContentType?: QueryUnderstanding["requestedContentType"],
 ): SearchMatch | undefined {
+  // A role-relation request cannot use its source entity as an untyped exact
+  // answer. Typed editorial requests may still resolve an exact same-role
+  // record before relation discovery (for example, a named article title).
+  if (isExplicitRequestedRoleRelation(message) && !requestedContentType) return undefined;
   const explicitSubject = extractExplicitInformationalSubject(message);
   if (!explicitSubject) return undefined;
-  const subject = correctMinorTyposFromIndex(explicitSubject, index);
+  const subject = semanticInformationalSubject(correctMinorTyposFromIndex(explicitSubject, index));
   const familyTerms = subject.split(" ").filter((term) =>
     !/^(?:service|services|capability|capabilities|solution|solutions|offering|offerings|technology|technologies)$/.test(term));
   const broadFamilyLookup = familyTerms.length === 1 &&
     /\b(?:services?|capabilities|solutions?|offerings?|technolog(?:y|ies))\b/.test(subject);
   if (broadFamilyLookup) return undefined;
+  const definitionQuery = isDirectDefinitionQuery(message) && isCompactDefinitionSubject(subject);
+  const explicitEditorialRequest = ["blog", "resource", "whitepaper", "ebook", "case-study"].includes(requestedContentType ?? "");
+  const editorialRepresentation = (document: SuccessiveSearchDocument) => {
+    const identity = `${document.type} ${document.slug} ${document.normalizedTitle}`;
+    return document.type === "post" || ["blog", "resource", "editorial", "whitepaper", "report"].includes(document.role) ||
+      /\b(?:e-?book|white ?paper|guide|article|blog|case study)\b/.test(identity);
+  };
+  const directResourceEvidence = (document: SuccessiveSearchDocument): SearchMatch["localEvidence"] | undefined => {
+    const resourceRecord = document.role === "resource" ||
+      /\b(?:e-?book|white ?paper|guide|report|case study|article|blog)\b/.test(
+        normalizeSearchText(`${document.type} ${document.slug} ${document.title}`),
+      );
+    const authoredBody = document.editorTextSegments ?? [];
+    if (!resourceRecord || !authoredBody.length) return undefined;
+    return {
+      groupPath: "record.authored-body",
+      passages: [document.title, ...authoredBody],
+      heading: document.title,
+      url: document.url,
+    };
+  };
   const candidates = index
     .map((document) => ({ document, strength: Math.max(
       directIdentityStrength(document, subject), boundedTitleTypoStrength(document, subject),
-    ) }))
-    .filter(({ document, strength }) =>
+    ), definitionPassages: definitionQuery ? definitionEvidencePassages(document, subject) : [],
+    semanticPassages: definitionQuery ? semanticSynthesisEvidencePassages(document, subject) : [],
+    localEvidence: directResourceEvidence(document) }))
+    .filter(({ document, strength, definitionPassages, semanticPassages }) =>
       strength >= 0.96 &&
-      (document.normalizedTitle.split(" ").length >= 2 || strength >= 0.99),
+      (document.normalizedTitle.split(" ").length >= 2 || strength >= 0.99) &&
+      (!explicitEditorialRequest || isRequestedContentTypeCompatible(document, requestedContentType ?? null)) &&
+      (!definitionQuery || definitionPassages.length > 0 || semanticPassages.length > 0),
     )
     .sort((a, b) => {
       const authority = (document: SuccessiveSearchDocument) =>
@@ -1109,8 +1489,11 @@ export function matchExactIndexedTitle(
           )) ? 3
           : document.role === "case_study" ? 2
           : ["partner", "partners", "blog", "editorial"].includes(document.role) ? 0 : 1;
+      const roleDelta = explicitEditorialRequest
+        ? Number(editorialRepresentation(b.document)) - Number(editorialRepresentation(a.document))
+        : authority(b.document) - authority(a.document);
       const literalDelta = Number(b.strength >= 0.99) - Number(a.strength >= 0.99);
-      return literalDelta || authority(b.document) - authority(a.document) || b.strength - a.strength ||
+      return roleDelta || literalDelta || b.strength - a.strength ||
       b.document.normalizedTitle.length - a.document.normalizedTitle.length ||
       b.document.contentQuality - a.document.contentQuality;
     });
@@ -1128,8 +1511,12 @@ export function matchExactIndexedTitle(
   return {
     document: selected.document,
     score: Math.round((700 + selected.strength * 100) * 100) / 100,
-    matchedFields: [selected.strength >= 0.99 ? "exact-title-lock" : "near-exact-title-lock"],
-    selectedPassages: [selected.document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+    matchedFields: [selected.strength >= 0.99 ? "exact-title-lock" : "indexed-entity-typo-recovery",
+      ...(definitionQuery && !selected.definitionPassages.length ? ["semantic-subject-evidence"] : [])],
+    selectedPassages: definitionQuery
+      ? (selected.definitionPassages.length ? selected.definitionPassages : selected.semanticPassages)
+      : selected.localEvidence?.passages ?? [selected.document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+    localEvidence: selected.localEvidence,
     confidence: "high",
     scoreBreakdown: {
       title: 700, headings: 0, metadata: 0, body: 0, contentType: 0,
@@ -1138,13 +1525,74 @@ export function matchExactIndexedTitle(
   };
 }
 
-export async function resolveExactIndexedTitle(message: string): Promise<SearchMatch | undefined> {
-  return matchExactIndexedTitle(await loadSearchIndex(), message);
+/**
+ * Natural questions often wrap a canonical offering in outcome language. This
+ * recognizes only a contiguous, independently title-local entity span; it
+ * does not relax lexical ranking for queries that cannot prove such a span.
+ */
+export function matchEntityFirstQuestionSpan(index: SuccessiveSearchDocument[], message: string): SearchMatch | undefined {
+  const normalized = normalizeSearchText(message);
+  if (!/^(?:what|how|why|when|where|which|can|could|would|do|does|is|are|tell|explain|describe)\b/.test(normalized)) return undefined;
+  const tokens = normalized.split(" ").filter(Boolean);
+  const candidates: Array<{ document: SuccessiveSearchDocument; span: string; length: number; authority: number }> = [];
+  for (let start = 0; start < tokens.length - 1; start += 1) {
+    for (let end = Math.min(tokens.length, start + 7); end >= start + 2; end -= 1) {
+      const span = tokens.slice(start, end).join(" ");
+      index.forEach((document) => {
+        const title = document.normalizedTitle;
+        const canonicalOffering = ["service", "technology", "product", "accelerator", "industry", "global_capabilities"].includes(document.role) ||
+          (document.role === "page" && /\b(?:services?|solutions?|consulting|capabilit(?:y|ies)|implementation|integration|development|engineering|platform|modernization)\b/.test(title));
+        if (!canonicalOffering || !title.startsWith(`${span} `)) return;
+        const suffix = title.slice(span.length + 1);
+        if (!/\b(?:services?|solutions?|consulting|capabilit(?:y|ies)|implementation|integration|development|engineering|platform|modernization)\b/.test(suffix)) return;
+        candidates.push({ document, span, length: end - start, authority: document.role === "service" ? 3 : 2 });
+      });
+    }
+  }
+  candidates.sort((left, right) => right.length - left.length || right.authority - left.authority || left.document.title.length - right.document.title.length);
+  const selected = candidates[0];
+  if (!selected || (candidates[1] && candidates[1].length === selected.length && candidates[1].authority === selected.authority)) return undefined;
+  return {
+    document: selected.document,
+    score: 795,
+    confidence: "high",
+    matchedFields: ["entity-first-question-span", "canonical-page-identity"],
+    selectedPassages: [selected.document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+    scoreBreakdown: { title: 700, headings: 0, metadata: 0, body: 0, contentType: 0, penalties: 0, authorityCoverage: 0.97, entity: 1 },
+  };
+}
+
+export async function resolveExactIndexedTitle(
+  message: string,
+  requestedContentType?: QueryUnderstanding["requestedContentType"],
+): Promise<SearchMatch | undefined> {
+  return matchExactIndexedTitle(await loadSearchIndex(), message, requestedContentType);
 }
 
 export function isExplicitRequestedRoleRelation(message: string): boolean {
-  return /^(?:show|find|give me|do you have|any)\s+(?:related\s+)?(?:services?|capabilities|case studies|customer stories|blogs?|articles?|resources?|products?|partners?|industries|accelerators?)\s+(?:related to|for|about)\s+.+$/i
-    .test(normalizeSearchText(message));
+  return Boolean(explicitRequestedRoleRelationSubject(message));
+}
+
+/** Keeps an explicit result role separate from the current-turn subject. */
+function explicitRequestedRoleRelationSubject(message: string): string | undefined {
+  return normalizeSearchText(message).match(
+    /^(?:show(?: me)?|find|give me|do you have|any)\s+(?:related\s+)?(?:services?|capabilities|case studies|customer stories|blogs?|articles?|posts?|resources?|guides?|reports?|white ?papers?|e-?books?|products?|partners?|industries|accelerators?)\s+(?:related to|for|about|on)\s+(.+)$/,
+  )?.[1]?.trim();
+}
+
+function hasStrongRelatedSubjectEvidence(document: SuccessiveSearchDocument, subject: string): boolean {
+  const normalizedSubject = normalizeSearchText(subject);
+  if (!normalizedSubject) return false;
+  // Require the complete subject in one bounded, first-party field. This is
+  // intentionally stricter than generic lexical scoring, which can assemble
+  // coincidental words from unrelated content.
+  return [
+    document.title,
+    document.slug.replace(/[-_]+/g, " "),
+    ...document.aliases,
+    ...document.headings.slice(0, 4),
+    ...document.descriptions.slice(0, 4),
+  ].some((field) => normalizeSearchText(field).includes(normalizedSubject));
 }
 
 export function matchValidatedRequestedRole(
@@ -1154,32 +1602,41 @@ export function matchValidatedRequestedRole(
 ): SearchMatch[] {
   if (!requested) return [];
   const normalized = normalizeSearchText(message);
-  const subject = normalized.match(
-    /^(?:show|find|give me|do you have|any)\s+(?:related\s+)?(?:services?|capabilities|case studies|customer stories|blogs?|articles?|resources?|products?|partners?|industries|accelerators?)\s+(?:related to|for|about)\s+(.+)$/,
-  )?.[1]?.trim();
+  const subject = explicitRequestedRoleRelationSubject(normalized);
   if (!subject) return [];
   const base = index
     .map((document) => ({ document, strength: directIdentityStrength(document, subject) }))
     .filter(({ strength }) => strength >= 0.96)
     .sort((a, b) => b.strength - a.strength)[0]?.document;
   if (!base) return [];
-  const byId = new Map(index.map((document) => [document.id, document]));
-  return base.relatedCapabilities
-    .filter((relation) => relation.evidence.some((item) =>
-      ["explicit-reference", "internal-link", "taxonomy"].includes(item),
-    ))
-    .map((relation) => ({ relation, document: byId.get(relation.documentId) }))
-    .filter((item): item is { relation: SuccessiveSearchDocument["relatedCapabilities"][number]; document: SuccessiveSearchDocument } =>
-      Boolean(item.document) && isRequestedContentTypeCompatible(item.document!, requested),
-    )
-    .sort((a, b) => b.relation.score - a.relation.score || b.document.contentQuality - a.document.contentQuality)
+  const compatibleCandidates = index
+    .filter((document) => document.id !== base.id || document.type !== base.type)
+    .map((document) => {
+      const relation = base.relatedCapabilities.find((item) => item.documentId === document.id) ??
+        document.relatedCapabilities.find((item) => item.documentId === base.id);
+      const structuralRelation = Boolean(relation?.evidence.some((item) =>
+        ["explicit-reference", "internal-link", "taxonomy"].includes(item),
+      ));
+      const directSubjectEvidence = hasStrongRelatedSubjectEvidence(document, subject);
+      return { document, relation, structuralRelation, directSubjectEvidence };
+    })
+    .filter(({ document, structuralRelation, directSubjectEvidence }) =>
+      isRequestedContentTypeCompatible(document, requested) && (structuralRelation || directSubjectEvidence),
+    );
+  // Published structural links are the strongest relationship signal. Only
+  // when none exists for the requested role may an independently subject-led
+  // first-party record supply the bounded fallback set.
+  const structuralCandidates = compatibleCandidates.filter(({ structuralRelation }) => structuralRelation);
+  return (structuralCandidates.length ? structuralCandidates : compatibleCandidates)
+    .sort((a, b) => Number(b.structuralRelation) - Number(a.structuralRelation) ||
+      (b.relation?.score ?? 0) - (a.relation?.score ?? 0) || b.document.contentQuality - a.document.contentQuality)
     .slice(0, 5)
-    .map(({ document, relation }, position) => ({
-      document, score: Math.round((620 + relation.score * 100 - position) * 100) / 100,
-      matchedFields: ["validated-role-relation", "requested-role-representation"],
+    .map(({ document, relation, structuralRelation }, position) => ({
+      document, score: Math.round((620 + (structuralRelation ? relation?.score ?? 0 : 0.5) * 100 - position) * 100) / 100,
+      matchedFields: [structuralRelation ? "validated-role-relation" : "strong-subject-role-relation", "requested-role-representation"],
       selectedPassages: [document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
       confidence: "high" as const,
-      scoreBreakdown: { title: 0, headings: 0, metadata: 620, body: 0, contentType: 100, penalties: 0, authorityCoverage: relation.score, entity: 1 },
+      scoreBreakdown: { title: 0, headings: 0, metadata: 620, body: 0, contentType: 100, penalties: 0, authorityCoverage: structuralRelation ? relation?.score ?? 0 : 0.5, entity: 1 },
     }));
 }
 
@@ -1567,7 +2024,7 @@ export async function retrieveFromIndex(
       matches: [],
       isProductList,
     };
-  const exactTitleLock = matchExactIndexedTitle(index, currentMessage);
+  const exactTitleLock = matchExactIndexedTitle(index, currentMessage, understanding?.requestedContentType);
   if (exactTitleLock &&
       !contentIdentity(exactTitleLock.document.title, exactTitleLock.document.url)
         .some((key) => excludedContent.has(key))) {
@@ -1578,6 +2035,19 @@ export async function retrieveFromIndex(
       matches: [exactTitleLock],
       isProductList,
       candidates: [exactTitleLock],
+    };
+  }
+  const entityFirstQuestionMatch = matchEntityFirstQuestionSpan(index, currentMessage);
+  if (entityFirstQuestionMatch &&
+      !contentIdentity(entityFirstQuestionMatch.document.title, entityFirstQuestionMatch.document.url)
+        .some((key) => excludedContent.has(key))) {
+    return {
+      normalizedQuery,
+      indexedDocuments: index.length,
+      reliableMatchFound: true,
+      matches: [entityFirstQuestionMatch],
+      isProductList,
+      candidates: [entityFirstQuestionMatch],
     };
   }
   const validatedRoleMatches = matchValidatedRequestedRole(
@@ -1615,14 +2085,18 @@ export async function retrieveFromIndex(
     understanding,
     excludedContent,
   );
-  if (embeddedMatches.length) {
+  const authoritativeEmbeddedMatches = embeddedMatches.filter((match) =>
+    match.matchedFields.includes("embedded-direct-subject-authority") ||
+    match.matchedFields.includes("exact-structured-section"),
+  );
+  if (authoritativeEmbeddedMatches.length) {
     return {
       normalizedQuery,
       indexedDocuments: index.length,
       reliableMatchFound: true,
-      matches: embeddedMatches,
+      matches: authoritativeEmbeddedMatches,
       isProductList,
-      candidates: embeddedMatches,
+      candidates: authoritativeEmbeddedMatches,
     };
   }
   if (understanding?.temporalIntent && understanding.requestedContentType) {
@@ -1654,25 +2128,31 @@ export async function retrieveFromIndex(
     return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: matches.length > 0, matches, isProductList };
   }
   const directSubject = withoutServiceTypeTerms(extractDirectLookupSubject(currentMessage));
+  const definitionQuery = isDirectDefinitionQuery(currentMessage) && isCompactDefinitionSubject(directSubject);
   const directMatches = index
     .map((document) => ({ document, strength: directIdentityStrength(
       document,
       directSubject,
       understanding?.requestedContentType,
-    ) }))
-    .filter(({ document, strength }) =>
+    ), definitionPassages: definitionQuery ? definitionEvidencePassages(document, directSubject) : [],
+    semanticPassages: definitionQuery ? semanticSynthesisEvidencePassages(document, directSubject) : [] }))
+    .filter(({ document, strength, definitionPassages, semanticPassages }) =>
       strength >= 0.9 &&
       (!understanding?.requestedContentType ||
         isRequestedContentTypeCompatible(document, understanding.requestedContentType)) &&
+      (!definitionQuery || definitionPassages.length > 0 || semanticPassages.length > 0) &&
       !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)),
     )
     .sort((a, b) => b.strength - a.strength || b.document.contentQuality - a.document.contentQuality);
   if (directMatches.length) {
-    const matches: SearchMatch[] = directMatches.slice(0, 3).map(({ document, strength }, position) => ({
+    const matches: SearchMatch[] = directMatches.slice(0, 3).map(({ document, strength, definitionPassages, semanticPassages }, position) => ({
       document,
       score: Math.round((500 + strength * 100 - position) * 100) / 100,
-      matchedFields: [strength >= 0.99 ? "normalized-exact-title" : "near-exact-title"],
-      selectedPassages: [document.chunks.find(({ normalizedText }) =>
+      matchedFields: [strength >= 0.99 ? "normalized-exact-title" : "near-exact-title",
+        ...(definitionQuery && !definitionPassages.length ? ["semantic-subject-evidence"] : [])],
+      selectedPassages: definitionQuery
+        ? (definitionPassages.length ? definitionPassages : semanticPassages)
+        : [document.chunks.find(({ normalizedText }) =>
         document.productLike && /\b(?:is|are)\s+(?:an?\s+)?[^.!?]{0,140}\b(?:product|platform|solution|tool)\b/.test(normalizedText))?.text ??
         document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
       confidence: "high",
@@ -1680,6 +2160,56 @@ export async function retrieveFromIndex(
     }));
     return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches, isProductList };
   }
+  // Do not let broad lexical ranking turn contextual use/failure language
+  // into a definition after all direct authoritative definition evidence was
+  // rejected. This remains scoped to compact, explicit definition requests.
+  if (definitionQuery) {
+    return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: false, matches: [], candidates: [], isProductList };
+  }
+  const equivalentMatches = index
+    .map((document) => ({ document, strength: canonicalEquivalentSubjectStrength(document, directSubject) }))
+    .filter(({ document, strength }) => strength >= 0.95 &&
+      !contentIdentity(document.title, document.url).some((key) => excludedContent.has(key)))
+    .sort((left, right) => right.strength - left.strength || right.document.contentQuality - left.document.contentQuality)
+    .slice(0, 3)
+    .map(({ document, strength }, position): SearchMatch => ({
+      document,
+      score: Math.round((390 + strength * 100 - position) * 100) / 100,
+      matchedFields: ["strong-equivalent-canonical-subject", "title-facet-equivalence"],
+      selectedPassages: [document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+      confidence: "high",
+      scoreBreakdown: { title: 390, headings: 0, metadata: 100, body: 0, contentType: 80, penalties: 0, authorityCoverage: strength, entity: 1 },
+    }));
+  if (equivalentMatches.length) {
+    return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches: equivalentMatches, candidates: equivalentMatches, isProductList };
+  }
+  // A compound capability label may use a canonical service's title for one
+  // facet and its own published service copy for the other. This remains
+  // fail-closed: every subject facet must be present in that same record and a
+  // distinctive facet must identify the service title itself.
+  const compoundTerms = directSubject.split(" ").filter((term) => term.length > 2);
+  const compoundCapabilityMatches = compoundTerms.length >= 2 && compoundTerms.length <= 4
+    ? index.filter((document) => isRequestedContentTypeCompatible(document, "service"))
+      .map((document) => {
+        const identity = normalizeSearchText(`${document.title} ${document.slug.replace(/-/g, " ")}`);
+        const text = ` ${document.combinedText} `;
+        const titleTerms = compoundTerms.filter((term) => identity.includes(` ${term} `));
+        const allPresent = compoundTerms.every((term) => text.includes(` ${term} `));
+        const distinctiveTitle = titleTerms.some((term) => term.length >= 6);
+        return { document, titleTerms, allPresent, distinctiveTitle };
+      })
+      .filter((item) => item.allPresent && item.distinctiveTitle)
+      .sort((left, right) => right.titleTerms.length - left.titleTerms.length || right.document.contentQuality - left.document.contentQuality)
+      .slice(0, 2)
+      .map(({ document }, position): SearchMatch => ({
+        document, score: 470 - position,
+        matchedFields: ["compound-canonical-capability", "canonical-service-authority"],
+        selectedPassages: [document.chunks[0]?.text].filter((value): value is string => Boolean(value)),
+        confidence: "high", scoreBreakdown: { title: 300, headings: 0, metadata: 100, body: 100, contentType: 80, penalties: 0, authorityCoverage: 1, entity: 1 },
+      }))
+    : [];
+  if (compoundCapabilityMatches.length)
+    return { normalizedQuery, indexedDocuments: index.length, reliableMatchFound: true, matches: compoundCapabilityMatches, candidates: compoundCapabilityMatches, isProductList };
   // An explicit "X services/capabilities" request is an identity lookup, not
   // permission to enumerate otherwise unrelated services whose body mentions
   // X. If no compatible canonical identity was found, fail closed before the

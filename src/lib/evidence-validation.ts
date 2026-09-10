@@ -13,7 +13,7 @@ export type RequestedAttribute =
   | "duration" | "guarantee" | "cost" | "staffing" | "schedule" | "private_record"
   | "partnership" | "capability" | "content_type" | "freshness"
   | "quantity" | "comparison" | "recommendation" | "availability"
-  | "compatibility" | "engagement" | "support_model" | "project_requirement" | "fact";
+  | "compatibility" | "engagement" | "support_model" | "project_requirement" | "certification" | "fact";
 
 export interface EvidenceValidation {
   status: EvidenceStatus;
@@ -44,7 +44,7 @@ export interface QuerySafetyProfile {
  */
 export function analyzeQuerySafety(message: string): QuerySafetyProfile {
   const q = normalizeSearchText(message);
-  const publicScope = /\b(?:public|publicly|published|announced|case stud(?:y|ies)|customer stor(?:y|ies)|press release|media coverage)\b/.test(q);
+  const publicScope = /\b(?:public|publicly|published|announced|case stud(?:y|ies)|customer stor(?:y|ies)|articles?|blogs?|resources?|press release|media coverage)\b/.test(q);
   const privateScope = /\b(?:internal|private|confidential|secret|unreleased|unpublished)\b/.test(q);
   const current = /\b(?:current|currently|ongoing|active|right now|today|working on|assigned to|on leave|delayed)\b/.test(q);
   const future = /\b(?:upcoming|future|next year|will launch|roadmap)\b/.test(q);
@@ -149,6 +149,9 @@ const attributeWords = new Set([
   "rating", "hike", "salary", "bonus", "appraisal", "attendance", "manager",
   "policy", "partner", "partnership", "case", "study", "blog", "blogs", "article", "articles",
   "resource", "resources", "news", "announcement", "announcements", "latest", "current", "recent", "newest", "recommend",
+  // Availability/claim vocabulary is an attribute predicate, never entity
+  // identity. Keep this aligned with requestedAttribute's generic classifier.
+  "free", "zero", "cost", "unlimited", "lifetime", "fixed", "price", "same", "day", "certified", "certification",
 ]);
 
 const terms = (value: string) => normalizeSearchText(value).split(" ")
@@ -168,6 +171,9 @@ const isAttributeTerm = (term: string) =>
 export function requestedAttribute(message: string, understanding: QueryUnderstanding): RequestedAttribute {
   const query = normalizeSearchText(message);
   if (/\b(?:guarantee|guaranteed|commit|committed)\b.*\b(?:delivery|date|timeline|duration|time|outcome|result|performance)\b/.test(query)) return "guarantee";
+  if (/\b(?:free|zero[- ]cost|unlimited|24\/?7|lifetime|fixed[- ]price|same[- ]day)\b/.test(query) &&
+      /\b(?:is|are|does|do|provide|offer|include|available|service|services?|support)\b/.test(query)) return "availability";
+  if (/\b(?:certified|certification)\b/.test(query)) return "certification";
   if (/\b(?:free trials?|trial availability|free demos?|demo availability|available in (?:our|my|the) (?:region|country|market|location))\b/.test(query)) return "availability";
   if (/\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|work with|connect(?:s|ed|ing|ion)?)\b/.test(query)) return "compatibility";
   if (/\b(?:dedicated(?: [a-z0-9+.#-]+){0,3} (?:developers?|engineers?|team)|engagement model|long term (?:project|engagement)|staff(?:ing| augmentation))\b/.test(query)) return "engagement";
@@ -227,7 +233,8 @@ function attributeCoverage(attribute: RequestedAttribute, text: string, match: S
     quantity: /\b\d+\b/,
     comparison: /\b(?:compare|versus|difference|better|advantages?|tradeoffs?)\b/,
     recommendation: /\b(?:recommend|suitable|fit|approach|solution|service|capability)\b/,
-    availability: /\b(?:free trial|trial availability|free demo|demo availability|available in|regional availability)\b/,
+    availability: /\b(?:free|zero[- ]cost|no cost|without charge|paid subscription|subscription required|unlimited|24\/?7|lifetime|fixed[- ]price|same[- ]day|trial availability|free demo|available in|regional availability)\b/,
+    certification: /\b(?:certified|certification|accredited|accreditation)\b/,
     compatibility: /\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|work with|connect(?:s|ed|ing|ion)?)\b/,
     engagement: /\b(?:dedicated(?: [a-z0-9+.#-]+){0,3} (?:developers?|engineers?|team)|engagement model|long term|staff(?:ing| augmentation))\b/,
     support_model: /\b(?:post launch support|after implementation|post implementation|ongoing (?:support|maintenance))\b/,
@@ -337,7 +344,7 @@ export function validateEvidence(args: {
       return !target || /^(?:system|platform|pipeline|environment|technology)$/.test(target) ||
         new RegExp(`\\b${target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text);
     }
-    if (["availability", "engagement", "support_model", "project_requirement"].includes(attribute))
+    if (["availability", "certification", "engagement", "support_model", "project_requirement"].includes(attribute))
       return attributeCoverage(attribute, text, item.match) > 0;
     if (attribute === "recommendation") return false;
     return true;
@@ -380,7 +387,7 @@ export function safeEvidenceResponse(validation: EvidenceValidation): string {
     schedule: "schedule or policy", private_record: "private employee information", partnership: "formal partnership relationship",
     capability: "capability", content_type: "requested content type", freshness: "current or latest status",
     quantity: "requested quantity", comparison: "requested comparison", recommendation: "recommendation",
-    availability: "requested availability", compatibility: "requested compatibility", engagement: "engagement model",
+    availability: "requested availability", certification: "certification status", compatibility: "requested compatibility", engagement: "engagement model",
     support_model: "support model", project_requirement: "project-specific requirement", fact: "requested fact",
   };
   if (validation.status === "AMBIGUOUS") return "What subject or project are you asking about? Please add a little context so I can check the relevant Successive information.";

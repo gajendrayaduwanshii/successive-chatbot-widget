@@ -112,13 +112,34 @@ const QUESTION_WORDS = new Set([
 
 const followUpPattern = /^(?:tell me more(?: about (?:it|this|that|him|her))?|what about(?: this| that| it| him| her)?|anything else|any examples?|how|why|how (?:does|would) (?:it|this|that) (?:work|help)(?: us|my company)?|what (?:can it do|is (?:his|her|its) experience|is (?:his|her|its) role|would you suggest|do you recommend|next))[?.!\s]*$/i;
 
+/** Facet labels are not subjects when the visitor names no entity. */
+export function isFacetOnlyFollowUp(message: string): boolean {
+  const normalized = normalizeSearchText(message);
+  return /^(?:what (?:are (?:the )?)?(?:benefits|capabilities|features|services)(?: are included)?|what (?:is|are) (?:the )?(?:approach|process|roadmap|value|use cases?)|what (?:approach|process)(?: should we use)?|how does (?:it|this|that) work|(?:is there|where can i find|where can i learn more about) (?:an? )?(?:ebook|e book|resource|guide)|tell me more|explain more|give me more details)(?:\?|\s)*$/.test(normalized);
+}
+
 /** Grammar that requires an earlier subject/result; it never owns a subject. */
 export function isDependentFollowUp(message: string): boolean {
   const normalized = normalizeSearchText(message);
-  return /\b(?:this|that|it|its|these|those|they|them|their|same)\b/.test(normalized) ||
+  return isFacetOnlyFollowUp(normalized) ||
+    /\b(?:this|that|it|its|these|those|they|them|their|same)\b/.test(normalized) ||
     /\b(?:other|another)\b.*\b(?:product|service|case study|article|resource|partner|job|opening|result|one)\b/.test(normalized) ||
     /^(?:what about|how about|tell me more|more about|any|another|other|next|first|second|third|last)\b/.test(normalized) ||
     /^(?:what does it|what do they|who is it for|where is it|which industries .*\bthis\b|does it|what does .* cover)\b/.test(normalized);
+}
+
+/** Conservatively repairs only a one-letter-deleted leading interrogative. */
+export function normalizeMalformedInterrogative(message: string): string {
+  return message.replace(/^\s*(?:hat|wat|wht|wha)\s+is\b/i, (prefix) =>
+    prefix.replace(/(?:hat|wat|wht|wha)/i, "What"));
+}
+
+/** A company catalog request is an independent turn even when it names no offering. */
+export function isExplicitStandaloneCatalogQuery(message: string): boolean {
+  const normalized = normalizeSearchText(message);
+  return /^(?:what|which|show|list|tell me about)\b/.test(normalized) &&
+    /\b(?:successive(?: digital)?|your)\b/.test(normalized) &&
+    /\b(?:services?|capabilities|offerings?)\b/.test(normalized);
 }
 
 const explicitTypeRequest = (message: string, type: RegExp): boolean => {
@@ -415,11 +436,14 @@ export function resolveConversationUnderstanding(
   const continuesScope = scope === "CONTINUE_SAME_SCOPE" || scope === "AMBIGUOUS_FOLLOW_UP";
   // Collection-wide operators control context ownership; they are never
   // semantic subjects or filters in the resolved retrieval request.
-  const currentTopics = current.topics.filter((topic) =>
+  const subjectlessFacet = isFacetOnlyFollowUp(current.normalizedQuery);
+  const currentTopics = (subjectlessFacet ? [] : current.topics).filter((topic) =>
     !/^(?:all|every|complete|full|entire|one|ones|item|items|result|results)$/.test(topic));
-  const hasExplicitCurrentSubject = currentTopics.length > 0 || current.entities.length > 0 || Boolean(current.industry);
+  const standaloneCatalog = isExplicitStandaloneCatalogQuery(current.normalizedQuery);
+  const hasExplicitCurrentSubject = !subjectlessFacet &&
+    (standaloneCatalog || currentTopics.length > 0 || current.entities.length > 0 || Boolean(current.industry));
   const dependent = isDependentFollowUp(current.normalizedQuery);
-  const shouldInherit = !broadensScope && !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 || dependent);
+  const shouldInherit = !standaloneCatalog && !broadensScope && !hasExplicitCurrentSubject && (current.isFollowUp || current.topics.length === 0 || dependent);
   const preserveTypeForTopicSwitch = /^what about\b/.test(current.normalizedQuery);
   const comparison = /\b(?:better than|compare(?:d)? (?:to|with)|difference between|versus|\bvs\b|or .+\??$|do you mean .+ too)\b/i.test(current.normalizedQuery);
   const correction = /^(?:i mean|i meant|no i mean|actually|sorry i mean|not .+? (?:but|instead) )\b/i.test(current.normalizedQuery);
@@ -460,7 +484,11 @@ export function resolveConversationUnderstanding(
       broadensScope ? null : current.existingPlatform ??
       (shouldInherit ? prior?.existingPlatform ?? null : null),
     requestedContentType:
-      current.requestedContentType ??
+      subjectlessFacet && !/\b(?:ebook|e book|resource|guide)\b/.test(current.normalizedQuery)
+        ? (prior?.requestedContentType && ["ebook", "resource", "whitepaper"].includes(prior.requestedContentType)
+          ? prior.requestedContentType
+          : null)
+        : current.requestedContentType ??
       (shouldInherit || continuesScope || refinesScope || preserveTypeForTopicSwitch
         ? prior?.requestedContentType ?? null
         : null),

@@ -19,6 +19,11 @@
   }
   var widgetOrigin = scriptUrl.origin;
   var data = script.dataset || {};
+  // Demo presentation mode. Keep response data and renderers intact so these
+  // sections can be restored with a UI-only flag change after the demo.
+  var SHOW_RESULT_CARDS = false;
+  var SHOW_SOURCES = false;
+  var SHOW_SUGGESTIONS = false;
   var clamp = function (value, fallback, min, max) {
     var parsed = Number.parseInt(value || "", 10);
     return Number.isFinite(parsed)
@@ -218,6 +223,18 @@
   var validLink = function (value) {
     return safeUrl(value, "");
   };
+  var validatedSuccessiveLink = function (value) {
+    var href = validLink(value);
+    if (!href) return "";
+    try {
+      var hostname = new URL(href).hostname.toLowerCase();
+      return hostname === "successive.tech" || hostname.endsWith(".successive.tech")
+        ? href
+        : "";
+    } catch {
+      return "";
+    }
+  };
   var appendInline = function (parent, text) {
     var pattern =
       /\*\*\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)\*\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
@@ -314,7 +331,7 @@
         create("h3", "", safeText(card.title, "Result", 200)),
       );
       content.appendChild(create("p", "", safeText(card.description, "", 500)));
-      var link = create("a", "", "Learn more ");
+      var link = create("a", "", "Explore " + safeText(card.title, "this page", 200) + " ");
       link.href = validLink(card.url);
       link.target = "_blank";
       link.rel = "noopener noreferrer";
@@ -368,6 +385,83 @@
       box.appendChild(button);
     });
     wrap.appendChild(box);
+  };
+  var contextualLinkLabel = function (item, answer) {
+    var title = safeText(item.title, "", 200);
+    var identity = safeText(
+      [title, item.type, item.badge, item.service_type, answer].filter(Boolean).join(" "),
+      "",
+      500,
+    ).toLowerCase();
+    var conciseTitle = title
+      .replace(/\s+(?:for|to|with|driving|powering|transforming|accelerating|enabling|delivering)\b.*$/i, "")
+      .replace(/:\s+.*$/, "")
+      .trim() || title;
+    if (/\bleadership\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "leadership team", suffix: " to learn more about Successive's leadership.",
+    };
+    if (/\b(?:office|location|contact)\b/.test(identity)) return {
+      prefix: "Explore ", anchor: "Successive's office locations", suffix: " for contact and location details.",
+    };
+    if (/\bcase[ -]?stud(?:y|ies)\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "full case study", suffix: " for more details on the solution and business impact.",
+    };
+    if (/\b(?:post|blog|article)\b/.test(identity)) return {
+      prefix: "Read the ", anchor: "full article", suffix: " for additional insights and practical guidance.",
+    };
+    if (/\b(?:resource|whitepaper|ebook)\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "full resource", suffix: " for deeper insights and practical guidance.",
+    };
+    if (/\b(?:product|kagen|accelerator)\b/.test(identity) && conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about its capabilities and applications.",
+    };
+    if (/\bindustry\b/.test(identity) && conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about Successive's industry capabilities and solutions.",
+    };
+    if (/\bpartner|partnership\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "partnership", suffix: " to learn more about the collaboration and related capabilities.",
+    };
+    if (conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about Successive's capabilities and approach.",
+    };
+    return null;
+  };
+  var renderContextualLink = function (wrap, response) {
+    // The API owns the one final contextual CTA, including category-aware
+    // wording and validated identity. Do not synthesize a second CTA from
+    // hidden cards/sources in the client.
+    if (!response || typeof response.answer !== "string") return;
+    if (response.answer) return;
+    var candidates = [];
+    (Array.isArray(response.sources) ? response.sources : []).forEach(function (source) {
+      if (source) candidates.push(source);
+    });
+    (Array.isArray(response.cards) ? response.cards : []).forEach(function (card) {
+      if (card) candidates.push(card);
+    });
+    var answer = response.answer;
+    for (var index = 0; index < candidates.length; index += 1) {
+      var candidate = candidates[index];
+      var href = validatedSuccessiveLink(candidate.url);
+      if (!href) continue;
+      var cta = contextualLinkLabel(candidate, answer);
+      if (!cta) continue;
+      var escapedHref = href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp("(?:Explore|Read|View|Meet)[^\\n]*\\]\\(" + escapedHref + "\\)", "i").test(answer)) continue;
+      var paragraph = create("p", "contextual-cta");
+      paragraph.appendChild(document.createTextNode(cta.prefix));
+      var link = create("a", "contextual-link", cta.anchor);
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.addEventListener("click", function () {
+        dispatch("link-clicked", { cardType: "contextual" });
+      });
+      paragraph.appendChild(link);
+      paragraph.appendChild(document.createTextNode(cta.suffix));
+      wrap.appendChild(paragraph);
+      return;
+    }
   };
   var executableSuggestions = function (response) {
     if (Array.isArray(response && response.suggestionActions) && response.suggestionActions.length)
@@ -430,9 +524,11 @@
             window.clearInterval(timer);
             typewritingMessage = null;
             if (message.response) {
-              renderCards(wrap, message.response.cards);
-              renderSources(wrap, message.response.sources);
-              renderSuggestions(wrap, executableSuggestions(message.response));
+              renderContextualLink(bubble, message.response);
+              if (SHOW_RESULT_CARDS) renderCards(wrap, message.response.cards);
+              if (SHOW_SOURCES) renderSources(wrap, message.response.sources);
+              if (SHOW_SUGGESTIONS)
+                renderSuggestions(wrap, executableSuggestions(message.response));
             }
           }
         }, 22);
@@ -450,9 +546,11 @@
     }
     wrap.appendChild(bubble);
     if (assistant && message.response && message !== typewritingMessage) {
-      renderCards(wrap, message.response.cards);
-      renderSources(wrap, message.response.sources);
-      renderSuggestions(wrap, executableSuggestions(message.response));
+      renderContextualLink(bubble, message.response);
+      if (SHOW_RESULT_CARDS) renderCards(wrap, message.response.cards);
+      if (SHOW_SOURCES) renderSources(wrap, message.response.sources);
+      if (SHOW_SUGGESTIONS)
+        renderSuggestions(wrap, executableSuggestions(message.response));
     }
     row.appendChild(wrap);
     if (message.anchorId) row.id = message.anchorId;

@@ -550,6 +550,20 @@ function pageAnswer(document: SuccessiveSearchDocument, answer: string, evidence
   return { answer, document, evidencePaths, suggestions };
 }
 
+/**
+ * Structured answers name the exact ACF fields that established the fact.
+ * Serialize those fields, rather than the document-wide flattened descriptions,
+ * so a later CTA/banner section cannot become evidence for an earlier section.
+ */
+function evidencePathText(document: SuccessiveSearchDocument, paths: string[]): string[] {
+  const allowed = new Set(paths);
+  return document.structuredFields
+    .filter((field) => field.kind === "text" && allowed.has(field.path))
+    .map((field) => field.value.trim())
+    .filter((value, index, all) => value.length > 0 &&
+      all.findIndex((other) => normalizeSearchText(other) === normalizeSearchText(value)) === index);
+}
+
 function publishedOwnershipEvidence(document: SuccessiveSearchDocument): { value: string; path: string } | null {
   const structured = document.structuredFields.find(({ path, label, value }) =>
     /\b(?:owner|ownership|owned by|parent company|controlling (?:company|entity))\b/i.test(`${path.replace(/[_-]+/g, " ")} ${label}`) &&
@@ -840,7 +854,13 @@ export function answerStructuredRequest(
       }
       return pageAnswer(source.document, "The available published content confirms Successive’s awards collection, but it does not provide a unique, reliable award date that establishes which item is latest.", ["title", "description"], ["Show all awards and recognitions", "What is Successive recognized for?"]);
     }
-    return pageAnswer(source.document, source.document.descriptions.slice(0, 5).join("\n\n"), ["title", "description", "title2", "description2"], ["What is Successive recognized for?", "What is Successive’s latest award?"]);
+    const paths = ["title", "description", "title2", "description2"];
+    return pageAnswer(
+      source.document,
+      evidencePathText(source.document, paths).join("\n\n"),
+      paths,
+      ["What is Successive recognized for?", "What is Successive’s latest award?"],
+    );
   }
   return null;
 }

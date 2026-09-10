@@ -3,6 +3,9 @@ import { buildSearchDocument, buildSearchIndex, normalizeServiceSchemaType } fro
 import { detectIntent } from "./intent-detector";
 import {
   cardEligibility,
+  canonicalEquivalentSubjectStrength,
+  definitionEvidencePassages,
+  semanticSynthesisEvidencePassages,
   extractExplicitInformationalSubject,
   semanticInformationalSubject,
   isBroadAiServicesQuery,
@@ -23,6 +26,7 @@ import {
   shouldUseOffTopicFallback,
   isExplicitListRequest,
   classifyFollowUpScope,
+  isFacetOnlyFollowUp,
   resolveConversationUnderstanding,
   shouldUseSemanticUnderstanding,
 } from "./query-understanding";
@@ -72,6 +76,11 @@ describe("standalone and follow-up canonical subject consistency", () => {
     )).toBe("workflow orchestration");
   });
 
+  it("treats a leading commercial qualifier as a predicate rather than entity identity", () => {
+    expect(extractExplicitInformationalSubject("free Sample Cloud Consulting services?"))
+      .toBe("sample cloud consulting services");
+  });
+
   it("does not require prior conversation state for a standalone subject", () => {
     const standalone = matchExactIndexedTitle([canonical], "Workflow Orchestration");
     expect(standalone).toMatchObject({ document: { id: canonical.id }, confidence: "high" });
@@ -87,6 +96,24 @@ describe("standalone and follow-up canonical subject consistency", () => {
     expect(classifyFollowUpScope(current, current.normalizedQuery)).toBe("SWITCH_TOPIC");
   });
 
+  it("inherits a retained subject for a subjectless facet follow-up but not for an explicit replacement", () => {
+    expect(isFacetOnlyFollowUp("What are the benefits?")).toBe(true);
+    expect(isFacetOnlyFollowUp("What are the benefits of Workflow Orchestration?")).toBe(false);
+
+    const inherited = resolveConversationUnderstanding(
+      buildDeterministicUnderstanding("What are the benefits?"),
+      [{ role: "user", content: "Tell me about Workflow Orchestration" }],
+    ).understanding;
+    expect(inherited.topics).toEqual(["workflow", "orchestration"]);
+
+    const replacement = resolveConversationUnderstanding(
+      buildDeterministicUnderstanding("What are the benefits of Cloud Cost Optimization?"),
+      [{ role: "user", content: "Tell me about Workflow Orchestration" }],
+    ).understanding;
+    expect(replacement.topics).toContain("cloud");
+    expect(replacement.topics).not.toContain("workflow");
+  });
+
   it("does not manufacture a canonical match for genuine no-content wording", () => {
     expect(matchExactIndexedTitle([canonical], "Tell me about an unpublished orbital ledger"))
       .toBeUndefined();
@@ -98,11 +125,155 @@ describe("standalone and follow-up canonical subject consistency", () => {
     expect(matchExactIndexedTitle([entity, canonical], "Workflow Orchestration")?.document.id).toBe(canonical.id);
   });
 
+  it("keeps a canonical offering ahead of a same-subject resource unless an editorial role is requested", () => {
+    const offering = document("Workflow Orchestration Services", "workflow-orchestration-services", "Published service evidence.");
+    offering.role = "service";
+    const ebook = document("Workflow Orchestration", "workflow-orchestration-ebook", "Published eBook evidence.");
+    ebook.role = "resource";
+    expect(matchExactIndexedTitle([ebook, offering], "Tell me about Workflow Orchestration.")?.document.id).toBe(offering.id);
+    expect(matchExactIndexedTitle([offering, ebook], "Tell me about Workflow Orchestration eBook.", "ebook")?.document.id).toBe(ebook.id);
+  });
+
+  it("recovers one unambiguous indexed entity-token typo without using body text", () => {
+    const awards = document("Awards and Recognitions", "awards", "Published award evidence.");
+    awards.role = "awards";
+    expect(matchExactIndexedTitle([awards], "awrad")?.matchedFields).toContain("indexed-entity-typo-recovery");
+    const alternate = document("Award Platform", "award-platform", "Different published entity.");
+    expect(matchExactIndexedTitle([awards, alternate], "awrad")).toBeUndefined();
+  });
+
+  it("normalizes a direct definition article before canonical identity lookup", () => {
+    const api = document("API Development Company", "api-development", "An API is an application programming interface for software communication.");
+    const shopping = document("Social Shopping Guide", "social-shopping", "An API appears incidentally in commerce guidance.");
+    expect(matchExactIndexedTitle([shopping, api], "What is an API?")?.document.id).toBe(api.id);
+  });
+
+  it("requires semantic definition evidence instead of contextual failure copy", () => {
+    const contextual = document("API Development Company", "api-development", "API is offline, so display popular items. API latency and API failure handling are monitored.");
+    const definition = document("API Development Company", "api-development", "An API is an application programming interface that enables software systems to communicate.");
+    expect(definitionEvidencePassages(contextual, "api")).toEqual([]);
+    expect(definitionEvidencePassages(definition, "api")).toEqual([
+      "An API is an application programming interface that enables software systems to communicate.",
+    ]);
+    expect(matchExactIndexedTitle([contextual], "What is an API?")).toBeUndefined();
+    expect(matchExactIndexedTitle([definition], "What is an API?")?.selectedPassages).toEqual([
+      "An API is an application programming interface that enables software systems to communicate.",
+    ]);
+  });
+
+  it("admits direct subject-specific capability evidence without a dictionary definition", () => {
+    const technology = document(
+      "Nimbus UI Framework", "nimbus-ui-framework",
+      "Nimbus UI Framework helps frontend teams build interactive application interfaces with reusable components.",
+    );
+    technology.role = "technology";
+    expect(definitionEvidencePassages(technology, "Nimbus UI")).toEqual([]);
+    expect(semanticSynthesisEvidencePassages(technology, "Nimbus UI")).toEqual([
+      "Nimbus UI Framework helps frontend teams build interactive application interfaces with reusable components.",
+    ]);
+    const resolved = matchExactIndexedTitle([technology], "What is Nimbus UI?");
+    expect(resolved?.matchedFields).toContain("semantic-subject-evidence");
+    expect(resolved?.selectedPassages[0]).toMatch(/frontend teams/i);
+  });
+
+  it("recognizes a bounded technology qualifier in a canonical title without accepting body-only mentions", () => {
+    const canonical = document(
+      "Aurora JS Development Company", "aurora-js-development",
+      "Aurora JS development helps teams build maintainable web applications.",
+    );
+    canonical.role = "technology";
+    const incidental = document(
+      "Unrelated Delivery Guide", "unrelated-delivery-guide",
+      "This article briefly mentions Aurora while describing an unrelated delivery process.",
+    );
+    expect(matchExactIndexedTitle([canonical, incidental], "What is Aurora?")?.document.id).toBe(canonical.id);
+    expect(matchExactIndexedTitle([incidental], "What is Aurora?")).toBeUndefined();
+  });
+
+  it("does not treat a vendor or locally-pronominal API as generic API", () => {
+    const vendor = document(
+      "BigCommerce API", "bigcommerce-api",
+      "BigCommerce API is a commerce integration interface for storefront operations. This API helps manage shopper carts.",
+    );
+    const generic = document("API Overview", "api-overview", "An API is an application programming interface for software communication.");
+    expect(definitionEvidencePassages(vendor, "api")).toEqual([]);
+    expect(definitionEvidencePassages(vendor, "bigcommerce api")).toEqual([
+      "BigCommerce API is a commerce integration interface for storefront operations.",
+    ]);
+    expect(definitionEvidencePassages(generic, "api")).toEqual([
+      "An API is an application programming interface for software communication.",
+    ]);
+    expect(matchExactIndexedTitle([vendor], "What is an API?")).toBeUndefined();
+  });
+
   it("keeps a canonically locked sub-service compatible through final alignment", () => {
     const subService = document("Workflow Orchestration Services", "workflow-orchestration-services", "Published capability.");
     subService.role = "service";
     subService.service_type = "Sub-service";
     expect(isRequestedContentTypeCompatible(subService, "sub-service")).toBe(true);
+  });
+});
+
+describe("structured capability sections and safe canonical equivalence", () => {
+  it.each([
+    ["AI-Native Product Engineering", "Design and ship production-grade products and platforms."],
+    ["Autonomous Platform Delivery", "Design and ship reliable platforms with governed automation."],
+    ["Data Intelligence Operations", "Turn governed enterprise data into decisions embedded in daily workflows."],
+    ["Experience Commerce Systems", "Build connected customer journeys and scalable commerce operations."],
+  ])("treats a bounded major section as evidence for %s", (subject, description) => {
+    const home = buildSearchDocument({
+      id: Math.floor(Math.random() * 1_000_000), type: "page", slug: "home", link: "https://successive.tech/",
+      title: { rendered: "Home" }, content: { rendered: "" },
+      acf: { services: [{ link: { title: subject, url: "https://successive.tech/capability/" }, description }] },
+    });
+    const query = `What is ${subject}?`;
+    const matches = rankEmbeddedEntityEvidence([home], query, buildDeterministicUnderstanding(query), new Set());
+    expect(matches[0]).toMatchObject({ document: { title: subject, url: "https://successive.tech/capability/" }, confidence: "high" });
+    expect(matches[0]?.matchedFields).toContain("exact-structured-section");
+    expect(matches[0]?.selectedPassages).toContain(description);
+  });
+
+  it("does not elevate an incidental body occurrence into a structured subject identity", () => {
+    const incidental = buildSearchDocument({
+      id: 72231, type: "page", slug: "company-story", link: "https://successive.tech/company-story/",
+      title: { rendered: "Company Story" }, content: { rendered: "<p>An incidental phrase, Autonomous Platform Delivery, appeared in a customer quotation.</p>" },
+    });
+    const query = "What is Autonomous Platform Delivery?";
+    const matches = rankEmbeddedEntityEvidence([incidental], query, buildDeterministicUnderstanding(query), new Set());
+    expect(matches).toEqual([]);
+  });
+
+  it("accepts a bounded structured named platform but not a body-only mention", () => {
+    const home = buildSearchDocument({
+      id: 72230, type: "page", slug: "home", link: "https://successive.tech/",
+      title: { rendered: "Home" }, content: { rendered: "" },
+      acf: {
+        kagen_card_heading: "Atlas Launch",
+        hero_description: "Atlas Launch, our AI-native platform, helps enterprises plan, build, test, and launch.",
+      },
+    });
+    const incidental = document("Company Story", "company-story", "Atlas Launch was mentioned during an event.");
+    const query = "What is Atlas Launch?";
+    const understanding = buildDeterministicUnderstanding(query);
+    expect(understanding.answerMode).toMatch(/define|explain|details|summarize/);
+    const matches = rankEmbeddedEntityEvidence([incidental, home], query, understanding, new Set());
+    expect(matches.map((match) => match.document.title)).toEqual(["Home"]);
+    expect(matches[0]?.matchedFields).toContain("embedded-direct-subject-authority");
+  });
+
+  it("accepts a title-level equivalent canonical subject but rejects an announcement with broad overlap", () => {
+    const canonical = document("Machine Intelligence Strategy Consulting", "machine-intelligence-strategy", "Advisory services define an adoption roadmap and delivery approach.");
+    const announcement = buildSearchDocument({
+      id: 72232, type: "press-release", slug: "machine-intelligence-launch", link: "https://successive.tech/launch/",
+      title: { rendered: "Machine Intelligence Adoption Launch" }, content: { rendered: "<p>A company announcement about a new launch.</p>" },
+    });
+    expect(canonicalEquivalentSubjectStrength(canonical, "Machine Intelligence Adoption Strategy")).toBeGreaterThanOrEqual(0.95);
+    expect(canonicalEquivalentSubjectStrength(announcement, "Machine Intelligence Adoption Strategy")).toBe(0);
+  });
+
+  it("preserves an adoption-strategy subject when selecting an equivalent canonical service", () => {
+    const consulting = document("Transform Business with AI Strategy Consulting", "ai-strategy-consulting", "AI strategy consulting defines a practical adoption roadmap.");
+    expect(canonicalEquivalentSubjectStrength(consulting, "AI Adoption Strategy")).toBeGreaterThanOrEqual(0.95);
   });
 });
 
@@ -381,6 +552,25 @@ describe("generic query understanding", () => {
       "Show case studies related to Nova Operations Guide.",
       "case-study",
     )).toEqual([]);
+  });
+
+  it("keeps the explicit related-content subject separate from its requested role", () => {
+    const subject = { ...document("Experience Design Services", "experience-design-services", "Published Experience Design service."), role: "service" as const };
+    const first = { ...document("Improving Experience Design", "improving-experience-design", "Published article."), role: "blog" as const, type: "post" };
+    const second = { ...document("Experience Design Research", "experience-design-research", "Published article."), role: "blog" as const, type: "post" };
+    const weak = { ...document("Cloud Experience Delivery Guide", "cloud-experience-delivery", "Published article."), role: "blog" as const, type: "post" };
+    const devops = { ...document("DevOps Automation", "devops-automation", "Published article."), role: "blog" as const, type: "post" };
+    const query = "Show me articles related to Experience Design.";
+    expect(extractExplicitInformationalSubject(query)).toBe("experience design");
+    expect(buildDeterministicUnderstanding(query).requestedContentType).toBe("blog");
+    expect(matchValidatedRequestedRole([subject, first, second, weak, devops], query, "blog")
+      .map(({ document }) => document.title)).toEqual(["Improving Experience Design", "Experience Design Research"]);
+  });
+
+  it("fails closed when a related-content role has no strong subject relation", () => {
+    const subject = { ...document("Sample Capability", "sample-capability", "Published capability."), role: "service" as const };
+    const unrelated = { ...document("Cloud Infrastructure Guide", "cloud-infrastructure-guide", "Published article."), role: "blog" as const, type: "post" };
+    expect(matchValidatedRequestedRole([subject, unrelated], "Show me articles related to Sample Capability.", "blog")).toEqual([]);
   });
 
   it.each([
@@ -665,6 +855,18 @@ describe("generic query understanding", () => {
       acf: { service_type: "Expertise", description: "Formal consulting partnership." },
     });
     expect(partner.role).toBe("partner");
+  });
+
+  it("uses normalized semantic roles for page-backed partner compatibility without widening role boundaries", () => {
+    const partnerPage = document("Alliance Directory", "alliance-directory", "Published partner ecosystem.");
+    partnerPage.role = "partners";
+    expect(isRequestedContentTypeCompatible(partnerPage, "partner")).toBe(true);
+
+    for (const role of ["service", "blog", "case_study", "company", "industry"] as const) {
+      const unrelated = document(`Unrelated ${role}`, `unrelated-${role}`, "Published content.");
+      unrelated.role = role;
+      expect(isRequestedContentTypeCompatible(unrelated, "partner")).toBe(false);
+    }
   });
 
   it("derives product evidence from API launch and product metadata", () => {

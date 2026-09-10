@@ -56,6 +56,17 @@ describe("generic commercial intent", () => {
     expect(detectCommercialIntent("How do teams implement DevSecOps?")).toBeNull();
   });
 
+  it("keeps commercial words inside an explicitly requested editorial title out of sales routing", () => {
+    expect(detectCommercialIntent("Show articles related to Payment Gateway Integration: Roadmap, Costs, Skills."))
+      .toBeNull();
+    expect(detectCommercialIntent("Show me the Cloud Pricing Strategies for Enterprise Applications article."))
+      .toBeNull();
+    expect(detectCommercialIntent("How much does Payment Gateway Integration cost?")).toBe("pricing");
+    expect(detectCommercialIntent("Give me a quote for Payment Gateway Integration.")).toBe("quote");
+    expect(detectCommercialIntents("Show me the Payment Gateway Integration article and tell me how much implementation costs."))
+      .toEqual(["pricing"]);
+  });
+
   it.each([
     "What is cloud computing?", "What services do you provide?", "Tell me about CMS.",
     "Show case studies.", "Who is your CEO?", "Where is your Pune office?",

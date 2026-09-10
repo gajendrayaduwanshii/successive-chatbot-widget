@@ -1,6 +1,7 @@
 import { normalizeSearchText } from "./search-index";
 import type { Intent } from "./intent-detector";
 import { buildDeterministicUnderstanding, buildRetrievalQuery, classifyFollowUpScope, isDependentFollowUp } from "./query-understanding";
+import { detectCommercialIntent } from "./commercial-intent";
 
 type HistoryMessage = { role: "user" | "assistant"; content: string };
 
@@ -30,6 +31,9 @@ export function buildStructuredConversationState(history: HistoryMessage[]): Str
   const userTurns = userMessages.map((item) => buildDeterministicUnderstanding(item.content));
   const explicit = userTurns.filter((item, index) => {
     const message = userMessages[index]!.content;
+    // A price/estimate is an action on a prior subject, not a replacement
+    // subject for later dependent informational turns.
+    if (detectCommercialIntent(message)) return false;
     const subjectlessDependency = isDependentFollowUp(message) &&
       (!item.topics.length || /\b(?:this|that|it|its|these|those|they|them|their|one|ones|other|another)\b/i.test(message) ||
         /^(?:any|another|other|next|first|second|third|last)\b/i.test(message.trim()));
@@ -51,7 +55,8 @@ export function buildStructuredConversationState(history: HistoryMessage[]): Str
   return {
     activeTopic,
     previousTopic: previous?.entities[0] ?? previous?.topics.join(" ") ?? previous?.industry ?? null,
-    activeContentType: userTurns.findLast((item) => item.requestedContentType)?.requestedContentType ?? null,
+    activeContentType: userTurns.filter((_, index) => !detectCommercialIntent(userMessages[index]!.content))
+      .findLast((item) => item.requestedContentType)?.requestedContentType ?? null,
     activeProduct: active && (/\bkagen\b/.test(active.normalizedQuery) || active.requestedContentType === "product" || active.requestedContentType === "kagen-product")
       ? activeTopic : null,
     activePartner: active?.requestedContentType === "partner" ? activeTopic : null,
@@ -80,7 +85,8 @@ export function resolveStructuredFollowUpMessage(message: string, history: Histo
     return state.previousTopic ? `Tell me about ${state.previousTopic}` : undefined;
   if (/^(?:what can it do|what does it do|who is it for|any latest news|latest news|any case studies|any articles|what do you do together)$/.test(normalized)) {
     const lastUser = history.findLast((item) => item.role === "user")?.content ?? "";
-    const selectedResource = isDependentFollowUp(lastUser) ? state.lastPresentedResources[0]?.title : undefined;
+    const selectedResource = isDependentFollowUp(lastUser) && !detectCommercialIntent(lastUser)
+      ? state.lastPresentedResources[0]?.title : undefined;
     const subject = selectedResource ?? state.activeTopic;
     if (selectedResource) {
       const entity = selectedResource

@@ -18,7 +18,7 @@ const TOPICAL_DISCOVERY_ROLES = new Set<SuccessiveSearchDocument["role"]>([
 /** Parses only the generic action grammar used by related-content controls. */
 export function parseRelatedContentRequest(message: string): RelatedContentRequest | null {
   const normalized = normalizeSearchText(message);
-  const roleLabel = normalized.match(/^(?:explore|show|find|view|read)\s+(?:some\s+)?related\s+(.+)$/)?.[1];
+  const roleLabel = normalized.match(/^(?:explore|show(?: me)?|find|view|read)\s+(?:some\s+)?related\s+(.+)$/)?.[1];
   if (!roleLabel) return null;
   const mappings: Array<[RegExp, SuccessiveSearchDocument["role"][]]> = [
     [/\b(?:articles?|posts?|blogs?)\b/, ["blog", "editorial"]],

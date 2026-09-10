@@ -55,6 +55,10 @@ describe("global suggestion action registry", () => {
       expect(parseRelatedContentRequest("Explore related pages")?.requestedRoles).toEqual(["page"]);
     });
 
+    it("recognizes a dependent related-content request with the natural show-me wrapper", () => {
+      expect(parseRelatedContentRequest("Show me related articles")?.requestedRoles).toEqual(["blog", "editorial"]);
+    });
+
     it("preserves the subject while restricting related services", () => {
       const source = doc(201, "Workflow Automation", "page");
       const service = doc(202, "Workflow Automation Service", "service");

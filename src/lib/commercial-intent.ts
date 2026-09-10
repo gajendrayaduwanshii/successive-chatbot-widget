@@ -19,6 +19,32 @@ const INTENT_ORDER: CommercialIntent[] = [
 const COMMERCIAL_NOUN = /\b(?:costs?|pricing|prices?|charges?|rates?|budgets?|estimates?|quotations?|quotes?|proposals?|commercials?|consultations?)\b/;
 const COMMERCIAL_REQUEST = /\b(?:request|need|want|like|help|give|provide|prepare|send|share|get|receive|discuss|talk|speak|connect|contact|reach|call|callback|buy|purchase|engage|hire|start|kick[ -]?off|implement|implementing|build|develop)\b/;
 
+/**
+ * An explicit editorial request owns its named title/topic span. Commercial
+ * vocabulary inside that span is descriptive title text, not an action. A
+ * later actionable clause remains available for genuine mixed-intent turns.
+ */
+export function explicitEditorialSubject(message: string): string | undefined {
+  const normalized = normalizeSearchText(message);
+  const trailingRole = normalized.match(
+    /^(?:show me|tell me about)\s+(?:the\s+)?(.+?)\s+(?:article|blog|resource|case study)(?:\s+(?:and|then|also)\s+.*)?$/,
+  );
+  if (trailingRole?.[1]) return trailingRole[1].trim();
+  const match = normalized.match(
+    /^(?:(?:show|find|list|give me|do you have|show me)\s+(?:the\s+)?(?:articles?|blogs?|resources?|case studies|customer stories)\s*(?:related to|about|titled|called)?\s+|(?:tell me about|show me)\s+(?:the\s+)?(?:article|blog|resource|case study)\s+(?:titled|called)?\s+)(.+)$/,
+  );
+  if (!match?.[1]) return undefined;
+  return match[1]
+    .split(/\s+(?:and|then|also)\s+(?=(?:tell|give|what|how|can|could|would|need|want)\b)/)[0]
+    ?.trim() || undefined;
+}
+
+function commercialActionText(message: string): string {
+  const normalized = normalizeSearchText(message);
+  const subject = explicitEditorialSubject(message);
+  return subject ? normalized.replace(subject, " ").replace(/\s+/g, " ").trim() : normalized;
+}
+
 /** Generic, compositional commercial classification; no production question list. */
 export function detectCommercialIntent(message: string): CommercialIntent | null {
   return detectCommercialIntents(message)[0] ?? null;
@@ -27,6 +53,7 @@ export function detectCommercialIntent(message: string): CommercialIntent | null
 /** Returns every explicitly requested commercial action, in the user's order. */
 export function detectCommercialIntents(message: string): CommercialIntent[] {
   const q = normalizeSearchText(message);
+  const actionText = commercialActionText(message);
   const informationalCostTopic = /^(?:tell|show|explain|describe|summarize|what is|what are)\b.*\b(?:cost optimi[sz]ation|cost control|cost management|finops)\b/.test(q);
   if (informationalCostTopic && !/\b(?:project cost|pricing|estimate|quote|quotation|proposal|sales)\b/.test(q)) return [];
   if (/\b(?:do not|don t|not)\s+(?:need|want|asking (?:for|about))\s+(?:the )?(?:price|pricing|cost|estimate|quote|quotation|proposal)\b/.test(q) &&
@@ -35,7 +62,7 @@ export function detectCommercialIntents(message: string): CommercialIntent[] {
       !/\b(?:estimate|quote|quotation|proposal|pricing|contact|sales)\b/.test(q)) return [];
   const matches: Array<{ intent: CommercialIntent; index: number }> = [];
   const add = (intent: CommercialIntent, expression: RegExp) => {
-    const match = expression.exec(q);
+    const match = expression.exec(actionText);
     if (match) matches.push({ intent, index: match.index });
   };
   add("pricing", /\b(?:how much|what(?:'s| is| are) (?:the )?(?:cost|price|pricing)|costs?|prices?|pricing|charges?|rates?)\b/);
@@ -55,8 +82,8 @@ export function detectCommercialIntents(message: string): CommercialIntent[] {
       !/^how (?:is|are|was|were|do|does)\b/.test(q)) add("implementation", implementationAction);
   if (/\bintegration requirements?\b/.test(q)) add("implementation", /\bintegration requirements?\b/);
   add("buying", /\b(?:buy|purchase|engage|hire|start (?:a|the|our) project|work with successive|next steps?|get started)\b/);
-  if (!matches.length && COMMERCIAL_NOUN.test(q) && (COMMERCIAL_REQUEST.test(q) || /[?]$/.test(message.trim())))
-    matches.push({ intent: "pricing", index: q.search(COMMERCIAL_NOUN) });
+  if (!matches.length && COMMERCIAL_NOUN.test(actionText) && (COMMERCIAL_REQUEST.test(actionText) || /[?]$/.test(message.trim())))
+    matches.push({ intent: "pricing", index: actionText.search(COMMERCIAL_NOUN) });
   return matches
     .sort((a, b) => a.index - b.index || INTENT_ORDER.indexOf(a.intent) - INTENT_ORDER.indexOf(b.intent))
     .filter((item, index, all) => all.findIndex((other) => other.intent === item.intent) === index)

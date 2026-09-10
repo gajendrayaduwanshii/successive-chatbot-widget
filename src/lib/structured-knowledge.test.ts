@@ -44,6 +44,24 @@ describe("unsupported structured company information", () => {
   });
 });
 
+describe("structured local evidence serialization", () => {
+  it("does not append a later CTA section when answering from earlier structured fields", () => {
+    const awards = page(701, "awards", "Awards & Recognitions", {
+      title: "Awards & Recognitions",
+      description: "Published recognition and milestone evidence.",
+      title2: "Our Achievements",
+      description2: "Published accomplishments as an industry leader.",
+      cta_heading: "Successive Advantage",
+      cta_description: "Unrelated product-engineering promotion must not become award evidence.",
+    });
+    const result = answerStructuredRequest([awards], understandStructuredRequest("Award")!);
+    expect(result?.answer).toContain("Published recognition");
+    expect(result?.answer).toContain("Published accomplishments");
+    expect(result?.answer).not.toContain("Unrelated product-engineering");
+    expect(result?.evidencePaths).toEqual(["title", "description", "title2", "description2"]);
+  });
+});
+
 const trustedLabel = (suffix: string) => `Fixture Organization ${suffix}`;
 const trustedHomepage = (names: string[], heading = "Completely revised marketing copy"): WordPressItem => ({
   id: 901, type: "page", slug: "cms-internal-home-record", link: "https://successive.tech/",

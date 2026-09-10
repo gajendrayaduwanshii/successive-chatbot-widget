@@ -20,6 +20,7 @@ import {
 import {
   buildSearchDocument,
   buildSearchIndex,
+  factualDocumentEvidence,
   normalizeSearchText,
   type SuccessiveSearchDocument,
 } from "@/lib/search-index";
@@ -29,6 +30,13 @@ import {
   getIndexDiagnostics,
   isExplicitRequestedRoleRelation,
   extractExplicitInformationalSubject,
+  definitionEvidencePassages,
+  semanticSynthesisEvidencePassages,
+  isCompactDefinitionSubject,
+  isDirectDefinitionQuery,
+  isShortSemanticSubject,
+  semanticInformationalSubject,
+  matchExactIndexedTitle,
   resolveExactIndexedTitle,
   retrieveFromIndex,
   cardEligibility,
@@ -36,7 +44,7 @@ import {
   type SearchMatch,
 } from "@/lib/search-retriever";
 import type { NormalizedContent } from "@/types/wordpress";
-import { sanitizeGroundedAnswerOpening } from "@/lib/response-format";
+import { collapseAdjacentDuplicateTerms, retainValidatedInlineLinks, sanitizeGroundedAnswerOpening } from "@/lib/response-format";
 import { extractPublishedContactDetails } from "@/lib/contact-details";
 import {
   careerJobSummary,
@@ -73,6 +81,8 @@ import {
   buildRetrievalQuery,
   isExplicitListRequest,
   isDependentFollowUp,
+  isFacetOnlyFollowUp,
+  normalizeMalformedInterrogative,
   classifyFollowUpScope,
   type QueryUnderstanding,
 } from "@/lib/query-understanding";
@@ -90,11 +100,13 @@ import {
   classifyUnsupportedCompanyInformation,
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
-import { answerAddressesRequestedAttribute, recoverAuthoritativeEvidence, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
-import { alignedCta, anchorExactSubjectMatches, documentContentType, ensureRequestedRoleFraming, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches } from "@/lib/response-alignment";
+import { answerAddressesRequestedAttribute, recoverAuthoritativeEvidence, requestedAttribute, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
+import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, documentContentType, enrichAnswerWithValidatedInlineLinks, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "@/lib/response-alignment";
 import { buildCategoryNavigationActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, buildFollowUpQueryActions, classifySuggestionContext, documentActionKey, noRelatedContentMessage, parseRelatedContentRequest, resolveEligibleActionDocuments, resolveSuggestionAction, type LeadershipSuggestionContext, type SuggestionContextType } from "@/lib/suggestion-actions";
 import { commercialAnswer, commercialSubject, commercialSubjectFromAnswer, contactUsCta, detectCommercialIntent, detectCommercialIntents, hasExplicitGenericProjectSubject, isCommerciallyPriceableContext, isDependentCommercialSubjectQuery } from "@/lib/commercial-intent";
 import { buildContactableFallbackAnswer, selectContactableFallback, type ContactableFallback } from "@/lib/contactable-fallback";
+import { hasGroundedElaborationSecondAspect, isSafeGroundedElaboration, planGroundedElaboration } from "@/lib/grounded-elaboration";
+import { buildDeterministicOverviewAnswer, buildGroundedEvidencePackage, buildQuestionFocusedFallback, hasOnlyValidatedComposerUrls, hasQuestionFocusCoverage, isEligibleDeterministicOverview, isEligibleGroundedComposer } from "@/lib/grounded-evidence-package";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -165,6 +177,16 @@ async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]> {
   return documents;
 }
 
+/** A bounded card can borrow depth only from the exact canonical page it links
+ * to; siblings and lexical neighbours never qualify as supporting evidence. */
+function structuralCanonicalSupport(primary: SearchMatch, corpus: SuccessiveSearchDocument[]): SuccessiveSearchDocument | undefined {
+  if (!primary.localEvidence?.url || !primary.matchedFields.some((field) =>
+    field === "exact-structured-section" || field === "embedded-structural-parent")) return undefined;
+  const destination = primary.localEvidence.url.replace(/\/+$/, "");
+  return corpus.find((candidate) => candidate.id !== primary.document.id && candidate.type === "page" &&
+    candidate.url.replace(/\/+$/, "") === destination);
+}
+
 async function buildResolvedNavigationActions({ document, subject, contextType, excludedResultKeys = [], leadershipContext }: {
   document: SuccessiveSearchDocument;
   subject?: string;
@@ -211,6 +233,38 @@ async function fetchStructuredItems(request: StructuredRequest) {
   if (request.attribute !== "awards" || request.mode !== "latest") return pageItems;
   const awards = await fetchSuccessive("/content?type=award&per_page=100");
   return [...pageItems, ...awards];
+}
+
+// Some first-party company collections are intentionally fetched on demand by
+// their structured route and are therefore not guaranteed to be present in the
+// broad content corpus. Keep their *page identities* available to the same
+// conservative title-lock resolver used for the normal corpus. This is an
+// identity supplement only: matching remains title/slug/alias based and does
+// not use body text or rewrite arbitrary request text.
+const STRUCTURED_IDENTITY_PAGE_SLUGS = [
+  "about-us", "contact", "our-culture", "careers", "global-capabilities", "partners", "awards",
+] as const;
+
+async function resolveRouteIndexedTitle(
+  message: string,
+  requestedContentType?: QueryUnderstanding["requestedContentType"],
+): Promise<SearchMatch | undefined> {
+  const corpusMatch = await resolveExactIndexedTitle(message, requestedContentType);
+  if (corpusMatch) return corpusMatch;
+  const settled = await Promise.allSettled(
+    STRUCTURED_IDENTITY_PAGE_SLUGS.map((slug) => fetchSuccessive(`/pages/${slug}`)),
+  );
+  const seen = new Set<string>();
+  const structuredItems = settled.flatMap((result) => result.status === "fulfilled" ? result.value : [])
+    .filter((item) => {
+      const key = `${item.type}:${item.id}:${item.link}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  return structuredItems.length
+    ? matchExactIndexedTitle(buildSearchIndex(structuredItems), message, requestedContentType)
+    : undefined;
 }
 
 export async function OPTIONS(request: NextRequest) {
@@ -304,6 +358,10 @@ export async function POST(request: NextRequest) {
       );
     }
   }
+  preparedQuery = {
+    ...preparedQuery,
+    englishQuery: normalizeMalformedInterrogative(preparedQuery.englishQuery),
+  };
   const lastAssistantContent = [...parsed.data.history].reverse()
     .find((item) => item.role === "assistant")?.content ?? "";
   const groundedTitleFromHistory = lastAssistantContent.match(
@@ -351,8 +409,11 @@ export async function POST(request: NextRequest) {
     : inferredRelatedAction;
   const actionMessage = resolveSuggestionAction(resolvedSuggestionAction);
   const explicitTurnUnderstanding = buildDeterministicUnderstanding(preparedQuery.englishQuery);
-  const effectiveMessage = actionMessage ?? (explicitTurnUnderstanding.requestedContentType || detectCommercialIntent(preparedQuery.englishQuery)
+  const rawFacetOnlyFollowUp = isFacetOnlyFollowUp(preparedQuery.englishQuery);
+  const effectiveMessage = actionMessage ?? ((explicitTurnUnderstanding.requestedContentType && !rawFacetOnlyFollowUp) || detectCommercialIntent(preparedQuery.englishQuery)
     ? preparedQuery.englishQuery
+    : rawFacetOnlyFollowUp
+      ? preparedQuery.englishQuery
     : resolveUnsupportedAlternativeFollowUp(
     preparedQuery.englishQuery,
     parsed.data.history,
@@ -367,10 +428,10 @@ export async function POST(request: NextRequest) {
   const currentExplicitSubject = actionMessage
     ? undefined : extractExplicitInformationalSubject(preparedQuery.englishQuery);
   const currentQueryTitleLock = currentExplicitSubject
-    ? await resolveExactIndexedTitle(preparedQuery.englishQuery) : undefined;
+    ? await resolveRouteIndexedTitle(preparedQuery.englishQuery, explicitTurnUnderstanding.requestedContentType) : undefined;
   const exactTitleLock = currentQueryTitleLock ??
     (normalizeSearchText(effectiveMessage) !== normalizeSearchText(preparedQuery.englishQuery)
-      ? await resolveExactIndexedTitle(effectiveMessage) : undefined);
+      ? await resolveRouteIndexedTitle(effectiveMessage, explicitTurnUnderstanding.requestedContentType) : undefined);
   if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
       !detectCommercialIntent(preparedQuery.englishQuery) &&
       !isExplicitRequestedRoleRelation(preparedQuery.englishQuery) &&
@@ -834,7 +895,7 @@ export async function POST(request: NextRequest) {
   // Strong sales requests must reach the commercial route before private-price
   // evidence safeguards; the commercial route already refuses invented prices
   // and attaches only the validated Contact Us destination.
-  const unsupportedAnswer = exactTitleLock || detectCommercialIntent(effectiveMessage)
+  const unsupportedAnswer = exactTitleLock || explicitTurnUnderstanding.requestedContentType || detectCommercialIntent(effectiveMessage)
     ? null
     : safeUnsupportedQueryResponse(effectiveMessage);
   if (unsupportedAnswer) {
@@ -957,7 +1018,7 @@ export async function POST(request: NextRequest) {
   const directStructuredRequest = understandContextualStructuredRequest(
     effectiveMessage,
     parsed.data.history.slice(-8),
-  );
+  ) ?? (exactTitleLock ? understandStructuredRequest(exactTitleLock.document.title) : null);
   const structuredAttributeOwnsTurn = ["technologies", "capabilities"].includes(directStructuredRequest?.attribute ?? "");
   // A bare recognized person role (for example, "ceo") can also resemble an
   // indexed alias. Its explicit structured role is stronger than that title
@@ -968,7 +1029,7 @@ export async function POST(request: NextRequest) {
     // A catalog-like word embedded in an exact resource title is title text,
     // not an instruction to replace that resource with a company catalog.
     // Structured person-role requests retain their dedicated authoritative path.
-    (exactTitleLock && !structuredPersonRoleOwnsTurn) ? null : ["product", "kagen-product", "service", "sub-service", "solution", "case-study", "blog", "whitepaper", "ebook", "webinar", "event", "press-release", "media-coverage", "news", "accelerator", "partner", "career"]
+    (exactTitleLock && !structuredPersonRoleOwnsTurn && !directStructuredRequest) ? null : ["product", "kagen-product", "service", "sub-service", "solution", "case-study", "blog", "whitepaper", "ebook", "webinar", "event", "press-release", "media-coverage", "news", "accelerator", "partner", "career"]
     .includes(deterministicUnderstanding.requestedContentType ?? "")
       && !structuredAttributeOwnsTurn
     ? null
@@ -1002,17 +1063,33 @@ export async function POST(request: NextRequest) {
           contextType: "INDIVIDUAL_PAGE_CONTEXT",
           leadershipContext,
         });
+        // Structured company facts return before the general retrieval/CTA
+        // pipeline. Reuse its central CTA resolver here so a validated source
+        // retains the same terminal navigation behavior.
+        const structuredMatch: SearchMatch = {
+          document,
+          score: 1_000,
+          confidence: "high",
+          matchedFields: ["structured-api-evidence"],
+          selectedPassages: [structuredAnswer.answer],
+        };
+        const structuredCta = leadershipContext ? undefined : alignedCta(structuredMatch, deterministicUnderstanding);
+        const structuredBody = leadershipContext && document.url
+          ? `${structuredAnswer.answer.trim()}\n\nExplore the [${ctaAnchorTitle(document.title)}](${document.url}) page to learn more about Successive's leadership.`
+          : structuredCta
+            ? `${removeTrailingNavigationCtas(structuredAnswer.answer)}\n\n${structuredCta}`
+            : structuredAnswer.answer;
         return NextResponse.json(
           {
             success: true,
             data: {
-              answer: structuredAnswer.answer,
+              answer: structuredBody,
               cards: suppressUnsupportedCard ? [] : [{
                 type: "page" as const,
                 title: document.title,
                 description: (
+                  structuredAnswer.answer ??
                   document.descriptions[0] ??
-                  document.textSegments[0] ??
                   document.title
                 ).slice(0, 500),
                 url: document.url,
@@ -1042,8 +1119,9 @@ export async function POST(request: NextRequest) {
       // temporarily incomplete; no static company fact is used as fallback.
     }
   }
-  const hasExplicitCurrentSubject = deterministicUnderstanding.topics.length > 0 ||
-    deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry);
+  const hasExplicitCurrentSubject = !isFacetOnlyFollowUp(effectiveMessage) &&
+    (deterministicUnderstanding.topics.length > 0 ||
+      deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry));
   const deterministicWithContext = resolveConversationUnderstanding(
     deterministicUnderstanding,
     parsed.data.history.slice(-8),
@@ -1051,6 +1129,11 @@ export async function POST(request: NextRequest) {
   let understanding: QueryUnderstanding = deterministicUnderstanding;
   if (
     getEnv().AI_API_KEY &&
+    // An exact indexed title already supplies deterministic identity and
+    // overview intent. Keep semantic interpretation for all other definition
+    // requests, including short technical subjects.
+    !(exactTitleLock && !parsed.data.history.length &&
+      /^(?:what\s+(?:is|are)|tell me about|give me (?:an )?overview of|overview of|explain|describe)\b/i.test(effectiveMessage)) &&
     shouldUseSemanticUnderstanding(
       deterministicUnderstanding,
       parsed.data.history,
@@ -1101,7 +1184,10 @@ export async function POST(request: NextRequest) {
     industry: hasExplicitCurrentSubject
       ? deterministicUnderstanding.industry
       : deterministicUnderstanding.industry ?? understanding.industry,
-    requestedContentType: deterministicUnderstanding.requestedContentType,
+    requestedContentType: isFacetOnlyFollowUp(effectiveMessage) &&
+      !/\b(?:ebook|e book|resource|guide)\b/i.test(effectiveMessage)
+      ? null
+      : deterministicUnderstanding.requestedContentType,
     targetScope: hasExplicitCurrentSubject || deterministicUnderstanding.targetScope !== "topic"
       ? deterministicUnderstanding.targetScope
       : understanding.targetScope,
@@ -1133,7 +1219,11 @@ export async function POST(request: NextRequest) {
     };
   }
   const intent = exactTitleLock ? "general" : detectIntent(effectiveMessage);
-  const commercialIntent = exactTitleLock ? null : detectCommercialIntent(effectiveMessage);
+  // A dependent compatibility question needs claim validation against its
+  // active subject. It is not itself a request to buy or contact sales.
+  const dependentCompatibility = isDependentFollowUp(effectiveMessage) &&
+    /\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|connect(?:s|ed|ing|ion)?)\b/i.test(effectiveMessage);
+  const commercialIntent = exactTitleLock || dependentCompatibility ? null : detectCommercialIntent(effectiveMessage);
   const isNamedSuccessivePersonQuery =
     understanding.targetScope === "company" && understanding.entities.length > 0;
   const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
@@ -1323,7 +1413,7 @@ export async function POST(request: NextRequest) {
         .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
         .slice(0, 5);
       return NextResponse.json({ success: true, data: {
-        answer: informationalAnswer ? `${informationalAnswer}\n\n${answer}` : answer,
+        answer: informationalAnswer ? `${removeTrailingNavigationCtas(informationalAnswer)}\n\n${answer}` : answer,
         cards: [...informationalDocuments.map((item) => ({ type: cardType(item.type), title: item.title,
           description: item.descriptions[0] ?? item.textSegments[0] ?? item.title,
           url: item.url, image: item.image, badge: item.role.replace(/_/g, " ") })), { type: "page" as const, title: document.title,
@@ -1345,7 +1435,7 @@ export async function POST(request: NextRequest) {
         .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
         .slice(0, 5);
       return NextResponse.json({ success: true, data: {
-        answer: [informationalAnswer, commercialAnswer(subject, canonicalContactUrl, commercialIntents)].filter(Boolean).join("\n\n"),
+        answer: [removeTrailingNavigationCtas(informationalAnswer), commercialAnswer(subject, canonicalContactUrl, commercialIntents)].filter(Boolean).join("\n\n"),
         cards: [...informationalDocuments.map((item) => ({ type: cardType(item.type), title: item.title,
           description: item.descriptions[0] ?? item.textSegments[0] ?? item.title,
           url: item.url, image: item.image, badge: item.role.replace(/_/g, " ") })),
@@ -1868,7 +1958,15 @@ export async function POST(request: NextRequest) {
       if (!existing || match.score > existing.score) best.set(key, match);
       return best;
     }, new Map<string, SearchMatch>()).values()].sort((a, b) => b.score - a.score);
-    const mergedBaseMatches = strongestByDocument([...retrieval.matches, ...literalRetrieval.matches]).slice(0, 8);
+    const mergedRankedMatches = strongestByDocument([...retrieval.matches, ...literalRetrieval.matches]).slice(0, 8);
+    const explicitEditorialRole = ["blog", "resource", "whitepaper", "ebook", "case-study"].includes(
+      understanding.requestedContentType ?? "",
+    );
+    // Generic entity questions should anchor to a canonical offering before a
+    // same-name resource. Explicit resource requests keep their requested role.
+    const mergedBaseMatches = explicitEditorialRole
+      ? mergedRankedMatches
+      : anchorExactSubjectMatches(mergedRankedMatches, understanding);
     const mergedBaseCandidates = strongestByDocument([...(retrieval.candidates ?? []), ...(literalRetrieval.candidates ?? [])]);
     retrieval = {
       ...retrieval,
@@ -1876,6 +1974,21 @@ export async function POST(request: NextRequest) {
       matches: mergedBaseMatches,
       candidates: mergedBaseCandidates,
     };
+    const entityFirstPrimary = mergedBaseMatches.find((match) =>
+      match.matchedFields.includes("entity-first-question-span"));
+    if (entityFirstPrimary) {
+      // The natural-language tail expresses what the visitor wants to know,
+      // not additional entity identity. Keep that request in effectiveMessage
+      // for composition while validating retrieval against the proven subject.
+      understanding = {
+        ...understanding,
+        topics: [entityFirstPrimary.document.title],
+        entities: [entityFirstPrimary.document.title],
+        requestedContentType: documentContentType(entityFirstPrimary.document) as QueryUnderstanding["requestedContentType"],
+        targetScope: "entity",
+        isBroadQuery: false,
+      };
+    }
     const facets = extractQueryFacets(effectiveMessage);
     const facetResults: Array<{ facet: typeof facets[number]; understanding: QueryUnderstanding;
       result: Awaited<ReturnType<typeof retrieveFromIndex>>; matches: SearchMatch[] }> = [];
@@ -1965,7 +2078,7 @@ export async function POST(request: NextRequest) {
               ? "I couldn't find that exact published item in the available Successive content."
               : requestedTypeLabel
               ? `I couldn't find a strongly matching Successive ${requestedTypeLabel} for this topic. I don't want to present a generic or weakly related item as direct evidence. You can broaden the content type or ask for related Successive services and resources.`
-              : buildHelpfulFallback(preparedQuery.fallbackAnswer),
+              : buildHelpfulFallback(preparedQuery.fallbackAnswer, effectiveMessage),
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
@@ -2111,7 +2224,14 @@ export async function POST(request: NextRequest) {
       matches: selectedMatches,
       hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
     });
-    if (exactTitleLock) {
+    // Exact identity is valuable for locating a subject, but it cannot turn a
+    // qualifier question into a generic capability answer. Those questions
+    // must continue through subject-local attribute validation.
+    const requestedFactAttribute = requestedAttribute(effectiveMessage, understanding);
+    const explicitEditorialTitle = ["blog", "resource", "whitepaper", "ebook", "case-study"].includes(
+      understanding.requestedContentType ?? "",
+    );
+    if (exactTitleLock && (explicitEditorialTitle || ["fact", "capability", "content_type"].includes(requestedFactAttribute))) {
       const locked = selectedMatches.find((match) =>
         match.document.id === exactTitleLock.document.id,
       ) ?? exactTitleLock;
@@ -2258,32 +2378,88 @@ export async function POST(request: NextRequest) {
         confidence: "low", insufficientContext: true,
       }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
     }
+    const explicitInformationalSubject = extractExplicitInformationalSubject(effectiveMessage);
+    const shortTechnicalSubject = Boolean(explicitInformationalSubject && isShortSemanticSubject(explicitInformationalSubject));
     const contextMatches = preGenerationAlignment.primary
-      ? [preGenerationAlignment.primary, ...preGenerationAlignment.related]
+      ? [preGenerationAlignment.primary, ...(shortTechnicalSubject ? [] : preGenerationAlignment.related)]
       : validatedMatches.slice(0, 1);
     selectedMatches = contextMatches;
     const contextStartedAt = performance.now();
     const context: NormalizedContent[] = contextMatches.map(
-      ({ document, selectedPassages }) => ({
+      (match) => {
+        const { document, selectedPassages } = match;
+        const compositionPassages = compositionEvidence(match, 6, understanding);
+        return {
         id: document.id,
         type: document.type,
         slug: document.slug,
         title: document.title,
-        excerpt: document.descriptions[0] ?? selectedPassages[0] ?? "",
-        plainText: namedResourceSubject
-          ? document.textSegments.slice(0, 10).join("\n\n")
-          : selectedPassages.join("\n\n"),
+        excerpt: compositionPassages[0] ?? factualDocumentEvidence(document)[0] ?? selectedPassages[0] ?? "",
+        plainText: match.localEvidence?.passages.join("\n\n") ?? (namedResourceSubject
+          ? factualDocumentEvidence(document).slice(0, 10).join("\n\n")
+          : compositionPassages.join("\n\n")),
         url: document.url,
         image: document.image,
         modified: document.modified,
         acfText: "",
         extractedUrls: [],
         service_type: document.service_type,
-      }),
+        };
+      },
     );
     contextConstructionDurationMs = performance.now() - contextStartedAt;
+    // The deterministic answer needs ranked evidence even when a question has
+    // a dependent-looking grammatical shape but explicitly names its subject.
+    const structuralSupport = selectedMatches[0]
+      ? structuralCanonicalSupport(selectedMatches[0], await getSuggestionCorpus())
+      : undefined;
+    const questionEvidencePackage = selectedMatches[0]
+      ? buildGroundedEvidencePackage({
+        userQuery: effectiveMessage,
+        primary: selectedMatches[0],
+        understanding,
+        hasPriorContext: parsed.data.history.length > 0,
+        structuralCanonicalSupport: structuralSupport,
+      })
+      : undefined;
+    const evidencePackage = isEligibleGroundedComposer(selectedMatches[0], understanding) &&
+      !isDependentFollowUp(effectiveMessage)
+      ? questionEvidencePackage
+      : undefined;
+    const deterministicGroundedAnswer = buildQuestionFocusedFallback(
+      buildGroundedRetrievalAnswer(selectedMatches),
+      questionEvidencePackage,
+    );
+    // This is intentionally evaluated after canonical selection, evidence
+    // validation, and structural support discovery. It cannot make a query
+    // eligible merely because its wording resembles an overview.
+    const deterministicOverview = questionEvidencePackage && isEligibleDeterministicOverview({
+      primary: selectedMatches[0],
+      evidence: questionEvidencePackage,
+      understanding,
+      directEnglish: canUseEnglishQueryDirectly(parsed.data.message),
+      hasPriorContext: parsed.data.history.length > 0,
+      // The assistant's immediately preceding canonical link proves that the
+      // inherited subject is still active; a new explicit subject bypasses
+      // this context path entirely through normal resolution.
+      resolvedFollowUp: Boolean(isDependentFollowUp(effectiveMessage) && selectedMatches[0]?.document.url &&
+        lastAssistantContent.includes(selectedMatches[0].document.url)),
+      hasAction: Boolean(actionMessage || parsed.data.suggestionAction),
+      isCommercial: Boolean(commercialIntent),
+      facetCount: facetResults.length,
+    })
+      ? buildDeterministicOverviewAnswer(questionEvidencePackage)
+      : undefined;
+    // The evidence-package composer is a complete, fresh composition path.
+    // The legacy elaboration plan remains only for categories not yet eligible
+    // for that bounded package.
+    const elaboration = evidencePackage ? undefined : planGroundedElaboration({
+      answer: deterministicGroundedAnswer,
+      primary: selectedMatches[0],
+      understanding,
+    });
     let generatedData;
-    if (!getEnv().AI_API_KEY) {
+    if (!deterministicOverview && !getEnv().AI_API_KEY) {
       return error(
         503,
         "AI_NOT_CONFIGURED",
@@ -2291,26 +2467,49 @@ export async function POST(request: NextRequest) {
         cors.headers,
       );
     }
-    try {
-      const finalLlmStartedAt = performance.now();
-      const generated = await getLLMProvider().generateStructuredResponse({
-        message: effectiveMessage,
-        responseLanguage: preparedQuery.responseLanguage,
-        fallbackAnswer: preparedQuery.fallbackAnswer,
-        history: hasExplicitCurrentSubject ? [] : parsed.data.history.slice(-10),
-        context,
-        understanding,
-      });
-      const validated = assistantResponseSchema.safeParse(generated);
-      if (validated.success) generatedData = validated.data;
-      finalLlmDurationMs = performance.now() - finalLlmStartedAt;
-    } catch {
-      // Continue with a deterministic source-backed story below.
+    if (!deterministicOverview) {
+      try {
+        const finalLlmStartedAt = performance.now();
+        const generated = await getLLMProvider().generateStructuredResponse({
+          message: effectiveMessage,
+          responseLanguage: preparedQuery.responseLanguage,
+          fallbackAnswer: preparedQuery.fallbackAnswer,
+          history: hasExplicitCurrentSubject ? [] : parsed.data.history.slice(-10),
+          context,
+          understanding,
+          evidencePackage,
+          elaboration: elaboration?.eligible ? {
+            subject: elaboration.subject,
+            primaryEvidence: elaboration.primaryEvidence,
+            additionalEvidence: elaboration.additionalEvidence,
+          } : undefined,
+        });
+        const validated = assistantResponseSchema.safeParse(generated);
+        if (validated.success) generatedData = validated.data;
+        finalLlmDurationMs = performance.now() - finalLlmStartedAt;
+      } catch {
+        // Continue with a deterministic source-backed story below.
+      }
     }
     let generatedAnswer =
-      generatedData?.answer ?? buildGroundedRetrievalAnswer(selectedMatches);
+      deterministicOverview ?? generatedData?.answer ?? deterministicGroundedAnswer;
     if (generatedData?.answer && !isAnswerAlignedWithMatch(generatedData.answer, selectedMatches[0]))
-      generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
+      generatedAnswer = deterministicGroundedAnswer;
+    if (generatedData?.answer && evidencePackage && !hasOnlyValidatedComposerUrls(generatedData.answer, evidencePackage))
+      generatedAnswer = deterministicGroundedAnswer;
+    if (generatedData?.answer && evidencePackage && !hasQuestionFocusCoverage(generatedData.answer, evidencePackage)) {
+      generatedAnswer = buildQuestionFocusedFallback(deterministicGroundedAnswer, evidencePackage);
+    }
+    if (generatedData?.answer && elaboration?.eligible && !isSafeGroundedElaboration(
+      generatedData.answer,
+      elaboration,
+      context.map(({ url }) => url),
+    )) generatedAnswer = deterministicGroundedAnswer;
+    // The conditional LLM call is the preferred composer. If it omits the
+    // authorized second aspect, retain the same bounded evidence rather than
+    // silently falling back to a one-aspect response.
+    if (elaboration?.eligible && !hasGroundedElaborationSecondAspect(generatedAnswer, elaboration))
+      generatedAnswer = `${generatedAnswer.trim()}\n\n${elaboration.additionalEvidence.slice(0, 2).join(" ")}`;
     if (!answerAddressesRequestedAttribute(generatedAnswer, effectiveMessage, evidenceValidation.requestedAttribute)) {
       const contactableFallback = classifyContactableNoContent(understanding);
       if (contactableFallback) {
@@ -2348,7 +2547,7 @@ export async function POST(request: NextRequest) {
         {
           success: true,
           data: {
-            answer: buildHelpfulFallback(preparedQuery.fallbackAnswer),
+            answer: buildHelpfulFallback(preparedQuery.fallbackAnswer, effectiveMessage),
             cards: [],
             sources: [],
             suggestions: buildRelatedSuggestions("general"),
@@ -2367,23 +2566,60 @@ export async function POST(request: NextRequest) {
       /\bSuccessive\s+(?:does not|doesn't|cannot|can't|has no|only)\b/i.test(generatedAnswer)
     )
       generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
-    const groundedAnswer = ensureDescriptiveGroundedAnswer(
-      generatedAnswer,
-      selectedMatches,
-    );
-    const directlyAnswered = ensureExplicitPremiseCorrection(ensureDirectDefinition(
+    const directDefinitionSubject = extractExplicitInformationalSubject(effectiveMessage);
+    const enforceDefinitionSerialization = Boolean(directDefinitionSubject &&
+      isDirectDefinitionQuery(effectiveMessage) && isCompactDefinitionSubject(directDefinitionSubject));
+    const finalDefinitionEvidence = enforceDefinitionSerialization
+      ? selectedMatches.flatMap((match) => {
+        const definitionEvidence = definitionEvidencePassages(
+          match.document,
+          semanticInformationalSubject(directDefinitionSubject!),
+        );
+        // An embedded entity can be definition-valid even when its authored
+        // description starts with a value statement. Retrieval only applies
+        // this marker after matching the structured entity title, a local
+        // description, and its structural destination on the same record.
+        const semanticEvidence = semanticSynthesisEvidencePassages(
+          match.document,
+          semanticInformationalSubject(directDefinitionSubject!),
+        );
+        return definitionEvidence.length > 0
+          ? definitionEvidence
+          : semanticEvidence.length > 0
+            ? semanticEvidence
+          : match.matchedFields.includes("embedded-structural-parent")
+            ? match.selectedPassages
+            : [];
+      }).at(0)
+      : undefined;
+    // LLM topic alignment is intentionally broader than definition semantics.
+    // At the serialization boundary, definition answers must be copied from
+    // definition-valid evidence or use the established safe evidence response.
+    const semanticDefinition = Boolean(enforceDefinitionSerialization &&
+      selectedMatches.some((match) => match.matchedFields.includes("semantic-subject-evidence")));
+    if (enforceDefinitionSerialization && !semanticDefinition)
+      generatedAnswer = finalDefinitionEvidence ?? safeEvidenceResponse({
+        ...evidenceValidation,
+        status: "INSUFFICIENT_EVIDENCE",
+        accepted: [],
+        reason: "No definition-valid evidence survived final composition.",
+      });
+    const groundedAnswer = enforceDefinitionSerialization && !semanticDefinition
+      ? generatedAnswer
+      : ensureDescriptiveGroundedAnswer(generatedAnswer, selectedMatches);
+    const directlyAnswered = collapseAdjacentDuplicateTerms(ensureExplicitPremiseCorrection(ensureDirectDefinition(
       groundedAnswer,
       selectedMatches,
       effectiveMessage,
-    ), understanding);
-    const categoryAnswer = isUseCaseQuery(effectiveMessage)
+    ), understanding));
+    const categoryAnswer = sanitizePresentationText(ensureSubstantialTopicHeading(isUseCaseQuery(effectiveMessage)
       ? ensureCategoryHeading(
           directlyAnswered,
           buildUseCaseHeading(effectiveMessage),
         )
       : isBroadAiServicesQuery(effectiveMessage)
         ? ensureCategoryHeading(directlyAnswered, "Successive AI Services")
-        : directlyAnswered;
+        : directlyAnswered, selectedMatches[0], understanding));
     const alignment = selectAlignedSecondaryMatches({
       matches: selectedMatches,
       understanding,
@@ -2392,13 +2628,21 @@ export async function POST(request: NextRequest) {
     const alignedMatches = [alignment.primary, ...alignment.related].filter(
       (match): match is SearchMatch => Boolean(match),
     );
-    const cta = alignedCta(alignment.primary, understanding);
+    const validatedBodyUrls = alignedMatches.map(({ document }) => document.url);
+    const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
+      retainValidatedInlineLinks(categoryAnswer, validatedBodyUrls),
+      alignedMatches,
+    );
+    const hasBodyLink = Boolean(alignment.primary?.document.url && hasCanonicalBodyLink(inlineLinkedAnswer, alignment.primary.document.url));
+    const cta = shouldAppendFinalCta(Boolean(evidencePackage), hasBodyLink)
+      ? alignedCta(alignment.primary, understanding)
+      : undefined;
     const incompleteFacets = facetResults.filter((item) => item.matches.length === 0);
     const facetCompleteAnswer = incompleteFacets.length
-      ? `${categoryAnswer.trim()}\n\n${incompleteFacets.map(({ facet }) => `I couldn’t find authoritative published evidence for the requested ${facet.relation.toLowerCase().replace(/_/g, " ")} facet.`).join("\n")}`
-      : categoryAnswer;
-    const finalAnswerWithCta = cta && !facetCompleteAnswer.includes(alignment.primary?.document.url ?? "")
-      ? `${facetCompleteAnswer.trim()}\n\n${cta}`
+      ? `${inlineLinkedAnswer.trim()}\n\n${incompleteFacets.map(({ facet }) => `I couldn’t find authoritative published evidence for the requested ${facet.relation.toLowerCase().replace(/_/g, " ")} facet.`).join("\n")}`
+      : inlineLinkedAnswer;
+    const finalAnswerWithCta = cta
+      ? `${removeTrailingNavigationCtas(facetCompleteAnswer)}\n\n${cta}`
       : facetCompleteAnswer;
     const finalAnswer = ensureRequestedRoleFraming(
       finalAnswerWithCta,
@@ -2698,24 +2942,35 @@ function exhaustedCollectionResponse(
   );
 }
 
-function buildHelpfulFallback(localizedFallback: string): string {
+function buildHelpfulFallback(localizedFallback: string, query?: string): string {
   const site = getEnv().SUCCESSIVE_PUBLIC_SITE_URL.replace(/\/$/, "");
-  return `${localizedFallback} Try searching the [Successive website](${site}/?s=) or explore [Successive services](${site}/digital-transformation-services/) for more context.`;
+  const subject = query ? semanticInformationalSubject(extractExplicitInformationalSubject(query) ?? "") : "";
+  const search = subject
+    ? ` Try searching the [Successive website](${site}/?s=${encodeURIComponent(subject)})`
+    : "";
+  return `${localizedFallback}${search} or explore [Successive services](${site}/digital-transformation-services/) for more context.`;
 }
 
-function buildGroundedRetrievalAnswer(
-  matches: Array<{
-    document: SuccessiveSearchDocument;
-    selectedPassages: string[];
-  }>,
-): string {
+function buildGroundedRetrievalAnswer(matches: Array<Pick<SearchMatch, "document" | "selectedPassages" | "localEvidence">>): string {
   return matches
     .slice(0, 3)
-    .map(({ document, selectedPassages }) => {
-      const description = bestStoryDescription(document, selectedPassages);
-      return `**[${document.title.replace(/[\[\]]/g, "")}](${document.url})**\n\n${description}`;
+    .map(({ document, selectedPassages, localEvidence }) => {
+      const description = bestStoryDescription(document, selectedPassages, localEvidence);
+      const title = document.title.replace(/[\[\]]/g, "");
+      const source = hasMeaningfulInlineDestination(document)
+        ? `**[${title}](${document.url})**`
+        : `**${title}**`;
+      return `${source}\n\n${description}`;
     })
     .join("\n\n");
+}
+
+/** The route owns one final navigation sentence; preserve informational inline links. */
+function removeTrailingNavigationCtas(answer: string): string {
+  const paragraphs = answer.trim().split(/\n\s*\n/);
+  while (paragraphs.length && /^(?:explore|read|view|meet|dive)\b[\s\S]*\]\(https?:\/\//i.test(paragraphs.at(-1)!.trim()))
+    paragraphs.pop();
+  return paragraphs.join("\n\n").trim();
 }
 
 function buildWhitepaperCollectionAnswer(
@@ -2940,6 +3195,7 @@ function ensureDescriptiveGroundedAnswer(
   matches: Array<{
     document: SuccessiveSearchDocument;
     selectedPassages: string[];
+    localEvidence?: SearchMatch["localEvidence"];
   }>,
 ): string {
   answer = sanitizeGroundedAnswerOpening(
@@ -2957,19 +3213,25 @@ function ensureDescriptiveGroundedAnswer(
       ? answer.trim().slice(leadingHeading[0].length).trim()
       : answer.trim();
   const sentences = withHeading.match(/[^.!?]+[.!?]+/g)?.length ?? 0;
-  const hasInlinePageLink = matches.some(({ document }) =>
-    withHeading.includes(`](${document.url})`),
-  );
-  if (withHeading.length >= 180 && sentences >= 2 && hasInlinePageLink)
-    return withHeading;
-
-  const details = matches.slice(0, 2).map(({ document, selectedPassages }) => {
-    const description = bestStoryDescription(document, selectedPassages);
-    return `[${document.title.replace(/[\[\]]/g, "")}](${document.url}) provides additional context: ${description}`;
-  });
-  return details.length
-    ? `${withHeading}\n\n${details.join("\n\n")}`
-    : withHeading;
+  // A composed, substantial answer owns the visible body even if it chose not
+  // to include a source URL; search chunks must never be appended afterwards.
+  if (withHeading.length >= 160 && sentences >= 2) return withHeading;
+  // Deterministic fallbacks may still need a little depth. Use authored
+  // descriptions only (never selected retrieval chunks/headings), and omit a
+  // title/link wrapper so this remains prose rather than a source dump.
+  const additions = matches.slice(0, 2).flatMap(({ document, localEvidence }) =>
+    (localEvidence?.passages ?? factualDocumentEvidence(document)).map(sanitizePresentationText).filter((value) => {
+      // A bounded structured entity can have a concise, authored card
+      // description. It is still factual body evidence when it is a complete
+      // sentence, so do not let a cosmetic character floor reduce the answer
+      // to its heading/title alone.
+      const words = normalizeSearchText(value).split(" ").filter(Boolean);
+      return value.length >= 40 && words.length >= 6 && /[.!?]$/.test(value);
+    }),
+  ).filter((value, index, all) => all.findIndex((other) => normalizeHeading(other) === normalizeHeading(value)) === index)
+    .filter((value) => !normalizeHeading(withHeading).includes(normalizeHeading(value)))
+    .slice(0, 2);
+  return additions.length ? `${withHeading}\n\n${additions.join(" ")}` : withHeading;
 }
 
 function ensureDirectDefinition(
@@ -2977,6 +3239,7 @@ function ensureDirectDefinition(
   matches: Array<{
     document: SuccessiveSearchDocument;
     selectedPassages: string[];
+    localEvidence?: SearchMatch["localEvidence"];
   }>,
   message: string,
 ): string {
@@ -2991,10 +3254,9 @@ function ensureDirectDefinition(
     "i",
   );
   if (definitionPattern.test(answer.slice(0, 500))) return answer;
-  const evidence = matches.flatMap(({ document, selectedPassages }) => [
+  const evidence = matches.flatMap(({ document, selectedPassages, localEvidence }) => [
     ...selectedPassages,
-    ...document.textSegments,
-    ...document.descriptions,
+    ...(localEvidence?.passages ?? factualDocumentEvidence(document)),
   ]);
   const definition = evidence
     .map((passage) => passage.match(definitionPattern)?.[0]?.trim())
@@ -3005,13 +3267,20 @@ function ensureDirectDefinition(
 function bestStoryDescription(
   document: SuccessiveSearchDocument,
   selectedPassages: string[],
+  localEvidence?: SearchMatch["localEvidence"],
 ): string {
   const normalizedTitle = normalizeHeading(document.title);
-  const candidates = [
-    ...document.descriptions,
-    ...selectedPassages,
-    ...document.textSegments,
-  ];
+  const resourceLike = ["resource", "blog", "ebook", "whitepaper"].includes(documentContentType(document));
+  const factualEvidence = factualDocumentEvidence(document);
+  const ownedResourceDescriptions = resourceLike
+    ? factualEvidence.flatMap((value) => value.split(/(?<=[.!?])\s+|\n+/))
+      .filter((value) => /\bthis\s+(?:e-?book|white ?paper|guide|article|resource)\b/i.test(value))
+    : [];
+  const candidates = localEvidence?.passages ?? [
+    ...ownedResourceDescriptions,
+    ...factualEvidence,
+    ...(factualEvidence.length ? [] : selectedPassages),
+  ].map(sanitizePresentationText).filter(Boolean);
   const substantial = candidates.filter((value) => {
     const clean = value.replace(/\s+/g, " ").trim();
     return clean.length >= 60 && normalizeHeading(clean) !== normalizedTitle;
@@ -3039,4 +3308,20 @@ function cleanStoryDescription(value: string): string {
   if (sentenceEnd >= 100) return shortened.slice(0, sentenceEnd + 1);
   const lastWord = shortened.lastIndexOf(" ");
   return `${shortened.slice(0, lastWord > 0 ? lastWord : 240)}…`;
+}
+
+/**
+ * Search chunks intentionally retain structural labels for retrieval locality.
+ * They are not authored visitor copy, so strip their representation markers at
+ * the serialization boundary while leaving the indexed source untouched.
+ */
+function sanitizePresentationText(value: string): string {
+  return value
+    .replace(/\bcontent\s+(?:section|field|path)\s*:\s*/gi, "")
+    .replace(/\b[a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,2}\s+repeater\b\s*/gi, "")
+    .replace(/\b[a-z0-9]+(?:-[a-z0-9]+){2,}\b/gi, "")
+    .replace(/^\s*(?:talk|get)\s+(?:to|in)\s+(?:our\s+)?(?:experts?|touch)\.?\s*$/gim, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }

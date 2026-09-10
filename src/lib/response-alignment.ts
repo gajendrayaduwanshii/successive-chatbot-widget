@@ -1,5 +1,5 @@
-import { normalizeSearchText, normalizeServiceSchemaType, type SuccessiveSearchDocument } from "./search-index";
-import { isRequestedContentTypeCompatible, isShortSemanticSubject, type SearchMatch } from "./search-retriever";
+import { factualDocumentEvidence, normalizeSearchText, normalizeServiceSchemaType, type SuccessiveSearchDocument } from "./search-index";
+import { definitionEvidencePassages, isRequestedContentTypeCompatible, isShortSemanticSubject, type SearchMatch } from "./search-retriever";
 import type { QueryUnderstanding } from "./query-understanding";
 
 const GENERIC = new Set(["successive", "digital", "service", "services", "company", "solution", "solutions", "development", "technology", "technologies", "about", "provide", "me", "is", "are", "a", "an", "the", "all", "every", "show", "list", "latest", "newest", "recent", "current"]);
@@ -74,7 +74,8 @@ function exactIdentity(match: SearchMatch, understanding: QueryUnderstanding): b
   const shortDefinitionSubject = ["define", "explain"].includes(understanding.answerMode) &&
     identities.length === 1 && isShortSemanticSubject(identities[0] ?? "");
   const embeddedIdentity = match.matchedFields.includes("exact-embedded-entity") &&
-    (!shortDefinitionSubject || match.matchedFields.includes("embedded-direct-subject-authority"));
+    (match.matchedFields.includes("embedded-direct-subject-authority") ||
+      (!shortDefinitionSubject && Boolean(understanding.requestedContentType)));
   return identities.some((identity) => match.document.normalizedTitle === identity || slug === identity) ||
     embeddedIdentity ||
     match.matchedFields.some((field) => /exact-title|normalized-exact-title|exact-entity-authority|validated-role-relation/.test(field));
@@ -127,7 +128,13 @@ export function selectAlignedSecondaryMatches(input: {
       const dateDelta = Date.parse(b.document.modified ?? "") - Date.parse(a.document.modified ?? "");
       if (Number.isFinite(dateDelta) && dateDelta !== 0) return dateDelta;
     }
-    return Number(exactIdentity(b, understanding)) - Number(exactIdentity(a, understanding)) || b.score - a.score;
+    const explicitEditorial = ["blog", "resource", "whitepaper", "ebook", "case-study"].includes(understanding.requestedContentType ?? "");
+    const capabilityAuthority = (match: SearchMatch) => {
+      if (explicitEditorial) return 0;
+      return ["service", "sub-service", "expertise", "technology", "product", "kagen-product", "accelerator", "industry"].includes(documentContentType(match.document)) ? 1 : 0;
+    };
+    return Number(exactIdentity(b, understanding)) - Number(exactIdentity(a, understanding)) ||
+      capabilityAuthority(b) - capabilityAuthority(a) || b.score - a.score;
   });
   return { primary: accepted[0], related: accepted.slice(1, input.limit ?? 3), rejected };
 }
@@ -206,20 +213,257 @@ export function anchorExactSubjectMatches(
 }
 
 export function alignedCta(match: SearchMatch | undefined, understanding: QueryUnderstanding): string | undefined {
-  if (!match?.document.url) return undefined;
-  const type = documentContentType(match.document);
-  const labels: Record<string, string> = {
-    service: "Explore the service", "sub-service": "Explore the service", expertise: "Explore the capability",
-    blog: "Read the full article", "case-study": "Explore the full case study", whitepaper: "Read the whitepaper",
-    ebook: "Explore the ebook", webinar: "Learn more about the webinar", event: "Learn more about the event",
-    product: `Explore ${match.document.title}`, "kagen-product": `Explore ${match.document.title}`,
-    partner: "Explore the partnership", career: "View the opening", "press-release": "Read the announcement",
-    "media-coverage": "View media coverage", accelerator: "Explore the accelerator",
+  if (!match?.document.url || !hasNavigableDestination(match.document.url)) return undefined;
+  const category = ctaCategoryFor(match, understanding);
+  if (!category) return undefined;
+  const directDefinitionDestination = match.matchedFields.some((field) =>
+    ["exact-title-lock", "normalized-exact-title", "near-exact-title"].includes(field),
+  );
+  if (understanding.answerMode === "define" && !understanding.requestedContentType &&
+      !match.matchedFields.includes("embedded-structural-parent") && !directDefinitionDestination) return undefined;
+  const anchor = ctaAnchorTitle(match.document.title);
+  const labels: Partial<Record<CtaCategory, string>> = {
+    resource: "full resource", blog: "full article", "case-study": "full case study",
+    leadership: "leadership team", partner: "partnership", career: "opening", announcement: "announcement",
   };
-  const label = labels[type];
-  if (!label) return undefined;
-  if (understanding.answerMode === "define" && !understanding.requestedContentType) return undefined;
-  return `[${label}](${match.document.url})`;
+  const link = `[${labels[category] ?? anchor}](${match.document.url})`;
+  return selectCtaTemplate(category)(link);
+}
+
+/** A source host alone is not a contextual destination; root-only URLs have no page to navigate to. */
+function hasNavigableDestination(value: string): boolean {
+  try {
+    return Boolean(new URL(value).pathname.replace(/\/+$/, ""));
+  } catch {
+    return false;
+  }
+}
+
+type CtaCategory = "service" | "technology" | "ai-strategy" | "product" | "resource" | "blog" | "case-study" | "industry" | "leadership" | "partner" | "career" | "announcement" | "generic";
+type CtaTemplate = (link: string) => string;
+
+const CTA_TEMPLATES: Record<CtaCategory, CtaTemplate[]> = {
+  service: [
+    (link) => `Explore ${link} for a closer look at Successive's expertise and delivery approach.`,
+    (link) => `Explore ${link} for more details on the services, capabilities, and approach available from Successive.`,
+    (link) => `Explore ${link} to discover how Successive supports enterprise transformation in this area.`,
+  ],
+  technology: [
+    (link) => `Explore ${link} for more on Successive's engineering expertise and implementation approach.`,
+    (link) => `Explore ${link} to see how Successive helps enterprises build, modernize, and scale technology solutions.`,
+    (link) => `Explore ${link} for a closer look at Successive's technical capabilities and delivery expertise.`,
+  ],
+  "ai-strategy": [
+    (link) => `Explore ${link} for more on Successive's strategy, capabilities, and business-focused approach.`,
+    (link) => `Explore ${link} for a deeper look at the strategy and enterprise expertise Successive provides.`,
+    (link) => `Explore ${link} to see how Successive approaches AI strategy and enterprise transformation.`,
+  ],
+  product: [
+    (link) => `Explore ${link} to discover its capabilities and enterprise use cases.`,
+    (link) => `Explore ${link} for a closer look at its capabilities and applications.`,
+    (link) => `Explore ${link} for more details on its features, use cases, and enterprise applications.`,
+  ],
+  resource: [
+    (link) => `Explore the ${link} for deeper insights and practical guidance.`,
+    (link) => `Explore the ${link} for additional perspectives and actionable guidance.`,
+    (link) => `Dive into the ${link} for more detailed insights and practical takeaways.`,
+  ],
+  blog: [
+    (link) => `Read the ${link} for additional insights and practical guidance.`,
+    (link) => `Explore the ${link} for a deeper perspective on the topic.`,
+    (link) => `Read the ${link} for more insights and practical context.`,
+  ],
+  "case-study": [
+    (link) => `Explore the ${link} for more details on the solution and business impact.`,
+    (link) => `Read the ${link} to see the approach, implementation, and outcomes in context.`,
+    (link) => `Explore the ${link} for a closer look at the challenge, solution, and results.`,
+  ],
+  industry: [
+    (link) => `Explore ${link} to learn more about Successive's industry expertise and solutions.`,
+    (link) => `Explore ${link} for a closer look at Successive's capabilities in this industry.`,
+    (link) => `Explore ${link} to see how Successive addresses business and technology needs across this industry.`,
+  ],
+  leadership: [
+    (link) => `Explore the ${link} to learn more about Successive's leadership.`,
+    (link) => `Meet the ${link} for more on the people guiding Successive.`,
+  ],
+  partner: [(link) => `Explore the ${link} to learn more about the collaboration and related capabilities.`],
+  career: [(link) => `View the ${link} for role details and application information.`],
+  announcement: [(link) => `Read the ${link} for more details.`],
+  generic: [(link) => `Explore ${link} to learn more.`],
+};
+
+const lastCtaTemplate = new Map<CtaCategory, number>();
+
+function selectCtaTemplate(category: CtaCategory): CtaTemplate {
+  const templates = CTA_TEMPLATES[category];
+  const previous = lastCtaTemplate.get(category);
+  const eligible = templates.length > 1 && previous !== undefined
+    ? templates.map((_, index) => index).filter((index) => index !== previous)
+    : templates.map((_, index) => index);
+  const index = eligible[Math.floor(Math.random() * eligible.length)]!;
+  lastCtaTemplate.set(category, index);
+  return templates[index]!;
+}
+
+export function ctaTemplateCount(category: CtaCategory): number {
+  return CTA_TEMPLATES[category].length;
+}
+
+export function ctaCategoryFor(match: SearchMatch, understanding: QueryUnderstanding): CtaCategory | undefined {
+  const type = documentContentType(match.document);
+  const identity = normalizeSearchText(`${match.document.title} ${match.document.slug} ${understanding.topics.join(" ")}`);
+  if (["service", "sub-service", "expertise"].includes(type))
+    return /\b(?:ai|artificial intelligence)\b/.test(identity) && /\b(?:strategy|strategic|consulting|advisory)\b/.test(identity)
+      ? "ai-strategy" : "service";
+  if (type === "technology") return "technology";
+  if (["product", "kagen-product", "accelerator"].includes(type)) return "product";
+  if (["whitepaper", "ebook", "resource"].includes(type)) return "resource";
+  if (type === "blog") return "blog";
+  if (type === "case-study") return "case-study";
+  if (type === "industry") return "industry";
+  if (type === "partner") return "partner";
+  if (type === "career") return "career";
+  if (["press-release", "media-coverage"].includes(type)) return "announcement";
+  if (match.document.role === "leadership") return "leadership";
+  // A validated, grounded informational record can still provide useful
+  // navigation even when its source taxonomy has no specialized CTA wording.
+  return ["award", "certification", "recognition"].includes(type) && match.document.url
+    ? "generic" : undefined;
+}
+
+const CTA_ROLE_TERMS = /\b(?:services?|solutions?|consulting|advisory|capabilit(?:y|ies)|platform|product|accelerator|engineering|operations|strategy|technology|experience|commerce)\b/i;
+const CTA_ACTION_PREFIX = /^(?:transform|accelerate|enable|empower|drive|elevate|unlock|reimagine|modernize|scale|grow|improve|build)\b/i;
+
+/** Produces a concise, subject-bearing CTA anchor from a canonical page title. */
+export function ctaAnchorTitle(title: string): string {
+  const base = title.replace(/[\*_`]/g, "").replace(/:\s+.*$/, "").trim();
+  const segments = base.split(/\s+(?:with|through|using|via)\s+/i).map((value) => value.trim()).filter(Boolean);
+  if (segments.length === 2 && CTA_ACTION_PREFIX.test(segments[0]!) &&
+      !CTA_ROLE_TERMS.test(segments[0]!) && CTA_ROLE_TERMS.test(segments[1]!)) {
+    return segments[1]!;
+  }
+  return base
+    .replace(/\s+(?:for|to|driving|powering|transforming|accelerating|enabling|delivering)\b.*$/i, "")
+    .trim() || title;
+}
+
+/**
+ * Major capability records can use additional same-record evidence. Other
+ * categories deliberately retain their concise response shape.
+ */
+export function supportsEvidenceDrivenDepth(match: SearchMatch, understanding: QueryUnderstanding): boolean {
+  // A narrow named-subject use-case request may parse as a list, but it is not
+  // a broad collection and can safely use the subject's bounded evidence.
+  const isNarrowList = understanding.answerMode === "list" && !understanding.isBroadQuery;
+  if (!['define', 'explain', 'details', 'summarize'].includes(understanding.answerMode) && !isNarrowList) return false;
+  if (['blog', 'case-study', 'whitepaper', 'ebook', 'webinar', 'event', 'press-release', 'media-coverage', 'career', 'company', 'leadership'].includes(documentContentType(match.document))) return false;
+  const type = documentContentType(match.document);
+  if (['service', 'sub-service', 'expertise', 'technology', 'product', 'kagen-product', 'accelerator', 'industry'].includes(type) ||
+      match.document.role === 'global_capabilities' || match.matchedFields.includes('exact-structured-section')) return true;
+  // Some canonical solution and implementation pages are retained as generic
+  // pages by the source taxonomy. Their resolved title/role, not a topic list,
+  // establishes that they are substantial offerings.
+  return match.document.role === 'page' && /\b(?:solution|consulting|capabilit(?:y|ies)|implementation|integration|development|engineering|platform|accelerator|modernization|transformation)\b/i.test(match.document.title);
+}
+
+/** Adds a concise visitor-subject heading only for substantial, grounded topics. */
+export function ensureSubstantialTopicHeading(answer: string, match: SearchMatch | undefined, understanding: QueryUnderstanding): string {
+  if (!match || !supportsEvidenceDrivenDepth(match, understanding) || /^#{1,3}\s+/m.test(answer.trim())) return answer.trim();
+  const explicit = [...understanding.entities, ...understanding.topics]
+    .map((value) => value.trim()).find((value) => normalizeSearchText(value).split(" ").length >= 2);
+  const source = explicit ?? ctaAnchorTitle(match.document.title);
+  const heading = source.replace(/\s+/g, " ").trim();
+  if (!heading || heading.length > 90) return answer.trim();
+  return `## ${heading}\n\n${answer.trim()}`;
+}
+
+/** Selects unique, same-record evidence for composition without crossing result or section boundaries. */
+export function compositionEvidence(
+  match: Pick<SearchMatch, 'document' | 'selectedPassages' | 'matchedFields' | 'localEvidence'>,
+  limit = 6,
+  understanding?: QueryUnderstanding,
+): string[] {
+  const definitionSubject = understanding && ['define', 'explain'].includes(understanding.answerMode)
+    ? [...understanding.entities, ...understanding.topics].map(normalizeSearchText).find(Boolean)
+    : undefined;
+  if (definitionSubject) return definitionEvidencePassages(match.document, definitionSubject).slice(0, limit);
+  const sectionScoped = Boolean(match.localEvidence) ||
+    match.matchedFields.includes('exact-structured-section') ||
+    match.matchedFields.includes('exact-embedded-entity');
+  const legacyUnstructuredDocument = match.document.structuredFields.length === 0;
+  const candidates = sectionScoped
+    ? [...match.selectedPassages, ...(match.localEvidence?.passages ?? [])]
+    : legacyUnstructuredDocument
+      ? [...match.selectedPassages, ...match.document.descriptions, ...match.document.textSegments]
+      : factualDocumentEvidence(match.document);
+  const normalizedCandidates = candidates.map((value) => value.replace(/\s+/g, ' ').trim()).filter((value) => value.length >= 30);
+  const unique: string[] = [];
+  normalizedCandidates.forEach((candidate) => {
+    const normalized = normalizeSearchText(candidate);
+    if (!normalized || unique.some((existing) => {
+      const other = normalizeSearchText(existing);
+      return other.includes(normalized) || normalized.includes(other);
+    })) return;
+    unique.push(candidate);
+  });
+  return unique.slice(0, limit);
+}
+
+function firstPartySuccessiveUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      (url.hostname === "successive.tech" || url.hostname.endsWith(".successive.tech"));
+  } catch {
+    return false;
+  }
+}
+
+/** A root URL is contextual only when the resolved record itself identifies the homepage. */
+export function hasMeaningfulInlineDestination(document: Pick<SuccessiveSearchDocument, "url" | "slug" | "role">): boolean {
+  if (!firstPartySuccessiveUrl(document.url)) return false;
+  try {
+    if (new URL(document.url).pathname.replace(/\/+$/, "")) return true;
+    return document.slug === "home" || document.role === "company" && document.slug === "";
+  } catch {
+    return false;
+  }
+}
+
+function linkableTitlePhrases(title: string): string[] {
+  const phrases = [title.trim()];
+  const shortened = title
+    .replace(/\s+(?:services?|solutions?|company|platform|guide|consulting|development)$/i, "")
+    .trim();
+  if (shortened.split(/\s+/).length >= 2) phrases.push(shortened);
+  return [...new Set(phrases.filter(Boolean))].sort((left, right) => right.length - left.length);
+}
+
+/** Adds links only where an already-visible canonical phrase has an aligned first-party destination. */
+export function enrichAnswerWithValidatedInlineLinks(answer: string, matches: SearchMatch[]): string {
+  let enriched = answer;
+  matches.slice(0, 3).forEach((match) => {
+    const { document } = match;
+    if (!hasMeaningfulInlineDestination(document) || enriched.includes(`](${document.url})`)) return;
+    const phrase = linkableTitlePhrases(document.title).find((candidate) =>
+      new RegExp(candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(enriched));
+    if (!phrase) return;
+    const expression = new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    enriched = enriched.replace(expression, `[${phrase}](${document.url})`);
+  });
+  return enriched;
+}
+
+/** A heading destination labels the topic; a body link is a substantive navigation choice. */
+export function hasCanonicalBodyLink(answer: string, canonicalUrl: string): boolean {
+  const withoutLeadingHeading = answer.trim().replace(/^#{1,3}\s+[^\n]*(?:\n|$)/, "").trim();
+  return withoutLeadingHeading.includes(`](${canonicalUrl})`);
+}
+
+/** Eligible substantial composition owns a final CTA even when navigation is already linked in prose. */
+export function shouldAppendFinalCta(composerEligible: boolean, hasBodyCanonicalLink: boolean): boolean {
+  return composerEligible || !hasBodyCanonicalLink;
 }
 
 /** Keeps an explicitly requested, validated content role visible in prose. */
@@ -239,7 +483,9 @@ export function ensureRequestedRoleFraming(
   };
   const label = labels[requested];
   if (!label || new RegExp(`\\b${label.replace(" ", "\\s+")}\\b`, "i").test(answer)) return answer;
-  return `Related ${label}: **${match.document.title}**.\n\n${answer}`;
+  // The selected role remains available in cards/sources and the contextual
+  // link. Avoid prepending a result-style label that merely repeats it.
+  return answer;
 }
 
 const ANSWER_ALIGNMENT_NOISE = new Set([

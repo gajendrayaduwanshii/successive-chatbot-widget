@@ -5,7 +5,7 @@ export interface ExtractedAcfContent {
   headings: string[];
   descriptions: string[];
   faqItems: Array<{ question: string; answer: string }>;
-  links: Array<{ title?: string; url: string }>;
+  links: Array<{ title?: string; url: string; path: string }>;
   images: Array<{ url: string; alt?: string; title?: string }>;
   structuredFields: StructuredAcfField[];
 }
@@ -132,7 +132,7 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
           /\.(png|jpe?g|webp|gif|svg|avif)(\?|$)/i.test(url)
         )
           images.push({ url });
-        else links.push({ url });
+        else links.push({ url, path });
         return;
       }
       const text = cleanText(node);
@@ -153,7 +153,7 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
     const imageUrl = safeHttpUrl(record.url);
     if (
       imageUrl &&
-      (mediaKey.test(key) || "alt" in record || "caption" in record)
+      (/(?:image|logo|icon|video)/i.test(key) || "alt" in record || "caption" in record)
     ) {
       images.push({
         url: imageUrl,
@@ -179,6 +179,7 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
     if (linkUrl && ("title" in record || /link|button/i.test(key))) {
       links.push({
         url: linkUrl,
+        path,
         title:
           typeof record.title === "string"
             ? cleanText(record.title)
@@ -237,7 +238,7 @@ export function extractAcfContent(value: unknown): ExtractedAcfContent {
         ) === index,
     ),
     links: links.filter(
-      (link, index, all) => all.findIndex((x) => x.url === link.url) === index,
+      (link, index, all) => all.findIndex((x) => x.url === link.url && x.path === link.path) === index,
     ),
     images: images.filter(
       (image, index, all) =>

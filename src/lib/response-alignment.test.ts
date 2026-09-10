@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildSearchDocument } from "./search-index";
 import { buildDeterministicUnderstanding } from "./query-understanding";
-import { alignedCta, anchorExactSubjectMatches, documentContentType, ensureRequestedRoleFraming, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches } from "./response-alignment";
+import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, ctaCategoryFor, ctaTemplateCount, documentContentType, enrichAnswerWithValidatedInlineLinks, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "./response-alignment";
 import type { SearchMatch } from "./search-retriever";
 
 function match(title: string, slug: string, body: string, type = "page", score = 120, modified = "2026-01-01"): SearchMatch {
@@ -14,6 +14,15 @@ function match(title: string, slug: string, body: string, type = "page", score =
 }
 
 describe("user-visible response alignment", () => {
+  it("distinguishes a canonical heading link from a body-prose link for CTA presentation", () => {
+    const url = "https://successive.tech/delivery-engineering/";
+    expect(hasCanonicalBodyLink(`## [Delivery Engineering](${url})\n\nGrounded delivery overview.`, url)).toBe(false);
+    expect(hasCanonicalBodyLink(`## Delivery Engineering\n\nLearn through [Delivery Engineering](${url}).`, url)).toBe(true);
+    expect(shouldAppendFinalCta(true, true)).toBe(true);
+    expect(shouldAppendFinalCta(true, false)).toBe(true);
+    expect(shouldAppendFinalCta(false, true)).toBe(false);
+  });
+
   it("keeps API educational secondary content and rejects neighboring Node.js content", () => {
     const understanding = buildDeterministicUnderstanding("What is an API?");
     const api = match("API Development Services", "api-development-services", "API development, integration, and management.");
@@ -25,6 +34,19 @@ describe("user-visible response alignment", () => {
     expect(alignedCta(result.primary, understanding)).toBeUndefined();
   });
 
+  it("permits a definition CTA only for an already direct-identity validated destination", () => {
+    const understanding = buildDeterministicUnderstanding("What is an API?");
+    const api = match("API Development Company", "api-development", "An API is an application programming interface.");
+    api.document.role = "service";
+    api.matchedFields = ["near-exact-title"];
+    expect(alignedCta(api, understanding)).toContain("[API Development Company]");
+
+    const specialized = match("BigCommerce API Integration", "bigcommerce-api", "An API is an application programming interface.");
+    specialized.document.role = "service";
+    specialized.matchedFields = ["embedded-direct-subject-authority"];
+    expect(alignedCta(specialized, understanding)).toBeUndefined();
+  });
+
   it("enforces explicit content types and derives a CTA from the selected record", () => {
     const understanding = buildDeterministicUnderstanding("Show me AI blogs");
     const blog = match("Practical AI Adoption", "practical-ai-adoption", "AI adoption guidance.", "post");
@@ -32,16 +54,18 @@ describe("user-visible response alignment", () => {
     const result = selectAlignedSecondaryMatches({ matches: [service, blog], understanding });
     expect(result.primary?.document.title).toBe("Practical AI Adoption");
     expect(documentContentType(result.primary!.document)).toBe("blog");
-    expect(alignedCta(result.primary, understanding)).toContain("Read the full article");
+    expect(alignedCta(result.primary, understanding)).toContain("[full article]");
   });
 
-  it("states an explicit validated role when descriptive prose omits its label", () => {
+  it("keeps explicit role framing conversational when descriptive prose omits its label", () => {
     const service = match("Cloud Operations", "cloud-operations", "Improve governed delivery.");
     service.document.role = "service";
     expect(ensureRequestedRoleFraming("Improve governed delivery.", service, "service"))
-      .toContain("Related service: **Cloud Operations**");
+      .toBe("Improve governed delivery.");
     expect(ensureRequestedRoleFraming("Improve governed delivery.", service, "industry"))
       .toBe("Improve governed delivery.");
+    expect(alignedCta(service, buildDeterministicUnderstanding("What cloud services do you offer?")))
+      .toContain("Explore [Cloud Operations]");
   });
 
   it("distinguishes webinars from events and sorts latest records by date", () => {
@@ -100,6 +124,171 @@ describe("user-visible response alignment", () => {
     expect(result.rejected).toContainEqual({
       title: "Student Experience Modernization", reason: "not independently same-topic",
     });
+  });
+
+  it("anchors a focused subject to direct document authority over embedded body overlap", () => {
+    const understanding = buildDeterministicUnderstanding("Legacy modernization");
+    const direct = match(
+      "Application Modernization Services for Legacy Systems", "application-modernization-services",
+      "Modernize legacy systems through staged application modernization.", "page", 200,
+    );
+    direct.matchedFields = ["exact-embedded-entity", "embedded-direct-subject-authority"];
+    const incidental = match(
+      "Enterprise Spatial Intelligence", "enterprise-spatial-intelligence",
+      "Legacy modernization can support a spatial operating model.", "page", 300,
+    );
+    incidental.matchedFields = ["exact-embedded-entity"];
+    const result = selectAlignedSecondaryMatches({ matches: [incidental, direct], understanding });
+    expect(result.primary?.document.title).toBe("Application Modernization Services for Legacy Systems");
+    expect(result.rejected).toContainEqual({
+      title: "Enterprise Spatial Intelligence", reason: "not independently same-topic",
+    });
+  });
+
+  it.each([
+    ["Kubernetes Consulting Services", "service"],
+    ["Workflow Automation Accelerator", "accelerator"],
+    ["Retail Commerce Transformation", "case_study"],
+    ["Modernization Delivery Guide", "post"],
+    ["Healthcare Solutions", "industry"],
+    ["Cloud Alliance", "partners"],
+  ])("links an already-visible validated %s title inline", (title, type) => {
+    const current = match(title, title.toLowerCase().replace(/\W+/g, "-"), `${title} supports published delivery.`, type);
+    const answer = `Successive provides ${title} for enterprise teams.`;
+    expect(enrichAnswerWithValidatedInlineLinks(answer, [current]))
+      .toContain(`[${title}](${current.document.url})`);
+  });
+
+  it("does not invent an inline link when the title is absent or external", () => {
+    const current = match("Cloud Operations", "cloud-operations", "Cloud operations.");
+    expect(enrichAnswerWithValidatedInlineLinks("Improve governed delivery.", [current]))
+      .toBe("Improve governed delivery.");
+    current.document.url = "https://example.test/cloud-operations/";
+    expect(enrichAnswerWithValidatedInlineLinks("Cloud Operations improves delivery.", [current]))
+      .toBe("Cloud Operations improves delivery.");
+  });
+
+  it("rejects a root-collapsed contextual destination unless the record is the intentional homepage", () => {
+    const current = match("Sample Data Service", "sample-data-service", "Published process evidence.");
+    current.document.url = "https://successive.tech//";
+    expect(hasMeaningfulInlineDestination(current.document)).toBe(false);
+    expect(enrichAnswerWithValidatedInlineLinks("Sample Data Service supports governed delivery.", [current]))
+      .not.toContain("successive.tech//");
+    current.document.slug = "home";
+    expect(hasMeaningfulInlineDestination(current.document)).toBe(true);
+  });
+
+  it("uses a meaningful canonical service phrase for a CTA instead of a marketing lead-in", () => {
+    expect(ctaAnchorTitle("Transform Business with AI Strategy Consulting"))
+      .toBe("AI Strategy Consulting");
+    expect(ctaAnchorTitle("Cloud Consulting Services Driving Business Transformation"))
+      .toBe("Cloud Consulting Services");
+    expect(ctaAnchorTitle("Commerce Platform"))
+      .toBe("Commerce Platform");
+    expect(ctaAnchorTitle("**React Engineering**"))
+      .toBe("React Engineering");
+  });
+
+  it.each([
+    ["Service Consulting", "page", "service", "service"],
+    ["Kubernetes Engineering", "page", "technology", "technology"],
+    ["AI Strategy Consulting", "page", "service", "ai-strategy"],
+    ["Delivery Accelerator", "accelerators", "accelerator", "product"],
+    ["Cloud Cost Optimization eBook", "page", "resource", "resource"],
+    ["Cloud Computing Guide", "post", "blog", "blog"],
+    ["Retail Transformation", "case_study", "case_study", "case-study"],
+    ["Retail Solutions", "industries", "industry", "industry"],
+  ] as const)("keeps CTA variation inside the %s category", (title, type, role, category) => {
+    const current = match(title, title.toLowerCase().replace(/\W+/g, "-"), "Published supporting content.", type);
+    current.document.role = role;
+    const understanding = buildDeterministicUnderstanding(`Tell me about ${title}`);
+    expect(ctaCategoryFor(current, understanding)).toBe(category);
+    expect(ctaTemplateCount(category)).toBeGreaterThan(1);
+    const cta = alignedCta(current, understanding)!;
+    const expectedAnchor = category === "resource" ? "full resource" : category === "blog" ? "full article" :
+      category === "case-study" ? "full case study" : ctaAnchorTitle(title);
+    expect(cta).toContain(`[${expectedAnchor}](${current.document.url})`);
+  });
+
+  it("varies a service CTA sentence while preserving its anchor and URL", () => {
+    const current = match("Platform Consulting", "platform-consulting", "Published supporting content.");
+    current.document.role = "service";
+    const understanding = buildDeterministicUnderstanding("Tell me about Platform Consulting");
+    const first = alignedCta(current, understanding)!;
+    const second = alignedCta(current, understanding)!;
+    expect(first).not.toBe(second);
+    [first, second].forEach((cta) => expect(cta).toContain(`[Platform Consulting](${current.document.url})`));
+  });
+
+  it.each([
+    ["Service Delivery", "page", "service"],
+    ["Technology Delivery", "page", "technology"],
+    ["Product Delivery", "page", "product"],
+    ["Workflow Accelerator", "accelerators", "accelerator"],
+    ["Retail Solutions", "industries", "industry"],
+  ] as const)("selects unique same-subject composition evidence for a substantial %s", (title, type, role) => {
+    const current = match(title, title.toLowerCase().replace(/\W+/g, "-"),
+      "First supported detail delivers governed implementation.", type);
+    current.document.role = role;
+    if (role === "product") current.document.productLike = true;
+    current.document.descriptions = [
+      "First supported detail delivers governed implementation.",
+      "A distinct supported capability improves operational visibility and delivery confidence.",
+    ];
+    current.document.textSegments = [
+      ...current.document.descriptions,
+      "A second distinct supported detail helps teams apply the capability in enterprise workflows.",
+    ];
+    const understanding = buildDeterministicUnderstanding(`Tell me about ${title}`);
+    expect(supportsEvidenceDrivenDepth(current, understanding)).toBe(true);
+    expect(compositionEvidence(current)).toEqual([
+      "First supported detail delivers governed implementation.",
+      "A distinct supported capability improves operational visibility and delivery confidence.",
+      "A second distinct supported detail helps teams apply the capability in enterprise workflows.",
+    ]);
+  });
+
+  it("keeps person and narrow factual categories out of evidence-driven expansion", () => {
+    const person = match("Leadership", "leadership", "A concise leadership fact.");
+    person.document.role = "company";
+    const fact = match("Office Locations", "office-locations", "A concise location fact.");
+    expect(supportsEvidenceDrivenDepth(person, buildDeterministicUnderstanding("Who is the CEO?"))).toBe(false);
+    expect(supportsEvidenceDrivenDepth(fact, buildDeterministicUnderstanding("Office locations"))).toBe(false);
+  });
+
+  it("adds a concise heading for a substantial subject but not a narrow fact", () => {
+    const service = match("Cloud Delivery Services", "cloud-delivery", "Grounded service detail.");
+    service.document.role = "service";
+    const substantial = buildDeterministicUnderstanding("Tell me about cloud delivery");
+    expect(ensureSubstantialTopicHeading("Grounded service detail.", service, substantial))
+      .toBe("## Cloud Delivery Services\n\nGrounded service detail.");
+    const fact = match("Office Locations", "office-locations", "A concise location fact.");
+    expect(ensureSubstantialTopicHeading("A concise location fact.", fact, buildDeterministicUnderstanding("Office locations")))
+      .toBe("A concise location fact.");
+  });
+
+  it("keeps structured-card composition inside the selected section boundary", () => {
+    const section = match("Bounded Capability", "home", "The card's directly associated description supports the capability.");
+    section.matchedFields = ["exact-structured-section"];
+    section.document.descriptions = ["Unrelated text from another Home-page card must not be used."];
+    section.document.textSegments = [...section.document.descriptions];
+    expect(compositionEvidence(section)).toEqual([
+      "The card's directly associated description supports the capability.",
+    ]);
+  });
+
+  it("uses a carried local unit for embedded cards even without the legacy marker", () => {
+    const section = match("Capability Alpha", "home", "Alpha provides governed delivery workflows.");
+    section.document.descriptions = ["Unrelated cloud cost content must not be used."];
+    section.document.textSegments = [...section.document.descriptions];
+    section.matchedFields = ["exact-embedded-entity"];
+    section.localEvidence = {
+      groupPath: "capabilities[0]",
+      heading: "Capability Alpha",
+      passages: ["Capability Alpha", "Alpha provides governed delivery workflows."],
+    };
+    expect(compositionEvidence(section).join(" ")).toContain("governed delivery");
+    expect(compositionEvidence(section).join(" ")).not.toContain("cloud cost");
   });
 
   it("keeps prose aligned with the same identity used by its card and source", () => {

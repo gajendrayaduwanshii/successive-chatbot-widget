@@ -152,6 +152,20 @@ describe("generic evidence validation", () => {
     expect(validate("Do you provide dedicated developers for long-term projects?", [service]).status).toBe("INSUFFICIENT_EVIDENCE");
   });
 
+  it("validates commercial and factual qualifiers only against the resolved subject's evidence", () => {
+    const supported = match("Sample Service", "Sample Service is available at no cost.", "service");
+    const unsupported = match("Sample Cloud Consulting Services", "Cloud consulting supports architecture and migration planning.", "service");
+    const paid = match("Sample Product", "Access requires a paid subscription.", "product");
+    const certified = match("Sample Platform", "Sample Platform is certified for the published standard.", "product");
+    const otherService = match("Other Service", "Other Service includes a free assessment.", "service");
+
+    expect(validate("Is Sample Service free?", [supported]).status).toBe("SUPPORTED");
+    expect(validate("Is Sample Cloud Consulting Services free?", [unsupported]).status).toBe("INSUFFICIENT_EVIDENCE");
+    expect(validate("Is Sample Product free?", [paid]).status).toBe("SUPPORTED");
+    expect(validate("Is Sample Platform certified?", [certified]).status).toBe("SUPPORTED");
+    expect(validate("Is Sample Cloud Consulting Services free?", [unsupported, otherService]).status).toBe("INSUFFICIENT_EVIDENCE");
+  });
+
   it("accepts exact published compatibility evidence", () => {
     const service = match("Content Platform Development", "The platform integrates with ERP systems through published APIs.", "service");
     expect(validate("Can your content platform integrate with our ERP?", [service]).status).toBe("SUPPORTED");
@@ -200,6 +214,7 @@ describe("generic evidence validation", () => {
 
   it.each([
     "Show me your published case studies.",
+    "Show articles related to Payment Gateway Integration: Roadmap, Costs, Skills.",
     "Any retail case studies?",
     "Show me publicly announced customer work.",
     "What security services do you offer?",

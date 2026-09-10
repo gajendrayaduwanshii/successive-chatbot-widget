@@ -229,6 +229,18 @@
 .successive-chat-widget-wrap .sources a {
   color: var(--kc-primary);
 }
+.successive-chat-widget-wrap .bubble .contextual-cta {
+  margin: 12px 0 0;
+}
+.successive-chat-widget-wrap .bubble .contextual-link {
+  color: var(--kc-primary);
+  font-weight: 600;
+  text-decoration: none;
+}
+.successive-chat-widget-wrap .contextual-link:hover {
+  text-decoration: underline;
+}
+
 .successive-chat-widget-wrap .retry {
   display: block;
   margin-top: 10px;
@@ -487,6 +499,34 @@
     transform: scale(1);
   }
 }
+  .ai-prompt-chips {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 10px;
+      width: min(100%, 650px);
+      margin: 16px auto 0;
+    }
+
+    .ai-prompt-chips .ai-prompt-chip {
+      padding: 10px 16px;
+      border: 1px solid #d4d4d8;
+      border-radius: 999px;
+      background: #fff;
+      color: #27272a;
+      font: inherit;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      transition: border-color 160ms ease, background 160ms ease;
+    }
+
+    .ai-prompt-chips .ai-prompt-chip:hover,
+    .ai-prompt-chips .ai-prompt-chip:focus-visible {
+      border-color: #0063ce;
+      background: #f0f7ff;
+      outline: none;
+    }
 @media (max-width: 640px) {
   .successive-chat-widget-wrap .successive-chat-label,
   .successive-chat-widget-wrap .chat-actions button span {
@@ -542,3 +582,5 @@
 .successive-chat-widget-wrap .conversation .bubble > ul:first-child {
   margin-top: 0;
 }
+
+

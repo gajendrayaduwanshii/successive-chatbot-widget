@@ -26,6 +26,9 @@ export interface SuccessiveSearchDocument {
   descriptions: string[];
   faqItems: Array<{ question: string; answer: string }>;
   structuredFields: import("./acf-extractor").StructuredAcfField[];
+  structuredLinks: Array<{ title?: string; url: string; path: string }>;
+  /** Authored page/post body, separate from recursively flattened ACF fields. */
+  editorTextSegments?: string[];
   textSegments: string[];
   chunks: SuccessiveSearchChunk[];
   combinedText: string;
@@ -158,6 +161,27 @@ export function normalizeSearchText(value: string): string {
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Presentation blocks remain available for links and CTAs, but are not factual answer evidence. */
+export function isPresentationStructuredPath(path: string): boolean {
+  const segments = path.toLowerCase().replace(/\[\d+\]/g, "").split(/[._-]+/).filter(Boolean);
+  return segments.some((segment) => [
+    "cta", "button", "banner", "footer", "navigation", "nav", "contact", "form", "leadmagnet",
+  ].includes(segment));
+}
+
+/** Authored body plus non-presentation structured fields for factual composition. */
+export function factualDocumentEvidence(document: Pick<SuccessiveSearchDocument, "editorTextSegments" | "structuredFields" | "textSegments">): string[] {
+  const factual = deduplicateSegments([
+    ...(document.editorTextSegments ?? []),
+    ...document.structuredFields
+      .filter((field) => field.kind === "text" && !isPresentationStructuredPath(field.path))
+      .map((field) => field.value),
+  ]);
+  // Legacy/test documents without source-path provenance retain their existing
+  // content; production documents have authored/structured provenance.
+  return factual.length ? factual : document.textSegments;
 }
 
 export type ServiceSchemaType = "service" | "sub-service" | "expertise" | "pillar";
@@ -566,6 +590,8 @@ export function buildSearchDocument(
     descriptions,
     faqItems: extracted.faqItems,
     structuredFields: extracted.structuredFields,
+    structuredLinks: extracted.links,
+    editorTextSegments: editor,
     textSegments,
     chunks,
     combinedText,
