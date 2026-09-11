@@ -13,6 +13,7 @@ import { getContentLoadDiagnostics } from "@/lib/successive-api";
 import { getLLMProvider } from "@/lib/llm";
 import { assistantResponseSchema } from "@/lib/llm/schemas";
 import { rateLimit } from "@/lib/rate-limit";
+import { resolveCollectionResponse } from "@/lib/collection-response";
 import {
   canUseEnglishQueryDirectly,
   prepareEnglishQuery,
@@ -101,7 +102,7 @@ import {
   type StructuredRequest,
 } from "@/lib/structured-knowledge";
 import { answerAddressesRequestedAttribute, recoverAuthoritativeEvidence, requestedAttribute, safeEvidenceResponse, safeUnsupportedQueryResponse, validateEvidence } from "@/lib/evidence-validation";
-import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, documentContentType, enrichAnswerWithValidatedInlineLinks, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "@/lib/response-alignment";
+import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, documentContentType, enrichAnswerWithValidatedInlineLinks, inlineLinkMatches, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "@/lib/response-alignment";
 import { buildCategoryNavigationActions, buildGlobalRelatedContentActions, buildIndividualPageNavigationActions, buildFollowUpQueryActions, classifySuggestionContext, documentActionKey, noRelatedContentMessage, parseRelatedContentRequest, resolveEligibleActionDocuments, resolveSuggestionAction, type LeadershipSuggestionContext, type SuggestionContextType } from "@/lib/suggestion-actions";
 import { commercialAnswer, commercialSubject, commercialSubjectFromAnswer, contactUsCta, detectCommercialIntent, detectCommercialIntents, hasExplicitGenericProjectSubject, isCommerciallyPriceableContext, isDependentCommercialSubjectQuery } from "@/lib/commercial-intent";
 import { buildContactableFallbackAnswer, selectContactableFallback, type ContactableFallback } from "@/lib/contactable-fallback";
@@ -363,6 +364,23 @@ export async function POST(request: NextRequest) {
       { success: true, data: greetingResponse() },
       { headers: { ...cors.headers, "Cache-Control": "no-store" } },
     );
+  }
+  // Resolve strong indexed collections before query preparation or provider
+  // initialization. Named topics and uncertain collection requests continue
+  // through the existing evidence/LLM flow unchanged.
+  if (!parsed.data.suggestionAction && canUseEnglishQueryDirectly(parsed.data.message)) {
+    try {
+      const collection = resolveCollectionResponse(parsed.data.message,
+        await getSuggestionCorpus(), getEnv().SUCCESSIVE_PUBLIC_SITE_URL);
+      if (collection) return NextResponse.json({ success: true, data: {
+        answer: collection.answer,
+        cards: [], sources: [], suggestions: [], suggestionActions: [],
+        confidence: "high", insufficientContext: false,
+      } }, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
+    } catch {
+      // An unavailable corpus is not evidence for a collection. Preserve the
+      // established fallback path rather than inventing a root or members.
+    }
   }
   let preparedQuery;
   if (canUseEnglishQueryDirectly(parsed.data.message)) {
@@ -2676,10 +2694,11 @@ export async function POST(request: NextRequest) {
     const alignedMatches = [alignment.primary, ...alignment.related].filter(
       (match): match is SearchMatch => Boolean(match),
     );
-    const validatedBodyUrls = alignedMatches.map(({ document }) => document.url);
+    const bodyLinkMatches = inlineLinkMatches(selectedMatches, await getSuggestionCorpus(), categoryAnswer);
+    const validatedBodyUrls = bodyLinkMatches.map(({ document }) => document.url);
     const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
       retainValidatedInlineLinks(categoryAnswer, validatedBodyUrls),
-      alignedMatches,
+      bodyLinkMatches,
     );
     const hasBodyLink = Boolean(alignment.primary?.document.url && hasCanonicalBodyLink(inlineLinkedAnswer, alignment.primary.document.url));
     const cta = shouldAppendFinalCta(Boolean(evidencePackage), hasBodyLink)
