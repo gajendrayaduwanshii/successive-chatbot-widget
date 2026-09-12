@@ -124,6 +124,16 @@ async function persistIndex(documents: SuccessiveSearchDocument[]): Promise<void
   }
 }
 
+/** Updates the active and persisted index after a successful corpus warmup. */
+export async function storeRefreshedSearchIndex(
+  documents: SuccessiveSearchDocument[],
+): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
+  lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: documents.length };
+  await persistIndex(documents);
+}
+
 export function getIndexDiagnostics() {
   return { ...lastIndexDiagnostics };
 }
