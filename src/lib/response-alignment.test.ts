@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildSearchDocument } from "./search-index";
 import { buildDeterministicUnderstanding } from "./query-understanding";
-import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, ctaCategoryFor, ctaTemplateCount, documentContentType, enrichAnswerWithValidatedInlineLinks, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "./response-alignment";
+import { alignedCta, anchorExactSubjectMatches, compositionEvidence, ctaAnchorTitle, ctaCategoryFor, ctaTemplateCount, documentContentType, enrichAnswerWithValidatedInlineLinks, inlineLinkMatches, ensureRequestedRoleFraming, ensureSubstantialTopicHeading, hasCanonicalBodyLink, hasMeaningfulInlineDestination, isAnswerAlignedWithMatch, selectAlignedSecondaryMatches, selectFacetAlignedMatches, shouldAppendFinalCta, supportsEvidenceDrivenDepth } from "./response-alignment";
 import type { SearchMatch } from "./search-retriever";
 
 function match(title: string, slug: string, body: string, type = "page", score = 120, modified = "2026-01-01"): SearchMatch {
@@ -429,4 +429,81 @@ describe("user-visible response alignment", () => {
         .toEqual([first, second]);
     });
   });
+});
+
+
+describe("contextual page-name navigation", () => {
+  it("links all verified practices in an overview, leaving ambiguous Adobe plain", () => {
+    const answer = "Explore Product Engineering, CMS, GIS, Commerce, Cloud, and Adobe.";
+    const overview = match("Accelerators", "accelerators", answer);
+    const pages = [
+      ["Engineering", "product-engineering-services-solutions"],
+      ["Enterprise CMS", "content-management-system"], ["GIS Consulting", "gis"],
+      ["Digital Commerce", "commerce"], ["Cloud Transformation", "cloud-transformation-services"],
+    ].map(([title, slug]) => match(title!, slug!, "Published capability.").document);
+    const result = enrichAnswerWithValidatedInlineLinks(answer, inlineLinkMatches([overview], pages, answer));
+    expect(result.match(/\]\(https:/g)).toHaveLength(5);
+    expect(result).toContain("[CMS](https://successive.tech/content-management-system/)");
+    expect(result).toContain("and Adobe.");
+    expect(inlineLinkMatches([overview], [], answer)).toHaveLength(1);
+  });
+
+  it("does not link incidental practice keywords", () => {
+    const current = match("Operations", "operations", "A cloud platform supports commerce.");
+    const page = match("Cloud Transformation", "cloud-transformation-services", "Cloud services.");
+    expect(inlineLinkMatches([current], [page.document], "A cloud platform supports commerce.")).toHaveLength(1);
+  });
+
+  it("preserves links and code, matches whole names, and links only the first occurrence", () => {
+    const current = match("GIS", "gis", "GIS services.");
+    const answer = "ArcGIS `GIS` [GIS docs](https://example.test/GIS) **GIS** and GIS.";
+    expect(enrichAnswerWithValidatedInlineLinks(answer, [current])).toBe(
+      "ArcGIS `GIS` [GIS docs](https://example.test/GIS) **[GIS](https://successive.tech/gis/)** and GIS.");
+  });
+
+  it("leaves ambiguous names unlinked", () => {
+    const first = match("Cloud Operations", "cloud-operations", "Operations.");
+    const second = match("Cloud Operations", "other-operations", "Operations.");
+    expect(enrichAnswerWithValidatedInlineLinks("Cloud Operations", [first, second])).toBe("Cloud Operations");
+  });
+});
+
+
+it("links named related pages and authored labels outside the accelerator scenario", () => {
+  const overview = match("Offerings", "offerings", "Our Workflow Automation Platform supports delivery.");
+  const product = match("Workflow Automation Platform", "workflow-platform", "Workflow delivery.");
+  const service = match("Enterprise Content Services", "enterprise-content", "Content delivery.");
+  overview.document.structuredLinks = [{ title: "Content Hub", url: service.document.url, path: "services[0].link" }];
+  const answer = "Use Workflow Automation Platform or Content Hub.";
+  const result = enrichAnswerWithValidatedInlineLinks(answer,
+    inlineLinkMatches([overview], [product.document, service.document], answer));
+  expect(result).toContain("[Workflow Automation Platform](https://successive.tech/workflow-platform/)");
+  expect(result).toContain("[Content Hub](https://successive.tech/enterprise-content/)");
+});
+
+it("derives unfamiliar category identities from published pages without a named mapping", () => {
+  const answer = "Explore Observability, Robotics, and Fleet Management.";
+  const overview = match("Solutions", "solutions", answer);
+  const pages = [
+    match("Observability Consulting", "observability", "Monitoring capability."),
+    match("Robotics Development Services", "robotics-development-services", "Automation capability."),
+    match("Fleet Management Solutions", "fleet-management-solutions", "Fleet capability."),
+  ];
+  const result = enrichAnswerWithValidatedInlineLinks(answer,
+    inlineLinkMatches([overview], pages.map(({ document }) => document), answer));
+  expect(result).toContain("[Observability](https://successive.tech/observability/)");
+  expect(result).toContain("[Robotics](https://successive.tech/robotics-development-services/)");
+  expect(result).toContain("[Fleet Management](https://successive.tech/fleet-management-solutions/)");
+});
+
+it("keeps ambiguous category labels plain and never borrows a sibling entity's evidence", () => {
+  const answer = "Explore Robotics, and Observability.";
+  const overview = match("Solutions", "solutions", answer);
+  const pages = [match("Robotics Consulting", "robotics-consulting", "Robot consulting."),
+    match("Robotics Development", "robotics-development", "Robot development.")];
+  expect(enrichAnswerWithValidatedInlineLinks(answer,
+    inlineLinkMatches([overview], pages.map(({ document }) => document), answer))).toBe(answer);
+  overview.matchedFields = ["exact-embedded-entity"];
+  overview.selectedPassages = ["Unrelated local capability supports teams."];
+  expect(inlineLinkMatches([overview], [match("Robotics", "robotics", "Robots.").document], answer)).toHaveLength(1);
 });

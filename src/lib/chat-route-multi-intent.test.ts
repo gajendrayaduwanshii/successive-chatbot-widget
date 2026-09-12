@@ -769,3 +769,24 @@ describe("actual chat route multi-intent composition", () => {
       !/customer experience|cloud migration/i.test(`${subject ?? ""} ${topic ?? ""}`))).toBe(true);
   });
 });
+
+
+describe("broad service navigation", () => {
+  it.each(["services", "all services", "all setvices", "show me your services", "what services do you offer"])("returns an overview and multiple linked services for %s", async (query) => {
+    const result = await send(query, `service-overview-${query}`);
+    expect(result.data.insufficientContext).toBe(false);
+    expect(result.data.answer).not.toMatch(/^#{1,3} /);
+    expect(result.data.cards).toEqual([]);
+    expect(result.data.answer.match(/\]\(https:/g)!.length).toBeGreaterThanOrEqual(2);
+    expect(result.data.answer).not.toMatch(/couldn.t find|Explore \[Customer Experience/i);
+  });
+
+  it("resets a prior service topic when requesting the service portfolio", async () => {
+    const result = await send("services", "service-reset-history", [
+      { role: "user", content: "Tell me about customer experience" },
+      { role: "assistant", content: "Customer Experience helps teams improve customer journeys." },
+    ]);
+    expect(result.data.answer).not.toMatch(/^#{1,3} /);
+    expect(result.data.answer.match(/\]\(https:/g)!.length).toBeGreaterThanOrEqual(2);
+  });
+});

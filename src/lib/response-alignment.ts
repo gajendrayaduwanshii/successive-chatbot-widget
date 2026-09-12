@@ -441,19 +441,88 @@ function linkableTitlePhrases(title: string): string[] {
   return [...new Set(phrases.filter(Boolean))].sort((left, right) => right.length - left.length);
 }
 
-/** Adds links only where an already-visible canonical phrase has an aligned first-party destination. */
-export function enrichAnswerWithValidatedInlineLinks(answer: string, matches: SearchMatch[]): string {
-  let enriched = answer;
-  matches.slice(0, 3).forEach((match) => {
-    const { document } = match;
-    if (!hasMeaningfulInlineDestination(document) || enriched.includes(`](${document.url})`)) return;
-    const phrase = linkableTitlePhrases(document.title).find((candidate) =>
-      new RegExp(candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(enriched));
-    if (!phrase) return;
-    const expression = new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    enriched = enriched.replace(expression, `[${phrase}](${document.url})`);
+/** Derive short identities from a page's own slug, never from body keywords or guessed URLs. */
+function canonicalPageLabels(document: SuccessiveSearchDocument): string[] {
+  if (document.type !== "page" || !hasMeaningfulInlineDestination(document)) return [];
+  const words = document.slug.split("-").filter(Boolean);
+  while (words.length > 1 && /^(?:services?|solutions?|consulting|development|company|transformation)$/.test(words.at(-1)!)) words.pop();
+  const name = words.join(" ");
+  const labels = [name];
+  // Accept an acronym only if the page itself explicitly uses it as a title
+  // word. Automatically generated search aliases are not identity evidence.
+  const acronym = words.map((word) => word[0]).join("").toUpperCase();
+  if (words.length >= 2 && acronym.length >= 2 &&
+      document.title.split(/[^a-z0-9]+/i).includes(acronym)) labels.push(acronym);
+  return labels.filter((label) => label.length >= 3);
+}
+
+export function inlineLinkMatches(matches: SearchMatch[], corpus: SuccessiveSearchDocument[], answer: string): SearchMatch[] {
+  const evidence = matches.flatMap(({ document, localEvidence, selectedPassages, matchedFields }) =>
+    localEvidence?.passages ?? (matchedFields.includes("exact-embedded-entity") || matchedFields.includes("embedded-structural-parent")
+      ? selectedPassages : factualDocumentEvidence(document))).join(" ");
+  const visible = (name: string) => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}_-])${escaped}(?![\\p{L}\\p{N}_-])`, "iu");
+    return pattern.test(answer) && pattern.test(evidence);
+  };
+  const candidates = corpus.flatMap((document) => {
+    const labels = [document.title, ...canonicalPageLabels(document)].filter(visible);
+    return labels.map((title) => ({ document, title, authority:
+      normalizeSearchText(title) === normalizeSearchText(document.title) ? 3 :
+      normalizeSearchText(title) === normalizeSearchText(document.slug.replace(/-/g, " ")) ? 2 :
+      normalizeServiceSchemaType(document.service_type) === "pillar" ? 1 : 0 }));
   });
-  return enriched;
+  // Single-word category labels are navigational in an enumeration, not in
+  // incidental prose such as "a cloud platform". Require displayed casing.
+  const categoryNames = new Set(candidates.filter(({ title }) =>
+    new RegExp(`(?:^|[\\s,])${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[,;]|,? and )`, "i").test(answer))
+    .map(({ title }) => title.toLowerCase()));
+  const authorityByLabel = new Map<string, number>();
+  for (const candidate of candidates) authorityByLabel.set(candidate.title.toLowerCase(),
+    Math.max(authorityByLabel.get(candidate.title.toLowerCase()) ?? -1, candidate.authority));
+  const additional = candidates.flatMap(({ document, title, authority }): SearchMatch[] => {
+    if (authority < authorityByLabel.get(title.toLowerCase())!) return [];
+    const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mention = answer.match(new RegExp(`\\b${escaped}\\b`, "i"))?.[0];
+    if (title.split(/\s+/).length === 1 && (categoryNames.size < 2 || !mention || !/^[A-Z]/.test(mention))) return [];
+    return [{ document: { ...document, title }, score: 0, confidence: "high",
+      matchedFields: ["validated-inline-identity"], selectedPassages: [] }];
+  });
+  const authored = matches.flatMap((match) => match.document.structuredLinks.flatMap((link): SearchMatch[] => {
+    const title = link.title?.trim();
+    if (!title || /^(?:learn more|read more|explore|view|click here|contact us|connect with us)$/i.test(title)) return [];
+    const target = corpus.find((document) => document.url === link.url);
+    return target ? [{ ...match, document: { ...target, title } }] : [];
+  }));
+  return [...matches, ...additional, ...authored];
+}
+
+/** Link each unambiguous identity once, preserving Markdown and visible casing. */
+export function enrichAnswerWithValidatedInlineLinks(answer: string, matches: SearchMatch[]): string {
+  const destinations = new Map<string, Set<string>>();
+  for (const { document } of matches) {
+    if (!hasMeaningfulInlineDestination(document)) continue;
+    for (const phrase of linkableTitlePhrases(document.title)) {
+      const key = phrase.toLowerCase();
+      const urls = destinations.get(key) ?? new Set<string>();
+      urls.add(document.url);
+      destinations.set(key, urls);
+    }
+  }
+  const phrases = [...destinations.keys()].filter((key) => destinations.get(key)!.size === 1)
+    .sort((a, b) => b.length - a.length);
+  if (!phrases.length) return answer;
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const expression = new RegExp(`(?<![\\p{L}\\p{N}_-])(?:${phrases.map(escape).join("|")})(?![\\p{L}\\p{N}_-])`, "giu");
+  const linked = new Set([...answer.matchAll(/\]\((https?:\/\/[^\s)]+)\)/g)].map((match) => match[1]));
+  // Existing links/images, code, raw URLs, and HTML are not prose.
+  return answer.split(/(!?\[[^\]]*\]\([^)]*\)|\[[^\]]*\]\[[^\]]*\]|```[\s\S]*?```|`[^`]*`|https?:\/\/[^\s<>]+|<[^>]*>)/g)
+    .map((part, index) => index % 2 ? part : part.replace(expression, (label) => {
+      const url = [...destinations.get(label.toLowerCase())!][0]!;
+      if (linked.has(url)) return label;
+      linked.add(url);
+      return `[${label}](${url})`;
+    })).join("");
 }
 
 /** A heading destination labels the topic; a body link is a substantive navigation choice. */
