@@ -131,6 +131,7 @@
     height: clamp(data.height, 650, 450, 850),
     mobileFullscreen: bool(data.mobileFullscreen, true),
     promptInputId: safeText(data.promptInputId, "", 100),
+    promptTypingContentId: safeText(data.promptTypingContentId, "", 100),
     promptButtonId: safeText(data.promptButtonId, "", 100),
     containerId: safeText(data.containerId, "", 100),
   };
@@ -173,6 +174,7 @@
   };
   var sessionId = "";
   var unbindPromptInput = null;
+  var stopPromptTyping = null;
   var loadingStatusTimer = null;
   var previousOverflow = "";
   var mobileQuery = window.matchMedia("(max-width: 640px)");
@@ -807,6 +809,61 @@
     save();
     renderConversation();
   };
+  var animatePromptPlaceholder = function (externalInput) {
+    var fallbackPrompt = externalInput.getAttribute("placeholder") || "What can we solve for you?";
+    var promptText = function () {
+      var source = config.promptTypingContentId
+        ? document.getElementById(config.promptTypingContentId)
+        : null;
+      var content = source ? String(source.textContent || "").trim() : "";
+      return content || fallbackPrompt;
+    };
+    var timer = null;
+    var character = 0;
+    var deleting = false;
+    var active = true;
+    var render = function () {
+      if (!active) return;
+      var prompt = promptText();
+      if (document.activeElement === externalInput || String(externalInput.value || "")) {
+        externalInput.placeholder = fallbackPrompt;
+        timer = window.setTimeout(render, 180);
+        return;
+      }
+      externalInput.placeholder = prompt.slice(0, character) + "|";
+      if (!deleting && character < prompt.length) {
+        character += 1;
+        timer = window.setTimeout(render, 55);
+      } else if (!deleting) {
+        deleting = true;
+        timer = window.setTimeout(render, 1800);
+      } else if (character > 0) {
+        character -= 1;
+        timer = window.setTimeout(render, 28);
+      } else {
+        deleting = false;
+        timer = window.setTimeout(render, 450);
+      }
+    };
+    var reset = function () {
+      if (!String(externalInput.value || "")) {
+        character = 0;
+        deleting = false;
+      }
+    };
+    externalInput.addEventListener("focus", reset);
+    externalInput.addEventListener("blur", reset);
+    externalInput.addEventListener("input", reset);
+    render();
+    return function () {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+      externalInput.placeholder = fallbackPrompt;
+      externalInput.removeEventListener("focus", reset);
+      externalInput.removeEventListener("blur", reset);
+      externalInput.removeEventListener("input", reset);
+    };
+  };
   var bindPromptInput = function () {
     if (!config.promptInputId) return;
     var externalInput = document.getElementById(config.promptInputId);
@@ -834,12 +891,15 @@
     externalInput.addEventListener("keydown", keydown);
     if (form) form.addEventListener("submit", submit);
     else if (button) button.addEventListener("click", submit);
+    stopPromptTyping = animatePromptPlaceholder(externalInput);
     update();
     unbindPromptInput = function () {
       externalInput.removeEventListener("input", update);
       externalInput.removeEventListener("keydown", keydown);
       if (form) form.removeEventListener("submit", submit);
       else if (button) button.removeEventListener("click", submit);
+      if (stopPromptTyping) stopPromptTyping();
+      stopPromptTyping = null;
     };
   };
   var destroy = function () {
