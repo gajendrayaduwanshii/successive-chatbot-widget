@@ -42,6 +42,12 @@ export function normalizeCollectionQuery(query: string): string {
   while (words.length && words.at(-1) === "please") words.pop();
   return words.map(singular).join(" ");
 }
+
+/** Corpus-free gate using exactly the resolver's existing grammar bound. */
+export function isPlausibleCollectionQuery(query: string): boolean {
+  const normalized = normalizeCollectionQuery(query);
+  return Boolean(normalized && normalized.split(" ").length <= 5);
+}
 function urlKey(value: string, origin: string): string | undefined {
   try {
     const url = new URL(value);
@@ -231,8 +237,8 @@ const link = (doc: Document, label = doc.title) => `[${label.replace(/[[\]\\]/g,
 
 /** A narrow grammar prevents topic/relationship/attribute questions becoming catalogs. */
 export function resolveCollectionResponse(query: string, documents: Document[], siteUrl: string): CollectionResponse | undefined {
+  if (!isPlausibleCollectionQuery(query)) return;
   const normalized = normalizeCollectionQuery(query);
-  if (!normalized || normalized.split(" ").length > 5) return;
   const catalog = discoverIndexedCollections(documents, siteUrl);
   // Exact canonical topic identity retains its existing route, unless it is
   // the proven landing page of the collection being requested.

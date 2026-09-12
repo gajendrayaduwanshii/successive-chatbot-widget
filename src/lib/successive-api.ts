@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { unstable_cache } from "next/cache";
 import { getEnv } from "./env";
 import type { WordPressItem } from "@/types/wordpress";
 
@@ -262,12 +261,6 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
   return items;
 }
 
-const fetchCachedCorpus = unstable_cache(
-  fetchAllPublishedContentUncached,
-  ["successive-corpus-v1"],
-  { revalidate: 60 * 60 },
-);
-
 export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
   if (process.env.NODE_ENV === "test") return fetchAllPublishedContentUncached();
   const now = Date.now();
@@ -291,7 +284,9 @@ export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
     }
     return corpusBuildPromise;
   }
-  corpusBuildPromise = fetchCachedCorpus()
+  // The full payload exceeds Next's per-entry Data Cache limit. Existing
+  // process/persisted caches and this shared promise own corpus reuse.
+  corpusBuildPromise = fetchAllPublishedContentUncached()
     .then((items) => {
       corpusCache = { items, loadedAt: Date.now(), diagnostics: lastDiagnostics };
       return items;

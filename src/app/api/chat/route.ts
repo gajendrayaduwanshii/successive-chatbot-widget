@@ -1,4 +1,5 @@
-import { NextRequest, NextResponse } from "next/server";
+import { buildStrongDeterministicAnswer } from "@/lib/strong-deterministic-answer";
+import { after, NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { corsHeaders } from "@/lib/cors";
 import {
@@ -11,9 +12,10 @@ import { getEnv } from "@/lib/env";
 import { fetchAllPublishedContent, fetchSuccessive } from "@/lib/successive-api";
 import { getContentLoadDiagnostics } from "@/lib/successive-api";
 import { getLLMProvider } from "@/lib/llm";
+import { getSuggestionCorpus } from "@/lib/suggestion-corpus";
 import { assistantResponseSchema } from "@/lib/llm/schemas";
 import { rateLimit } from "@/lib/rate-limit";
-import { resolveCollectionResponse } from "@/lib/collection-response";
+import { isPlausibleCollectionQuery, resolveCollectionResponse } from "@/lib/collection-response";
 import {
   canUseEnglishQueryDirectly,
   prepareEnglishQuery,
@@ -200,13 +202,21 @@ The work typically includes identifying underused resources, improving resource 
 Explore [Cloud Cost Optimization](${url}) for additional guidance and practical insights.`;
 }
 
-let suggestionCorpusCache: { loadedAt: number; documents: SuccessiveSearchDocument[] } | undefined;
-async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]> {
-  if (suggestionCorpusCache && Date.now() - suggestionCorpusCache.loadedAt < 60 * 60_000)
-    return suggestionCorpusCache.documents;
-  const documents = buildSearchIndex(await fetchAllPublishedContent());
-  suggestionCorpusCache = { loadedAt: Date.now(), documents };
-  return documents;
+let suggestionCorpusWarmupScheduled = false;
+
+function scheduleSuggestionCorpusWarmup(): void {
+  if (suggestionCorpusWarmupScheduled) return;
+  suggestionCorpusWarmupScheduled = true;
+  try {
+    // Fallback if startup warming failed or the host delayed initialization.
+    // This reuses the startup cache/build and never starts a parallel build.
+    after(async () => {
+      try { await getSuggestionCorpus(); } catch { /* Normal callers may retry. */ }
+    });
+  } catch {
+    // Hosts without after() support retain ordinary on-demand loading.
+    suggestionCorpusWarmupScheduled = false;
+  }
 }
 
 /** A bounded card can borrow depth only from the exact canonical page it links
@@ -359,6 +369,7 @@ export async function POST(request: NextRequest) {
       "Too many messages. Please wait a moment and try again.",
       { ...cors.headers, "Retry-After": String(limit.retryAfter) },
     );
+  scheduleSuggestionCorpusWarmup();
   if (isGreeting(parsed.data.message)) {
     return NextResponse.json(
       { success: true, data: greetingResponse() },
@@ -368,7 +379,8 @@ export async function POST(request: NextRequest) {
   // Resolve strong indexed collections before query preparation or provider
   // initialization. Named topics and uncertain collection requests continue
   // through the existing evidence/LLM flow unchanged.
-  if (!parsed.data.suggestionAction && canUseEnglishQueryDirectly(parsed.data.message)) {
+  if (!parsed.data.suggestionAction && canUseEnglishQueryDirectly(parsed.data.message) &&
+      isPlausibleCollectionQuery(parsed.data.message)) {
     try {
       const collection = resolveCollectionResponse(parsed.data.message,
         await getSuggestionCorpus(), getEnv().SUCCESSIVE_PUBLIC_SITE_URL);
@@ -1175,9 +1187,26 @@ export async function POST(request: NextRequest) {
     deterministicUnderstanding,
     parsed.data.history.slice(-8),
   ).understanding;
+  // Reuse the already-resolved, ambiguity-checked indexed identity. Bare
+  // canonical titles can contain problem words without asking for advice.
+  const confidentStandaloneSubject = Boolean(
+    exactTitleLock?.confidence === "high" && currentExplicitSubject &&
+    !parsed.data.history.length && !actionMessage &&
+    canUseEnglishQueryDirectly(parsed.data.message) && currentFacets.length <= 1 &&
+    // As in the existing commercial route, an indexed title owns identity;
+    // commercial vocabulary inside a bare title is not a pricing request.
+    (!detectCommercialIntent(effectiveMessage) ||
+      normalizeSearchText(effectiveMessage) === normalizeSearchText(currentExplicitSubject)) &&
+    !deterministicUnderstanding.isFollowUp && !deterministicUnderstanding.needsClarification &&
+    !deterministicUnderstanding.containsPremise && !deterministicUnderstanding.temporalIntent &&
+    (normalizeSearchText(effectiveMessage) === normalizeSearchText(currentExplicitSubject) ||
+      (deterministicUnderstanding.intent === "informational" &&
+        ["define", "explain"].includes(deterministicUnderstanding.answerMode)))
+  );
   let understanding: QueryUnderstanding = deterministicUnderstanding;
+  let usedSemanticUnderstanding = false;
   if (
-    getEnv().AI_API_KEY &&
+    getEnv().AI_API_KEY && !confidentStandaloneSubject &&
     // An exact indexed title already supplies deterministic identity and
     // overview intent. Keep semantic interpretation for all other definition
     // requests, including short technical subjects.
@@ -1188,6 +1217,7 @@ export async function POST(request: NextRequest) {
       parsed.data.history,
     )
   ) {
+    usedSemanticUnderstanding = true;
     const understandingStartedAt = performance.now();
     try {
       understanding = await getLLMProvider().understandQuery(
@@ -2475,7 +2505,7 @@ export async function POST(request: NextRequest) {
       !isDependentFollowUp(effectiveMessage)
       ? questionEvidencePackage
       : undefined;
-    const deterministicGroundedAnswer = buildQuestionFocusedFallback(
+    let deterministicGroundedAnswer = buildQuestionFocusedFallback(
       buildGroundedRetrievalAnswer(selectedMatches),
       questionEvidencePackage,
     );
@@ -2499,27 +2529,47 @@ export async function POST(request: NextRequest) {
     })
       ? buildDeterministicOverviewAnswer(questionEvidencePackage)
       : undefined;
-    // The evidence-package composer is a complete, fresh composition path.
-    // The legacy elaboration plan remains only for categories not yet eligible
-    // for that bounded package.
-    const elaboration = evidencePackage ? undefined : planGroundedElaboration({
+    // Replace (never supplement) final composition for bounded standalone
+    // answers whose identity and evidence needed no upstream LLM reasoning.
+    const lightweightEnhancement = Boolean(!deterministicOverview && evidencePackage &&
+      !usedSemanticUnderstanding && canUseEnglishQueryDirectly(parsed.data.message) &&
+      !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage &&
+      !commercialIntent && facetResults.length <= 1 && understanding.intent === "informational" &&
+      !understanding.containsPremise && !understanding.temporalIntent &&
+      ["overview", "process", "benefits", "capabilities"].includes(evidencePackage.questionFocus) &&
+      deterministicGroundedAnswer.length >= 300 && deterministicGroundedAnswer.length <= 3000);
+    // Preserve the established overview/enhancer paths. Only replace full
+    // composition when the selected record can independently supply an answer.
+    const strongDeterministic = !deterministicOverview && !lightweightEnhancement
+      ? buildStrongDeterministicAnswer({
+          primary: selectedMatches[0], evidence: questionEvidencePackage, understanding,
+          standalone: !usedSemanticUnderstanding && canUseEnglishQueryDirectly(parsed.data.message) &&
+            !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage &&
+            !commercialIntent && facetResults.length <= 1,
+          singleSource: selectedMatches.length === 1,
+        })
+      : undefined;
+    if (strongDeterministic?.answer) deterministicGroundedAnswer = strongDeterministic.answer;
+    // Keep the deeper evidence-package/elaboration composer for other queries.
+    const elaboration = evidencePackage || strongDeterministic?.answer ? undefined : planGroundedElaboration({
       answer: deterministicGroundedAnswer,
       primary: selectedMatches[0],
       understanding,
     });
     let generatedData;
-    if (!deterministicOverview && !getEnv().AI_API_KEY) {
-      return error(
-        503,
-        "AI_NOT_CONFIGURED",
-        "The AI provider is not configured. Add AI_API_KEY to the server environment and restart the application.",
-        cors.headers,
-      );
-    }
-    if (!deterministicOverview) {
+    // Validated deterministic evidence already exists here. An unavailable
+    // provider must not turn that answer into AI_NOT_CONFIGURED.
+    if (!deterministicOverview && !strongDeterministic?.answer && getEnv().AI_API_KEY) {
       try {
         const finalLlmStartedAt = performance.now();
-        const generated = await getLLMProvider().generateStructuredResponse({
+        const generated = await getLLMProvider().generateStructuredResponse(lightweightEnhancement ? {
+          message: parsed.data.message,
+          presentationBase: deterministicGroundedAnswer,
+          responseLanguage: preparedQuery.responseLanguage,
+          fallbackAnswer: deterministicGroundedAnswer,
+          history: [],
+          context: [],
+        } : {
           message: effectiveMessage,
           responseLanguage: preparedQuery.responseLanguage,
           fallbackAnswer: preparedQuery.fallbackAnswer,
@@ -2562,11 +2612,11 @@ export async function POST(request: NextRequest) {
     const selectedUrl = selectedMatches[0]?.document.url ?? "";
     const fallbackSubject = `${selectedMatches[0]?.document.title ?? ""} ${selectedUrl} ${effectiveMessage}`;
     const fallbackFailure = /couldn.t confirm|could not find reliable/i.test(generatedAnswer);
-    const strategyFallbackNeeded = fallbackFailure || (!generatedData?.answer && generatedAnswer.length < 900 &&
-      !/roadmap|infrastructure|data quality|readiness|pocs?/i.test(generatedAnswer));
-    const productFallbackNeeded = fallbackFailure || (!generatedData?.answer &&
+    const strategyFallbackNeeded = !strongDeterministic?.answer && (fallbackFailure || (!generatedData?.answer && generatedAnswer.length < 900 &&
+      !/roadmap|infrastructure|data quality|readiness|pocs?/i.test(generatedAnswer)));
+    const productFallbackNeeded = !strongDeterministic?.answer && (fallbackFailure || (!generatedData?.answer &&
       questionEvidencePackage?.questionFocus === "overview" && generatedAnswer.length < 900 &&
-      !/Design and ship production-grade products and platforms/i.test(generatedAnswer));
+      !/Design and ship production-grade products and platforms/i.test(generatedAnswer)));
     if (strategyFallbackNeeded && /ai-strategy-consulting\/?$/i.test(selectedUrl) &&
         /\b(?:ai adoption strategy|ai strategy consulting)\b/i.test(fallbackSubject))
       generatedAnswer = aiStrategyFallback(selectedUrl);
@@ -2670,7 +2720,8 @@ export async function POST(request: NextRequest) {
         accepted: [],
         reason: "No definition-valid evidence survived final composition.",
       });
-    const groundedAnswer = enforceDefinitionSerialization && !semanticDefinition
+    // A quality-checked answer must not be padded with rejected promotional excerpts.
+    const groundedAnswer = strongDeterministic?.answer || (enforceDefinitionSerialization && !semanticDefinition)
       ? generatedAnswer
       : ensureDescriptiveGroundedAnswer(generatedAnswer, selectedMatches);
     const directlyAnswered = collapseAdjacentDuplicateTerms(ensureExplicitPremiseCorrection(ensureDirectDefinition(

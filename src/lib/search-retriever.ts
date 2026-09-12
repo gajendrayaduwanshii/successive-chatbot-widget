@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { unstable_cache } from "next/cache";
 import {
   fetchAllPublishedContent,
 } from "./successive-api";
@@ -124,12 +123,6 @@ async function persistIndex(documents: SuccessiveSearchDocument[]): Promise<void
     // A read-only deployment can still use the in-memory index safely.
   }
 }
-
-const buildCachedSearchIndex = unstable_cache(
-  async () => buildSearchIndex(await fetchAllPublishedContent()),
-  ["successive-search-index-v1"],
-  { revalidate: 60 * 60 },
-);
 
 export function getIndexDiagnostics() {
   return { ...lastIndexDiagnostics };
@@ -1452,7 +1445,10 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
     return indexBuildPromise;
   }
   const startedAt = Date.now();
-  indexBuildPromise = buildCachedSearchIndex()
+  // The derived full-corpus index also exceeds Next's per-entry cache limit.
+  // Retain the existing process/persisted index cache and in-flight promise.
+  indexBuildPromise = fetchAllPublishedContent()
+    .then((items) => buildSearchIndex(items))
     .then((documents) => {
       cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
       void persistIndex(documents);

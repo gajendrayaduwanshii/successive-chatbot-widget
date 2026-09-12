@@ -5,6 +5,8 @@ import type { QueryUnderstanding } from "../query-understanding";
 import type { CommercialIntent } from "../commercial-intent";
 import type { GroundedEvidencePackage } from "../grounded-evidence-package";
 export interface LLMInput {
+  /** Presentation-only mode: the provider sends just message and this grounded base. */
+  presentationBase?: string;
   message: string;
   responseLanguage: string;
   fallbackAnswer: string;

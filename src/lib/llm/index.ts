@@ -5,7 +5,7 @@ import type { LLMProvider } from "./types";
 export function getLLMProvider(): LLMProvider {
   const provider = getEnv().AI_PROVIDER;
   if (provider === "gemini") return new GeminiProvider();
-  if (provider === "openai" || provider === "nvidia")
+  if (provider === "openai" || provider === "nvidia" || provider === "groq")
     return new OpenAIProvider();
   throw new Error(`Unsupported LLM provider: ${provider}`);
 }
