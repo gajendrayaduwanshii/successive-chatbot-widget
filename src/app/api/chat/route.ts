@@ -2062,7 +2062,11 @@ export async function POST(request: NextRequest) {
     // already grounded in the normalized retrieval plan. Reserve the costly
     // literal whole-index fallback for an unresolved first pass; contextual
     // and semantic turns retain the existing two-plan validation.
-    const canReuseReliableInitial = standaloneDeterministicQuery && initialRetrieval.reliableMatchFound;
+    // retrievalMessage includes the latest visitor message together with any
+    // resolved conversation subject. If that first deterministic pass is
+    // reliable, it is the complete query and a second raw fallback is not
+    // needed. A weak or missing result still runs the literal fallback.
+    const canReuseReliableInitial = !usedSemanticUnderstanding && initialRetrieval.reliableMatchFound;
     const literalRetrieval = reuseInitialRetrieval || canReuseReliableInitial
       ? initialRetrieval
       : await retrieveFromIndex(
