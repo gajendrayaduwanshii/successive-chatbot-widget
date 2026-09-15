@@ -49,9 +49,9 @@ Add this repository secret:
 
 | Name | Value |
 | --- | --- |
-| `VERCEL_TOKEN` | A current Vercel access token scoped to the team that owns this project. |
+| `BLOB_READ_WRITE_TOKEN` | The read-write token for the connected private Vercel Blob store. |
 
-The workflow uses that token to securely pull the connected Vercel environment variables, including the Blob credential. `BLOB_READ_WRITE_TOKEN` does not need to be copied into GitHub.
+The workflow uses this secret only to write the refreshed private search-index file. It does not pull Vercel environment variables, which intentionally return `[SENSITIVE]` placeholders in GitHub Actions.
 
 ## First production index
 
