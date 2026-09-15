@@ -1105,6 +1105,10 @@ const exactIdentityLookupCache = new WeakMap<
   SuccessiveSearchDocument[],
   Map<string, SuccessiveSearchDocument[]>
 >();
+const candidateLookupCache = new WeakMap<
+  SuccessiveSearchDocument[],
+  Map<string, SuccessiveSearchDocument[]>
+>();
 
 function identityVocabulary(index: SuccessiveSearchDocument[]): Map<string, number> {
   const cached = identityVocabularyCache.get(index);
@@ -1133,6 +1137,22 @@ function exactIdentityLookup(index: SuccessiveSearchDocument[]): Map<string, Suc
       });
   });
   exactIdentityLookupCache.set(index, lookup);
+  return lookup;
+}
+
+function candidateLookup(index: SuccessiveSearchDocument[]): Map<string, SuccessiveSearchDocument[]> {
+  const cached = candidateLookupCache.get(index);
+  if (cached) return cached;
+  const lookup = new Map<string, SuccessiveSearchDocument[]>();
+  index.forEach((document) => {
+    normalizeSearchText(`${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.headings.join(" ")}`)
+      .split(" ").filter((term) => term.length >= 4).forEach((term) => {
+        const matches = lookup.get(term) ?? [];
+        matches.push(document);
+        lookup.set(term, matches);
+      });
+  });
+  candidateLookupCache.set(index, lookup);
   return lookup;
 }
 
@@ -1497,9 +1517,11 @@ function prewarmSearchIndexDerivedData(
   if (hydrated) {
     identityVocabularyCache.set(documents, hydrated.vocabulary);
     exactIdentityLookupCache.set(documents, hydrated.exactIdentityLookup);
+    candidateLookupCache.set(documents, hydrated.candidateLookup);
   } else {
     identityVocabulary(documents);
     exactIdentityLookup(documents);
+    candidateLookup(documents);
   }
   // IDF traverses every chunk in the full corpus. Keep it lazy: exact title
   // resolution does not use ranking and should not pay for a complete corpus
@@ -2055,6 +2077,7 @@ export async function retrieveFromIndex(
   currentMessage = query,
   excludedContent = new Set<string>(),
   understanding?: QueryUnderstanding,
+  allowCandidateLookup = true,
 ): Promise<RetrievalResult> {
   const retrievalStartedAt = performance.now();
   const baseIndex = await loadSearchIndex();
@@ -2633,7 +2656,7 @@ export async function retrieveFromIndex(
       isProductList,
     };
   }
-  const categoryIndex = index.filter((document) => {
+  let categoryIndex = index.filter((document) => {
     if (understanding?.requestedContentType &&
         !canonicalPageMatch(document, currentMessage) &&
         !isRequestedContentTypeCompatible(document, understanding.requestedContentType))
@@ -2719,6 +2742,22 @@ export async function retrieveFromIndex(
     }
     return true;
   });
+  const candidateTerms = normalizeSearchText(`${query} ${currentMessage}`).split(" ")
+    .filter((term) => term.length >= 4 && !STOPWORDS.has(term));
+  const candidateCounts = new Map<SuccessiveSearchDocument, number>();
+  if (allowCandidateLookup && candidateTerms.length >= 2) {
+    candidateTerms.forEach((term) => candidateLookup(index).get(term)?.forEach((document) => {
+      if (categoryIndex.includes(document))
+        candidateCounts.set(document, (candidateCounts.get(document) ?? 0) + 1);
+    }));
+    const minimumTermMatches = Math.min(2, new Set(candidateTerms).size);
+    const narrowed = [...candidateCounts.entries()]
+      .filter(([, count]) => count >= minimumTermMatches)
+      .map(([document]) => document);
+    if (narrowed.length > 0 && narrowed.length < categoryIndex.length)
+      categoryIndex = narrowed;
+  }
+  const candidateLookupUsed = categoryIndex.length < index.length && candidateCounts.size > 0;
   const idf = categoryIndex.length === index.length
     ? fullIndexInverseDocumentFrequency(index)
     : buildInverseDocumentFrequency(categoryIndex);
@@ -2854,6 +2893,8 @@ export async function retrieveFromIndex(
   const matches = resultPool
     .filter((match) => match.score >= resultCutoff)
     .slice(0, 5);
+  if (candidateLookupUsed && !matches.length)
+    return retrieveFromIndex(query, currentIntent, currentMessage, excludedContent, understanding, false);
   return {
     normalizedQuery,
     indexedDocuments: index.length,

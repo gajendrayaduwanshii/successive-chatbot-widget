@@ -3,7 +3,7 @@ import { normalizeSearchText, type SuccessiveSearchDocument } from "./search-ind
 export type PreparedIdentityIndex = {
   vocabulary: Array<[string, number]>;
   exactIdentityLookup: Array<[string, number[]]>;
-  candidateLookup: Array<[string, number[]]>;
+  candidateLookup?: Array<[string, number[]]>;
 };
 
 /**
@@ -45,17 +45,24 @@ export function buildPreparedIdentityIndex(
 export function hydratePreparedIdentityIndex(
   documents: SuccessiveSearchDocument[],
   prepared: PreparedIdentityIndex,
-): { vocabulary: Map<string, number>; exactIdentityLookup: Map<string, SuccessiveSearchDocument[]> } | undefined {
+): { vocabulary: Map<string, number>; exactIdentityLookup: Map<string, SuccessiveSearchDocument[]>; candidateLookup: Map<string, SuccessiveSearchDocument[]> } | undefined {
   if (!Array.isArray(prepared.vocabulary) || !Array.isArray(prepared.exactIdentityLookup)) return undefined;
   const exactIdentityLookup = new Map<string, SuccessiveSearchDocument[]>();
+  const candidateLookup = new Map<string, SuccessiveSearchDocument[]>();
   prepared.exactIdentityLookup.forEach(([identity, indexes]) => {
     if (typeof identity !== "string" || !Array.isArray(indexes)) return;
     const matches = indexes.map((index) => documents[index]).filter((document): document is SuccessiveSearchDocument => Boolean(document));
     if (matches.length) exactIdentityLookup.set(identity, matches);
   });
+  prepared.candidateLookup?.forEach(([term, indexes]) => {
+    if (typeof term !== "string" || !Array.isArray(indexes)) return;
+    const matches = indexes.map((index) => documents[index]).filter((document): document is SuccessiveSearchDocument => Boolean(document));
+    if (matches.length) candidateLookup.set(term, matches);
+  });
   return {
     vocabulary: new Map(prepared.vocabulary.filter((entry): entry is [string, number] =>
       Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number")),
     exactIdentityLookup,
+    candidateLookup,
   };
 }
