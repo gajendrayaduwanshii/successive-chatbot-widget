@@ -328,6 +328,7 @@ export async function POST(request: NextRequest) {
   let retrievalDurationMs = 0;
   let finalLlmDurationMs = 0;
   let contextConstructionDurationMs = 0;
+  let preRetrievalApplicationDurationMs = 0;
   const origin = request.headers.get("origin");
   const cors = corsHeaders(origin);
   const isSameOrigin = origin === new URL(request.url).origin;
@@ -2008,6 +2009,10 @@ export async function POST(request: NextRequest) {
     }
   }
   try {
+    preRetrievalApplicationDurationMs = Math.max(
+      0,
+      performance.now() - requestStartedAt - understandingDurationMs,
+    );
     const retrievalStartedAt = performance.now();
     let retrieval = await retrieveFromIndex(
       retrievalMessage,
@@ -2848,18 +2853,27 @@ export async function POST(request: NextRequest) {
     const totalDurationMs = Math.round(performance.now() - requestStartedAt);
     const roundedUnderstandingDurationMs = Math.round(understandingDurationMs);
     const roundedFinalLlmDurationMs = Math.round(finalLlmDurationMs);
+    const roundedPreRetrievalApplicationDurationMs = Math.round(preRetrievalApplicationDurationMs);
+    const roundedRetrievalDurationMs = Math.round(retrievalDurationMs);
+    const roundedContextConstructionDurationMs = Math.round(contextConstructionDurationMs);
+    const applicationDurationMs = Math.max(
+      0,
+      totalDurationMs - roundedUnderstandingDurationMs - roundedFinalLlmDurationMs,
+    );
     const chatMetrics = {
       totalDurationMs,
-      applicationDurationMs: Math.max(
-        0,
-        totalDurationMs - roundedUnderstandingDurationMs - roundedFinalLlmDurationMs,
-      ),
+      applicationDurationMs,
+      preRetrievalApplicationDurationMs: roundedPreRetrievalApplicationDurationMs,
       understandingDurationMs: roundedUnderstandingDurationMs,
-      retrievalDurationMs: Math.round(retrievalDurationMs),
+      retrievalDurationMs: roundedRetrievalDurationMs,
       relationshipScoringDurationMs: retrieval.timings?.relationshipScoringMs ?? 0,
       rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
-      contextConstructionDurationMs: Math.round(contextConstructionDurationMs),
+      contextConstructionDurationMs: roundedContextConstructionDurationMs,
       finalLlmDurationMs: roundedFinalLlmDurationMs,
+      postRetrievalApplicationDurationMs: Math.max(
+        0,
+        applicationDurationMs - roundedPreRetrievalApplicationDurationMs - roundedRetrievalDurationMs - roundedContextConstructionDurationMs,
+      ),
       wordpress: getContentLoadDiagnostics(),
       index: getIndexDiagnostics(),
       selectedDocuments: selectedMatches.length,
