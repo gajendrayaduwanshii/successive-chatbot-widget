@@ -1435,6 +1435,21 @@ function buildInverseDocumentFrequency(
   );
 }
 
+const fullIndexIdfCache = new WeakMap<
+  SuccessiveSearchDocument[],
+  Map<string, number>
+>();
+
+function fullIndexInverseDocumentFrequency(
+  documents: SuccessiveSearchDocument[],
+): Map<string, number> {
+  const cached = fullIndexIdfCache.get(documents);
+  if (cached) return cached;
+  const idf = buildInverseDocumentFrequency(documents);
+  fullIndexIdfCache.set(documents, idf);
+  return idf;
+}
+
 async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
   // WordPress content is already revalidated every hour. Reusing the
   // derived index avoids repeated recursive ACF traversal and chunk generation
@@ -2024,7 +2039,7 @@ export async function retrieveFromIndex(
       ...understanding.technicalSignals,
       understanding.industry,
     ].filter(Boolean).join(" ");
-    const bridgeIdf = buildInverseDocumentFrequency(index);
+    const bridgeIdf = fullIndexInverseDocumentFrequency(index);
     index
       .filter((document) => ["case_study", "editorial", "blog", "press_release", "resource"].includes(document.role))
       .map((document) => rankSearchDocument(document, bridgeQuery || query, bridgeIdf, understanding))
@@ -2643,7 +2658,9 @@ export async function retrieveFromIndex(
     }
     return true;
   });
-  const idf = buildInverseDocumentFrequency(categoryIndex);
+  const idf = categoryIndex.length === index.length
+    ? fullIndexInverseDocumentFrequency(index)
+    : buildInverseDocumentFrequency(categoryIndex);
   const correctedTopicalInput = correctMinorTyposFromIndex(query, categoryIndex);
   const topicalQuery =
     intent === "case_studies"
