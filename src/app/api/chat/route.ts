@@ -287,12 +287,21 @@ const STRUCTURED_IDENTITY_PAGE_SLUGS = [
   "about-us", "contact", "our-culture", "careers", "global-capabilities", "partners", "awards",
 ] as const;
 
+type RouteTitleResolutionTimings = {
+  corpusLookupMs: number;
+  structuredFallbackMs: number;
+};
+
 async function resolveRouteIndexedTitle(
   message: string,
   requestedContentType?: QueryUnderstanding["requestedContentType"],
+  timings?: RouteTitleResolutionTimings,
 ): Promise<SearchMatch | undefined> {
+  const corpusLookupStartedAt = performance.now();
   const corpusMatch = await resolveExactIndexedTitle(message, requestedContentType);
+  if (timings) timings.corpusLookupMs += performance.now() - corpusLookupStartedAt;
   if (corpusMatch) return corpusMatch;
+  const structuredFallbackStartedAt = performance.now();
   const settled = await Promise.allSettled(
     STRUCTURED_IDENTITY_PAGE_SLUGS.map((slug) => fetchSuccessive(`/pages/${slug}`)),
   );
@@ -304,6 +313,7 @@ async function resolveRouteIndexedTitle(
       seen.add(key);
       return true;
     });
+  if (timings) timings.structuredFallbackMs += performance.now() - structuredFallbackStartedAt;
   return structuredItems.length
     ? matchExactIndexedTitle(buildSearchIndex(structuredItems), message, requestedContentType)
     : undefined;
@@ -489,11 +499,25 @@ export async function POST(request: NextRequest) {
   // replace a resolvable standalone entity before fact/no-content routing.
   const currentExplicitSubject = actionMessage
     ? undefined : extractExplicitInformationalSubject(preparedQuery.englishQuery);
+  const titleResolutionTimings: RouteTitleResolutionTimings = {
+    corpusLookupMs: 0,
+    structuredFallbackMs: 0,
+  };
   const currentQueryTitleLock = currentExplicitSubject
-    ? await resolveRouteIndexedTitle(preparedQuery.englishQuery, explicitTurnUnderstanding.requestedContentType) : undefined;
+    ? await resolveRouteIndexedTitle(
+        preparedQuery.englishQuery,
+        explicitTurnUnderstanding.requestedContentType,
+        titleResolutionTimings,
+      )
+    : undefined;
   const exactTitleLock = currentQueryTitleLock ??
     (normalizeSearchText(effectiveMessage) !== normalizeSearchText(preparedQuery.englishQuery)
-      ? await resolveRouteIndexedTitle(effectiveMessage, explicitTurnUnderstanding.requestedContentType) : undefined);
+      ? await resolveRouteIndexedTitle(
+          effectiveMessage,
+          explicitTurnUnderstanding.requestedContentType,
+          titleResolutionTimings,
+        )
+      : undefined);
   if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
       !detectCommercialIntent(preparedQuery.englishQuery) &&
       !isExplicitRequestedRoleRelation(preparedQuery.englishQuery) &&
@@ -2864,6 +2888,8 @@ export async function POST(request: NextRequest) {
       totalDurationMs,
       applicationDurationMs,
       preRetrievalApplicationDurationMs: roundedPreRetrievalApplicationDurationMs,
+      titleResolutionCorpusLookupMs: Math.round(titleResolutionTimings.corpusLookupMs),
+      titleResolutionStructuredFallbackMs: Math.round(titleResolutionTimings.structuredFallbackMs),
       understandingDurationMs: roundedUnderstandingDurationMs,
       retrievalDurationMs: roundedRetrievalDurationMs,
       relationshipScoringDurationMs: retrieval.timings?.relationshipScoringMs ?? 0,
