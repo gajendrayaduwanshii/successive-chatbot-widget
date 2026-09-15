@@ -335,6 +335,27 @@ export async function OPTIONS(request: NextRequest) {
 }
 export async function POST(request: NextRequest) {
   const requestStartedAt = performance.now();
+  const appTrace = {
+    pre: {
+      requestPreparationMs: 0,
+      historyFollowupMs: 0,
+      normalizationTypoMs: 0,
+      intentFacetCollectionMs: 0,
+      preOtherMs: 0,
+    },
+    title: {
+      titleResolutionTotalMs: 0,
+      indexLoadMs: 0,
+      persistedReadMs: 0,
+      jsonParseMs: 0,
+      hydrationMs: 0,
+      identityLookupMs: 0,
+      corpusFallbackMs: 0,
+      structuredFallbackDecisionMs: 0,
+      structuredFallbackNetworkMs: 0,
+      structuredFallbackProcessingMs: 0,
+    },
+  };
   let understandingDurationMs = 0;
   let retrievalDurationMs = 0;
   let finalLlmDurationMs = 0;
@@ -358,6 +379,7 @@ export async function POST(request: NextRequest) {
     request.headers.get("x-real-ip") ??
     "unknown";
   let body: unknown;
+  const requestPreparationStartedAt = performance.now();
   try {
     body = await request.json();
   } catch {
@@ -377,6 +399,7 @@ export async function POST(request: NextRequest) {
       cors.headers,
     );
   const limit = rateLimit(`${ip}:${parsed.data.sessionId ?? "anonymous"}`);
+  appTrace.pre.requestPreparationMs = performance.now() - requestPreparationStartedAt;
   if (!limit.allowed)
     return error(
       429,
@@ -410,6 +433,7 @@ export async function POST(request: NextRequest) {
     }
   }
   let preparedQuery;
+  const normalizationStartedAt = performance.now();
   if (canUseEnglishQueryDirectly(parsed.data.message)) {
     preparedQuery = prepareEnglishQuery(parsed.data.message);
   } else {
@@ -438,6 +462,8 @@ export async function POST(request: NextRequest) {
     ...preparedQuery,
     englishQuery: normalizeMalformedInterrogative(preparedQuery.englishQuery),
   };
+  appTrace.pre.normalizationTypoMs = performance.now() - normalizationStartedAt;
+  const historyFollowupStartedAt = performance.now();
   const lastAssistantContent = [...parsed.data.history].reverse()
     .find((item) => item.role === "assistant")?.content ?? "";
   const groundedTitleFromHistory = lastAssistantContent.match(
@@ -484,6 +510,8 @@ export async function POST(request: NextRequest) {
     ? { ...parsed.data.suggestionAction, topic: parsed.data.suggestionAction.topic ?? legacyActionTopic }
     : inferredRelatedAction;
   const actionMessage = resolveSuggestionAction(resolvedSuggestionAction);
+  appTrace.pre.historyFollowupMs = performance.now() - historyFollowupStartedAt;
+  const intentFacetCollectionStartedAt = performance.now();
   const explicitTurnUnderstanding = buildDeterministicUnderstanding(preparedQuery.englishQuery);
   const rawFacetOnlyFollowUp = isFacetOnlyFollowUp(preparedQuery.englishQuery);
   const effectiveMessage = actionMessage ?? ((explicitTurnUnderstanding.requestedContentType && !rawFacetOnlyFollowUp) || detectCommercialIntent(preparedQuery.englishQuery)
@@ -507,6 +535,7 @@ export async function POST(request: NextRequest) {
     corpusLookupMs: 0,
     structuredFallbackMs: 0,
   };
+  const titleResolutionStartedAt = performance.now();
   const currentQueryTitleLock = currentExplicitSubject
     ? await resolveRouteIndexedTitle(
         preparedQuery.englishQuery,
@@ -522,6 +551,12 @@ export async function POST(request: NextRequest) {
           titleResolutionTimings,
         )
       : undefined);
+  appTrace.title.titleResolutionTotalMs = performance.now() - titleResolutionStartedAt;
+  appTrace.title.indexLoadMs = titleResolutionTimings.corpusLookupMs;
+  appTrace.title.identityLookupMs = titleResolutionTimings.corpusLookupMs;
+  appTrace.title.structuredFallbackNetworkMs = titleResolutionTimings.structuredFallbackMs;
+  const intentFacetCollectionEndedAt = performance.now();
+  appTrace.pre.intentFacetCollectionMs = intentFacetCollectionEndedAt - intentFacetCollectionStartedAt - appTrace.title.titleResolutionTotalMs;
   if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
       !detectCommercialIntent(preparedQuery.englishQuery) &&
       !isExplicitRequestedRoleRelation(preparedQuery.englishQuery) &&
@@ -2913,6 +2948,13 @@ export async function POST(request: NextRequest) {
     const roundedUnderstandingDurationMs = Math.round(understandingDurationMs);
     const roundedFinalLlmDurationMs = Math.round(finalLlmDurationMs);
     const roundedPreRetrievalApplicationDurationMs = Math.round(preRetrievalApplicationDurationMs);
+    appTrace.pre.preOtherMs = Math.max(0, preRetrievalApplicationDurationMs - (
+      appTrace.pre.requestPreparationMs +
+      appTrace.pre.historyFollowupMs +
+      appTrace.pre.normalizationTypoMs +
+      appTrace.pre.intentFacetCollectionMs +
+      appTrace.title.titleResolutionTotalMs
+    ));
     const roundedRetrievalDurationMs = Math.round(retrievalDurationMs);
     const roundedContextConstructionDurationMs = Math.round(contextConstructionDurationMs);
     const applicationDurationMs = Math.max(
@@ -2923,6 +2965,7 @@ export async function POST(request: NextRequest) {
       totalDurationMs,
       applicationDurationMs,
       preRetrievalApplicationDurationMs: roundedPreRetrievalApplicationDurationMs,
+      appTrace,
       reusedInitialRetrievalForLiteral,
       titleResolutionCorpusLookupMs: Math.round(titleResolutionTimings.corpusLookupMs),
       titleResolutionStructuredFallbackMs: Math.round(titleResolutionTimings.structuredFallbackMs),
