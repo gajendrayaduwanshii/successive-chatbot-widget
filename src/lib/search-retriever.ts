@@ -4,7 +4,11 @@ import {
   fetchAllPublishedContent,
 } from "./successive-api";
 import { readPersistentSearchIndex } from "./persistent-search-index";
-import { hydratePreparedIdentityIndex, type PreparedIdentityIndex } from "./search-index-preparation";
+import {
+  buildPreparedIdentityIndex,
+  hydratePreparedIdentityIndex,
+  type PreparedIdentityIndex,
+} from "./search-index-preparation";
 import { detectIntent, type Intent } from "./intent-detector";
 import { contentIdentity } from "./conversation-context";
 import {
@@ -100,27 +104,40 @@ let cachedIndex:
 let indexBuildPromise: Promise<SuccessiveSearchDocument[]> | undefined;
 let lastIndexDiagnostics = { cache: "miss" as "hit" | "miss" | "shared", durationMs: 0, documents: 0 };
 
-async function readPersistedIndex(): Promise<SuccessiveSearchDocument[] | undefined> {
+type LocalPersistedSearchIndex = {
+  loadedAt?: number;
+  documents?: SuccessiveSearchDocument[];
+  preparedIdentityIndex?: PreparedIdentityIndex;
+};
+
+async function readPersistedIndex(): Promise<{
+  documents: SuccessiveSearchDocument[];
+  preparedIdentityIndex?: PreparedIdentityIndex;
+} | undefined> {
   if (process.env.NODE_ENV === "test") return undefined;
   try {
-    const parsed = JSON.parse(await readFile(PERSISTED_INDEX_PATH, "utf8")) as {
-      loadedAt?: number;
-      documents?: SuccessiveSearchDocument[];
-    };
+    const parsed = JSON.parse(await readFile(PERSISTED_INDEX_PATH, "utf8")) as LocalPersistedSearchIndex;
     if (!parsed.loadedAt || !Array.isArray(parsed.documents) ||
         Date.now() - parsed.loadedAt >= INDEX_CACHE_MS)
       return undefined;
-    return parsed.documents;
+    return { documents: parsed.documents, preparedIdentityIndex: parsed.preparedIdentityIndex };
   } catch {
     return undefined;
   }
 }
 
-async function persistIndex(documents: SuccessiveSearchDocument[]): Promise<void> {
+async function persistIndex(
+  documents: SuccessiveSearchDocument[],
+  preparedIdentityIndex = buildPreparedIdentityIndex(documents),
+): Promise<void> {
   if (process.env.NODE_ENV === "test") return;
   try {
     await mkdir(path.dirname(PERSISTED_INDEX_PATH), { recursive: true });
-    await writeFile(PERSISTED_INDEX_PATH, JSON.stringify({ loadedAt: Date.now(), documents }));
+    await writeFile(PERSISTED_INDEX_PATH, JSON.stringify({
+      loadedAt: Date.now(),
+      documents,
+      preparedIdentityIndex,
+    }));
   } catch {
     // A read-only deployment can still use the in-memory index safely.
   }
@@ -132,10 +149,11 @@ export async function storeRefreshedSearchIndex(
   preparedIdentityIndex?: PreparedIdentityIndex,
 ): Promise<void> {
   if (process.env.NODE_ENV === "test") return;
+  const prepared = preparedIdentityIndex ?? buildPreparedIdentityIndex(documents);
   cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
   lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: documents.length };
-  prewarmSearchIndexDerivedData(documents, preparedIdentityIndex);
-  await persistIndex(documents);
+  prewarmSearchIndexDerivedData(documents, prepared);
+  await persistIndex(documents, prepared);
 }
 
 export function getIndexDiagnostics() {
@@ -1540,18 +1558,18 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
     return cachedIndex.documents;
   }
   const persisted = await readPersistedIndex();
-  if (persisted?.length) {
-    cachedIndex = { documents: persisted, expiresAt: Date.now() + INDEX_CACHE_MS };
-    prewarmSearchIndexDerivedData(persisted);
-    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.length };
-    return persisted;
+  if (persisted?.documents.length) {
+    cachedIndex = { documents: persisted.documents, expiresAt: Date.now() + INDEX_CACHE_MS };
+    prewarmSearchIndexDerivedData(persisted.documents, persisted.preparedIdentityIndex);
+    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.documents.length };
+    return persisted.documents;
   }
   const shared = await readPersistentSearchIndex();
   if (shared?.documents.length) {
     cachedIndex = { documents: shared.documents, expiresAt: Date.now() + INDEX_CACHE_MS };
     prewarmSearchIndexDerivedData(shared.documents, shared.preparedIdentityIndex);
     lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: shared.documents.length };
-    void persistIndex(shared.documents);
+    void persistIndex(shared.documents, shared.preparedIdentityIndex);
     return shared.documents;
   }
   if (indexBuildPromise) {
