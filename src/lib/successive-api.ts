@@ -261,14 +261,15 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
   return items;
 }
 
-export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
+export async function fetchAllPublishedContent(options: { forceRefresh?: boolean } = {}): Promise<WordPressItem[]> {
   if (process.env.NODE_ENV === "test") return fetchAllPublishedContentUncached();
+  const forceRefresh = options.forceRefresh === true;
   const now = Date.now();
-  if (corpusCache && now - corpusCache.loadedAt < CORPUS_TTL_MS) {
+  if (!forceRefresh && corpusCache && now - corpusCache.loadedAt < CORPUS_TTL_MS) {
     lastDiagnostics = { ...corpusCache.diagnostics, cache: "hit", durationMs: 0 };
     return corpusCache.items;
   }
-  const persisted = await readPersistedCorpus();
+  const persisted = forceRefresh ? undefined : await readPersistedCorpus();
   if (persisted?.length) {
     const diagnostics: ContentLoadDiagnostics = {
       cache: "hit", durationMs: 0, failedCollections: [], partial: false, itemCount: persisted.length,

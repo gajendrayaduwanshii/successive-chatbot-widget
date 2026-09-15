@@ -2623,7 +2623,11 @@ export async function POST(request: NextRequest) {
     if (productFallbackNeeded && /product-engineering-services-solutions\/?$/i.test(selectedUrl) &&
         /\bai[- ]native product engineering\b/i.test(fallbackSubject))
       generatedAnswer = aiNativeProductFallback(selectedUrl);
-    if (strategyFallbackNeeded && /cloud-cost-optimization-ebook\/?$/i.test(selectedUrl) &&
+    // This resource has a verified, fuller source-backed overview. Do not let
+    // a syntactically valid but shallow composer response replace it.
+    const cloudOverviewNeedsDepth = questionEvidencePackage?.questionFocus === "overview" &&
+      generatedAnswer.length < 700;
+    if ((strategyFallbackNeeded || cloudOverviewNeedsDepth) && /cloud-cost-optimization-ebook\/?$/i.test(selectedUrl) &&
         /\bcloud cost optimization\b/i.test(fallbackSubject))
       generatedAnswer = cloudCostFallback(selectedUrl);
     if (!answerAddressesRequestedAttribute(generatedAnswer, effectiveMessage, evidenceValidation.requestedAttribute)) {

@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   fetchAllPublishedContent,
 } from "./successive-api";
+import { readPersistentSearchIndex } from "./persistent-search-index";
 import { detectIntent, type Intent } from "./intent-detector";
 import { contentIdentity } from "./conversation-context";
 import {
@@ -1449,6 +1450,13 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
     cachedIndex = { documents: persisted, expiresAt: Date.now() + INDEX_CACHE_MS };
     lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.length };
     return persisted;
+  }
+  const shared = await readPersistentSearchIndex();
+  if (shared?.length) {
+    cachedIndex = { documents: shared, expiresAt: Date.now() + INDEX_CACHE_MS };
+    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: shared.length };
+    void persistIndex(shared);
+    return shared;
   }
   if (indexBuildPromise) {
     lastIndexDiagnostics = { ...lastIndexDiagnostics, cache: "shared" };

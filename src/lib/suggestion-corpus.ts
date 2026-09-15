@@ -1,6 +1,7 @@
 import { fetchAllPublishedContent } from "./successive-api";
 import { buildSearchIndex, type SuccessiveSearchDocument } from "./search-index";
 import { storeRefreshedSearchIndex } from "./search-retriever";
+import { readPersistentSearchIndex, writePersistentSearchIndex } from "./persistent-search-index";
 
 type SuggestionCorpusState = {
   cache?: { loadedAt: number; documents: SuccessiveSearchDocument[] };
@@ -18,11 +19,18 @@ export async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]>
   if (state.cache && Date.now() - state.cache.loadedAt < 60 * 60_000)
     return state.cache.documents;
   if (!state.build) {
-    state.build = fetchAllPublishedContent()
-      .then(async (items) => {
+    state.build = readPersistentSearchIndex()
+      .then(async (persisted) => {
+        if (persisted?.length) {
+          state.cache = { loadedAt: Date.now(), documents: persisted };
+          await storeRefreshedSearchIndex(persisted);
+          return persisted;
+        }
+        const items = await fetchAllPublishedContent();
         const documents = buildSearchIndex(items);
         state.cache = { loadedAt: Date.now(), documents };
         await storeRefreshedSearchIndex(documents);
+        await writePersistentSearchIndex(documents);
         return documents;
       })
       .finally(() => { state.build = undefined; });
@@ -33,5 +41,16 @@ export async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]>
 /** Forces the next hourly background cycle to rebuild from the published source. */
 export async function refreshSuggestionCorpus(): Promise<SuccessiveSearchDocument[]> {
   state.cache = undefined;
-  return getSuggestionCorpus();
+  if (!state.build) {
+    state.build = fetchAllPublishedContent({ forceRefresh: true })
+      .then(async (items) => {
+        const documents = buildSearchIndex(items);
+        state.cache = { loadedAt: Date.now(), documents };
+        await storeRefreshedSearchIndex(documents);
+        await writePersistentSearchIndex(documents);
+        return documents;
+      })
+      .finally(() => { state.build = undefined; });
+  }
+  return state.build;
 }

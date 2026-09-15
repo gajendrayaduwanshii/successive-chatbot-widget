@@ -37,18 +37,32 @@ export function buildStrongDeterministicAnswer(args: {
   if (understanding.intent === "solve_problem" &&
     normalizeSearchText(evidence.userQuery) !== normalizeSearchText(primary.document.title))
     return fail("problem-reasoning");
-  if (primary.confidence !== "high" || !primary.matchedFields.some(field =>
-    /^(?:exact-title-lock|normalized-exact-title|exact-entity-authority|canonical-page-identity|strong-equivalent-canonical-subject)$/.test(field)))
+  const structuralCanonicalEvidence = evidence.supportingEvidence.semanticClusters
+    .filter((cluster) => cluster.source === "structural_canonical")
+    .flatMap((cluster) => cluster.passages);
+  const directCanonicalAuthority = primary.matchedFields.some(field =>
+    /^(?:exact-title-lock|normalized-exact-title|exact-entity-authority|canonical-page-identity|strong-equivalent-canonical-subject)$/.test(field));
+  // An exact card can represent a service whose full description lives at the
+  // card's explicit destination. That relationship is authoritative only when
+  // the route has recovered evidence from that exact linked page.
+  const linkedCanonicalAuthority = Boolean(primary.localEvidence?.url) &&
+    primary.matchedFields.some(field => field === "exact-structured-section" || field === "embedded-structural-parent") &&
+    structuralCanonicalEvidence.length > 0;
+  if (primary.confidence !== "high" || !(directCanonicalAuthority || linkedCanonicalAuthority))
     return fail("canonical-confidence");
   const url = evidence.validatedLinks.canonical;
   if (!url || !/^https:\/\/[^\s)]+$/.test(url) || evidence.questionFocus === "relationship") return fail("source-or-focus");
   // A local match may be a nested unit on a larger page. Never borrow its
   // parent's unrelated body. A matching document title AND URL proves that
-  // the existing record itself is the selected unit.
+  // the existing record itself is the selected unit. The sole exception is
+  // evidence from the exact canonical page linked by that unit: the route has
+  // already verified that relationship while building the evidence package.
   const ownsRecord = !primary.localEvidence ||
     (primary.localEvidence.url?.replace(/\/$/, "") === primary.document.url.replace(/\/$/, "") &&
       normalizeSearchText(primary.localEvidence.heading ?? "") === normalizeSearchText(primary.document.title));
-  const values = ownsRecord ? factualDocumentEvidence(primary.document) : primary.localEvidence?.passages ?? primary.selectedPassages;
+  const values = ownsRecord
+    ? factualDocumentEvidence(primary.document)
+    : [...(primary.localEvidence?.passages ?? primary.selectedPassages), ...structuralCanonicalEvidence];
   const subject = new Set(normalizeSearchText(primary.document.title).split(" ").filter(t => t.length >= 3));
   const relevant = (text: string) => normalizeSearchText(text).split(" ").some(t => subject.has(t));
   const selected: string[] = [];
@@ -60,19 +74,24 @@ export function buildStrongDeterministicAnswer(args: {
     })) return;
     if (selected.join(" ").length + text.length <= 1600 && selected.length < 6) selected.push(text);
   };
-  // Learning topics are not facts about implementation. Present them as
-  // published topic coverage, only for an overview, never as process steps.
-  if (evidence.questionFocus === "overview" && understanding.answerMode !== "define") {
+  // A named guide or resource often places its useful detail after marketing
+  // copy in a "You will learn" section. That section is still first-party
+  // evidence from the exact selected record, so preserve its concrete topics
+  // as a readable list instead of discarding the whole record as promotional.
+  if (evidence.questionFocus === "overview") {
     const learning = values.flatMap(value => {
       const section = value.split(/\byou will learn\s*:/i)[1];
-      if (!section || !relevant(value)) return [];
-      return (section.match(/\bHow to [^?.!]+\?/gi) ?? [])
-        .map(text => text.replace(/\?$/, "").replace(/^How/, "how").trim())
-        .filter(text => text.split(/\s+/).length >= 6 && !artifacts.test(text));
+      if (!section) return [];
+      return section
+        .replace(/[\u200b-\u200d\ufeff]/g, "")
+        .split(/(?<=[?.!])\s+(?=[A-Z])/)
+        .map(text => text.replace(/^\s*[•-]\s*/, "").replace(/\?$/, "").trim())
+        .filter(text => text.split(/\s+/).length >= 5 && text.length <= 220)
+        .filter(text => !/^(?:download|subscribe|contact us|get in touch|learn more|read more)\b/i.test(text));
     });
     learning.forEach(add);
     if (selected.length >= 2) return {
-      answer: `## [${primary.document.title.replace(/[\[\]]/g, "")}](${url})\n\nThe published description covers ${selected.join(" and ")}.`,
+      answer: `## [${primary.document.title.replace(/[\[\]]/g, "")}](${url})\n\nThe published resource covers:\n\n${selected.map(point => `- ${point}`).join("\n")}`,
       points: selected, facets: selected.map(() => "published learning topic"), reason: "grounded-topic-coverage",
     };
     selected.length = 0;

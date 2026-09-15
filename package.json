@@ -10,10 +10,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
-    ,"test:e2e": "node scripts/e2e-conversation-test.mjs"
+    "test": "vitest run",
+    "test:e2e": "node scripts/e2e-conversation-test.mjs",
+    "corpus:refresh": "tsx scripts/refresh-search-index.ts"
   },
   "dependencies": {
+    "@vercel/blob": "^2.8.0",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "latest",
@@ -35,6 +37,7 @@
     "jsdom": "latest",
     "prettier": "latest",
     "tailwindcss": "latest",
+    "tsx": "^4.23.13",
     "typescript": "latest",
     "vitest": "latest"
   },
