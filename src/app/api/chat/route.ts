@@ -2047,29 +2047,32 @@ export async function POST(request: NextRequest) {
       buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
-    const reuseInitialRetrieval = Boolean(exactTitleLock) || (!usedSemanticUnderstanding &&
-      !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage &&
+    const standaloneDeterministicQuery = !usedSemanticUnderstanding &&
+      !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage;
+    const reuseInitialRetrieval = Boolean(exactTitleLock) || (standaloneDeterministicQuery &&
       normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage));
-    const initialRetrievalPromise = retrieveFromIndex(
+    const initialRetrieval = await retrieveFromIndex(
       retrievalMessage,
       isNamedSuccessivePersonQuery ? "general" : intent,
       effectiveMessage,
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       understanding,
     );
-    const [initialRetrieval, literalRetrieval] = reuseInitialRetrieval
-      ? await initialRetrievalPromise.then((result) => [result, result] as const)
-      : await Promise.all([
-          initialRetrievalPromise,
-          retrieveFromIndex(
-            effectiveMessage,
-            isNamedSuccessivePersonQuery ? "general" : intent,
-            effectiveMessage,
-            shouldDeduplicate ? seenContentKeys : new Set<string>(),
-            literalUnderstanding,
-          ),
-        ]);
-    reusedInitialRetrievalForLiteral = reuseInitialRetrieval;
+    // For an independent deterministic question, a reliable first result is
+    // already grounded in the normalized retrieval plan. Reserve the costly
+    // literal whole-index fallback for an unresolved first pass; contextual
+    // and semantic turns retain the existing two-plan validation.
+    const canReuseReliableInitial = standaloneDeterministicQuery && initialRetrieval.reliableMatchFound;
+    const literalRetrieval = reuseInitialRetrieval || canReuseReliableInitial
+      ? initialRetrieval
+      : await retrieveFromIndex(
+          effectiveMessage,
+          isNamedSuccessivePersonQuery ? "general" : intent,
+          effectiveMessage,
+          shouldDeduplicate ? seenContentKeys : new Set<string>(),
+          literalUnderstanding,
+        );
+    reusedInitialRetrievalForLiteral = reuseInitialRetrieval || canReuseReliableInitial;
     let retrieval = initialRetrieval;
     const strongestByDocument = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
       const key = `${match.document.type}:${match.document.id}`;
