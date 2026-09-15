@@ -172,7 +172,7 @@ async function fetchPage(
     };
   } catch (error) {
     if (
-      attempt === 0 &&
+      attempt < 2 &&
       (!(error instanceof SuccessiveApiError) || error.kind !== "invalid")
     ) {
       return fetchPage(collection, page, params, attempt + 1);
@@ -181,8 +181,11 @@ async function fetchPage(
     if (error instanceof Error && error.name === "AbortError") {
       throw new SuccessiveApiError("WordPress request timed out", "timeout");
     }
+    const detail = error instanceof Error && error.message
+      ? `: ${error.message}`
+      : "";
     throw new SuccessiveApiError(
-      "Could not reach the Successive content service",
+      `Could not reach the Successive content service${detail}`,
       "unavailable",
     );
   } finally {
