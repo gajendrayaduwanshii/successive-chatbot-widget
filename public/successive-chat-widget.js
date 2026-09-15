@@ -133,6 +133,7 @@
     promptInputId: safeText(data.promptInputId, "", 100),
     promptTypingContentId: safeText(data.promptTypingContentId, "", 100),
     promptButtonId: safeText(data.promptButtonId, "", 100),
+    debugMetrics: bool(data.debugMetrics, false),
     containerId: safeText(data.containerId, "", 100),
   };
 
@@ -672,9 +673,11 @@
             : "long",
     });
     var startedAt = performance.now();
+    var requestHeaders = { "Content-Type": "application/json" };
+    if (config.debugMetrics) requestHeaders["X-Chat-Metrics"] = "true";
     fetch(config.apiUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: requestHeaders,
       body: JSON.stringify({
         message: message,
         history: requestHistory,
@@ -702,15 +705,35 @@
       }),
     })
       .then(function (response) {
+        var metricsHeader = response.headers && typeof response.headers.get === "function"
+          ? response.headers.get("X-Chat-Metrics")
+          : null;
         return response.json().then(function (json) {
           if (!response.ok || !json || !json.data)
             throw new Error(
               json?.error?.message || "I couldn’t complete that request.",
             );
-          return json.data;
+          return { data: json.data, metrics: metricsHeader };
         });
       })
-      .then(function (response) {
+      .then(function (result) {
+        var response = result.data;
+        if (config.debugMetrics) {
+          var metrics;
+          try { metrics = result.metrics ? JSON.parse(result.metrics) : null; } catch (_) { metrics = null; }
+          var clientTotalDurationMs = Math.round(performance.now() - startedAt);
+          var applicationDurationMs = metrics
+            ? Math.max(0, metrics.totalDurationMs - metrics.understandingDurationMs - metrics.finalLlmDurationMs)
+            : null;
+          console.info("successive_chat_metrics", {
+            clientTotalDurationMs: clientTotalDurationMs,
+            applicationDurationMs: applicationDurationMs,
+            browserNetworkOverheadMs: metrics
+              ? Math.max(0, clientTotalDurationMs - metrics.totalDurationMs)
+              : null,
+            server: metrics || "The API did not include server timings.",
+          });
+        }
         var assistantMessage = {
           role: "assistant",
           content: response.answer,

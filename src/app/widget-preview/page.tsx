@@ -78,6 +78,7 @@ export default function WidgetPreview() {
   data-open-by-default="${openDefault}"
   data-prompt-input-id="${promptInputId}"
   data-prompt-button-id="${promptButtonId}"
+  data-debug-metrics="true"
   defer
 ></script>`;
   const copy = async () => {

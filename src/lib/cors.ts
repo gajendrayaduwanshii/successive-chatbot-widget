@@ -20,7 +20,7 @@ export function corsHeaders(origin: string | null) {
     allowed.includes(normalizedOrigin);
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Chat-Metrics",
     Vary: "Origin",
   };
   if (normalizedOrigin && isAllowed)

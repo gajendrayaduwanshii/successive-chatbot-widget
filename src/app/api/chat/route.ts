@@ -2845,23 +2845,38 @@ export async function POST(request: NextRequest) {
       confidence: topScore >= 100 ? "high" : "medium",
       insufficientContext: false,
     };
-    if (process.env.NODE_ENV !== "production") {
-      console.info("chat_request_metrics", {
-        totalDurationMs: Math.round(performance.now() - requestStartedAt),
-        understandingDurationMs: Math.round(understandingDurationMs),
-        retrievalDurationMs: Math.round(retrievalDurationMs),
-        relationshipScoringDurationMs: retrieval.timings?.relationshipScoringMs ?? 0,
-        rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
-        contextConstructionDurationMs: Math.round(contextConstructionDurationMs),
-        finalLlmDurationMs: Math.round(finalLlmDurationMs),
-        wordpress: getContentLoadDiagnostics(),
-        index: getIndexDiagnostics(),
-        selectedDocuments: selectedMatches.length,
-      });
+    const totalDurationMs = Math.round(performance.now() - requestStartedAt);
+    const roundedUnderstandingDurationMs = Math.round(understandingDurationMs);
+    const roundedFinalLlmDurationMs = Math.round(finalLlmDurationMs);
+    const chatMetrics = {
+      totalDurationMs,
+      applicationDurationMs: Math.max(
+        0,
+        totalDurationMs - roundedUnderstandingDurationMs - roundedFinalLlmDurationMs,
+      ),
+      understandingDurationMs: roundedUnderstandingDurationMs,
+      retrievalDurationMs: Math.round(retrievalDurationMs),
+      relationshipScoringDurationMs: retrieval.timings?.relationshipScoringMs ?? 0,
+      rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
+      contextConstructionDurationMs: Math.round(contextConstructionDurationMs),
+      finalLlmDurationMs: roundedFinalLlmDurationMs,
+      wordpress: getContentLoadDiagnostics(),
+      index: getIndexDiagnostics(),
+      selectedDocuments: selectedMatches.length,
+    };
+    const metricsRequested = request.headers.get("x-chat-metrics") === "true";
+    if (process.env.NODE_ENV !== "production" || metricsRequested) {
+      console.info("chat_request_metrics", chatMetrics);
     }
+    const metricsHeaders: Record<string, string> = metricsRequested
+      ? {
+          "Access-Control-Expose-Headers": "X-Chat-Metrics",
+          "X-Chat-Metrics": JSON.stringify(chatMetrics),
+        }
+      : {};
     return NextResponse.json(
       { success: true, data: response },
-      { headers: { ...cors.headers, "Cache-Control": "no-store" } },
+      { headers: { ...cors.headers, ...metricsHeaders, "Cache-Control": "no-store" } },
     );
   } catch {
     return error(
