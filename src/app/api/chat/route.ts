@@ -31,6 +31,7 @@ import {
   isBroadAiServicesQuery,
   isUseCaseQuery,
   getIndexDiagnostics,
+  getIndexLoadTrace,
   preparedIdentityCandidates,
   isExplicitRequestedRoleRelation,
   extractExplicitInformationalSubject,
@@ -577,6 +578,10 @@ export async function POST(request: NextRequest) {
   appTrace.title.indexLoadMs = titleResolutionTimings.corpusLookupMs;
   appTrace.title.identityLookupMs = titleResolutionTimings.corpusLookupMs;
   appTrace.title.structuredFallbackNetworkMs = titleResolutionTimings.structuredFallbackMs;
+  const indexLoadTrace = getIndexLoadTrace();
+  appTrace.title.persistedReadMs = indexLoadTrace.persistedReadMs;
+  appTrace.title.jsonParseMs = indexLoadTrace.jsonParseMs;
+  appTrace.title.hydrationMs = indexLoadTrace.preparedIdentityHydrationMs;
   const intentFacetCollectionEndedAt = performance.now();
   appTrace.pre.intentFacetCollectionMs = intentFacetCollectionEndedAt - intentFacetCollectionStartedAt - appTrace.title.titleResolutionTotalMs;
   if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
@@ -2143,10 +2148,11 @@ export async function POST(request: NextRequest) {
           literalUnderstanding,
         );
     appTrace.literalRetrieval.secondRetrievalMs = shouldReuseLiteral ? 0 : performance.now() - literalRetrievalStartedAt;
-    appTrace.literalRetrieval.candidateCount = literalRetrieval.candidates?.length ?? 0;
-    appTrace.literalRetrieval.rankedDocumentCount = literalRetrieval.candidates?.length ?? 0;
+    appTrace.literalRetrieval.candidateLookupMs = literalRetrieval.timings?.candidateLookupMs ?? 0;
+    appTrace.literalRetrieval.candidateCount = literalRetrieval.timings?.candidateCount ?? 0;
+    appTrace.literalRetrieval.rankedDocumentCount = literalRetrieval.timings?.rankedDocumentCount ?? 0;
     appTrace.literalRetrieval.rankingMs = literalRetrieval.timings?.rankingMs ?? 0;
-    appTrace.literalRetrieval.fullFallbackUsed = !shouldReuseLiteral && (literalRetrieval.candidates?.length ?? 0) >= literalRetrieval.indexedDocuments;
+    appTrace.literalRetrieval.fullFallbackUsed = literalRetrieval.timings?.fullIndexUsed ?? false;
     appTrace.literalRetrieval.fullFallbackDocumentCount = appTrace.literalRetrieval.fullFallbackUsed ? literalRetrieval.indexedDocuments : 0;
     reusedInitialRetrievalForLiteral = shouldReuseLiteral;
     let retrieval = initialRetrieval;

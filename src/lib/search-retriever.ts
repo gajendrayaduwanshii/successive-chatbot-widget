@@ -103,6 +103,11 @@ let cachedIndex:
   { expiresAt: number; documents: SuccessiveSearchDocument[] } | undefined;
 let indexBuildPromise: Promise<SuccessiveSearchDocument[]> | undefined;
 let lastIndexDiagnostics = { cache: "miss" as "hit" | "miss" | "shared", durationMs: 0, documents: 0 };
+let lastIndexLoadTrace = {
+  persistedReadMs: 0, blobFetchMs: 0, jsonParseMs: 0,
+  preparedIdentityHydrationMs: 0, candidateLookupHydrationMs: 0,
+  documentPreparationMs: 0, cacheStoreMs: 0, totalMs: 0,
+};
 
 type LocalPersistedSearchIndex = {
   loadedAt?: number;
@@ -116,7 +121,12 @@ async function readPersistedIndex(): Promise<{
 } | undefined> {
   if (process.env.NODE_ENV === "test") return undefined;
   try {
-    const parsed = JSON.parse(await readFile(PERSISTED_INDEX_PATH, "utf8")) as LocalPersistedSearchIndex;
+    const readStartedAt = performance.now();
+    const serialized = await readFile(PERSISTED_INDEX_PATH, "utf8");
+    lastIndexLoadTrace.persistedReadMs = performance.now() - readStartedAt;
+    const parseStartedAt = performance.now();
+    const parsed = JSON.parse(serialized) as LocalPersistedSearchIndex;
+    lastIndexLoadTrace.jsonParseMs = performance.now() - parseStartedAt;
     if (!parsed.loadedAt || !Array.isArray(parsed.documents) ||
         Date.now() - parsed.loadedAt >= INDEX_CACHE_MS)
       return undefined;
@@ -158,6 +168,10 @@ export async function storeRefreshedSearchIndex(
 
 export function getIndexDiagnostics() {
   return { ...lastIndexDiagnostics };
+}
+
+export function getIndexLoadTrace() {
+  return { ...lastIndexLoadTrace };
 }
 
 export interface SearchMatch {
@@ -203,7 +217,12 @@ export interface RetrievalResult {
   collectionTotal?: number;
   collectionLabel?: string;
   candidates?: SearchMatch[];
-  timings?: { indexLoadMs: number; relationshipScoringMs: number; rankingMs: number };
+  timings?: {
+    indexLoadMs: number; relationshipScoringMs: number; rankingMs: number;
+    candidateLookupMs: number; candidateCount: number; eligibleFilterMs: number;
+    rankingPreparationMs: number; reliabilityMs: number; rankedDocumentCount: number;
+    fullIndexUsed: boolean;
+  };
 }
 
 function requestedRoleRepresentationTier(
@@ -1559,8 +1578,12 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
   }
   const persisted = await readPersistedIndex();
   if (persisted?.documents.length) {
+    const hydrateStartedAt = performance.now();
     cachedIndex = { documents: persisted.documents, expiresAt: Date.now() + INDEX_CACHE_MS };
     prewarmSearchIndexDerivedData(persisted.documents, persisted.preparedIdentityIndex);
+    lastIndexLoadTrace.preparedIdentityHydrationMs = performance.now() - hydrateStartedAt;
+    lastIndexLoadTrace.candidateLookupHydrationMs = lastIndexLoadTrace.preparedIdentityHydrationMs;
+    lastIndexLoadTrace.totalMs = lastIndexLoadTrace.persistedReadMs + lastIndexLoadTrace.jsonParseMs + lastIndexLoadTrace.preparedIdentityHydrationMs;
     lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.documents.length };
     return persisted.documents;
   }
@@ -2122,6 +2145,9 @@ export async function retrieveFromIndex(
   const retrievalStartedAt = performance.now();
   const baseIndex = await loadSearchIndex();
   const indexLoadedAt = performance.now();
+  let candidateLookupMs = 0;
+  let eligibleFilterMs = 0;
+  let rankingPreparationMs = 0;
   const normalizedQuery = correctMinorTyposFromIndex(normalizeQuery(query), baseIndex);
   const interpretedIntent: Intent | undefined =
     understanding?.requestedContentType === "case-study" || understanding?.intent === "evidence"
@@ -2696,6 +2722,7 @@ export async function retrieveFromIndex(
       isProductList,
     };
   }
+  const eligibleFilterStartedAt = performance.now();
   let categoryIndex = index.filter((document) => {
     if (understanding?.requestedContentType &&
         !canonicalPageMatch(document, currentMessage) &&
@@ -2782,6 +2809,8 @@ export async function retrieveFromIndex(
     }
     return true;
   });
+  eligibleFilterMs = performance.now() - eligibleFilterStartedAt;
+  const candidateLookupStartedAt = performance.now();
   const candidateTerms = normalizeSearchText(`${query} ${currentMessage}`).split(" ")
     .filter((term) => term.length >= 4 && !STOPWORDS.has(term));
   const candidateCounts = new Map<SuccessiveSearchDocument, number>();
@@ -2797,7 +2826,9 @@ export async function retrieveFromIndex(
     if (narrowed.length > 0 && narrowed.length < categoryIndex.length)
       categoryIndex = narrowed;
   }
+  candidateLookupMs = performance.now() - candidateLookupStartedAt;
   const candidateLookupUsed = categoryIndex.length < index.length && candidateCounts.size > 0;
+  const rankingPreparationStartedAt = performance.now();
   const idf = categoryIndex.length === index.length
     ? fullIndexInverseDocumentFrequency(index)
     : buildInverseDocumentFrequency(categoryIndex);
@@ -2829,6 +2860,7 @@ export async function retrieveFromIndex(
         .slice(0, 10)
     : [];
   if (!scoringPlans.length) scoringPlans.push(scoringQuery);
+  rankingPreparationMs = performance.now() - rankingPreparationStartedAt;
   const evaluatedCandidates = categoryIndex
     .map((document) => {
       const alternatives = scoringPlans.map((plan, planIndex) => ({
@@ -2935,10 +2967,13 @@ export async function retrieveFromIndex(
     .slice(0, 5);
   if (candidateLookupUsed && !matches.length)
     return retrieveFromIndex(query, currentIntent, currentMessage, excludedContent, understanding, false);
+  const reliabilityStartedAt = performance.now();
+  const reliableMatchFound = matches.length > 0;
+  const reliabilityMs = performance.now() - reliabilityStartedAt;
   return {
     normalizedQuery,
     indexedDocuments: index.length,
-    reliableMatchFound: matches.length > 0,
+    reliableMatchFound,
     matches,
     isProductList,
     candidates: evaluatedCandidates.map((match) => ({
@@ -2960,6 +2995,13 @@ export async function retrieveFromIndex(
       indexLoadMs: Math.round((indexLoadedAt - retrievalStartedAt) * 100) / 100,
       relationshipScoringMs: Math.round((relationshipsScoredAt - indexLoadedAt) * 100) / 100,
       rankingMs: Math.round((performance.now() - relationshipsScoredAt) * 100) / 100,
+      candidateLookupMs: Math.round(candidateLookupMs * 100) / 100,
+      candidateCount: candidateCounts.size,
+      eligibleFilterMs: Math.round(eligibleFilterMs * 100) / 100,
+      rankingPreparationMs: Math.round(rankingPreparationMs * 100) / 100,
+      reliabilityMs: Math.round(reliabilityMs * 100) / 100,
+      rankedDocumentCount: evaluatedCandidates.length,
+      fullIndexUsed: categoryIndex.length === index.length,
     },
   };
 }
