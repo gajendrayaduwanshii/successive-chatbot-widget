@@ -31,6 +31,7 @@ import {
   isBroadAiServicesQuery,
   isUseCaseQuery,
   getIndexDiagnostics,
+  preparedIdentityCandidates,
   isExplicitRequestedRoleRelation,
   extractExplicitInformationalSubject,
   definitionEvidencePassages,
@@ -2798,7 +2799,20 @@ export async function POST(request: NextRequest) {
     const alignedMatches = [alignment.primary, ...alignment.related].filter(
       (match): match is SearchMatch => Boolean(match),
     );
-    const bodyLinkMatches = inlineLinkMatches(selectedMatches, await getResponseCorpus(), categoryAnswer);
+    const responseCorpus = await getResponseCorpus();
+    const bodyLinkCandidates = preparedIdentityCandidates(responseCorpus, categoryAnswer);
+    const navigationCandidates = alignment.primary
+      ? preparedIdentityCandidates(
+          responseCorpus,
+          `${alignment.primary.document.title} ${understanding.entities.join(" ")} ${understanding.topics.join(" ")}`,
+        )
+      : [];
+    const bodyLinkMatches = inlineLinkMatches(
+      selectedMatches,
+      responseCorpus,
+      categoryAnswer,
+      bodyLinkCandidates,
+    );
     const validatedBodyUrls = bodyLinkMatches.map(({ document }) => document.url);
     const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
       retainValidatedInlineLinks(categoryAnswer, validatedBodyUrls),
@@ -2852,12 +2866,13 @@ export async function POST(request: NextRequest) {
     const relatedEvidenceActions = alignment.primary
       ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
-          corpus: await getResponseCorpus(),
+          corpus: responseCorpus,
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           limit: 3,
         }) : buildGlobalRelatedContentActions({
           source: alignment.primary.document,
-          corpus: await getResponseCorpus(),
+          corpus: responseCorpus,
+          candidateCorpus: navigationCandidates,
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
           limit: 3,

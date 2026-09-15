@@ -456,7 +456,12 @@ function canonicalPageLabels(document: SuccessiveSearchDocument): string[] {
   return labels.filter((label) => label.length >= 3);
 }
 
-export function inlineLinkMatches(matches: SearchMatch[], corpus: SuccessiveSearchDocument[], answer: string): SearchMatch[] {
+export function inlineLinkMatches(
+  matches: SearchMatch[],
+  corpus: SuccessiveSearchDocument[],
+  answer: string,
+  preparedCandidates?: SuccessiveSearchDocument[],
+): SearchMatch[] {
   const evidence = matches.flatMap(({ document, localEvidence, selectedPassages, matchedFields }) =>
     localEvidence?.passages ?? (matchedFields.includes("exact-embedded-entity") || matchedFields.includes("embedded-structural-parent")
       ? selectedPassages : factualDocumentEvidence(document))).join(" ");
@@ -465,7 +470,10 @@ export function inlineLinkMatches(matches: SearchMatch[], corpus: SuccessiveSear
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}_-])${escaped}(?![\\p{L}\\p{N}_-])`, "iu");
     return pattern.test(answer) && pattern.test(evidence);
   };
-  const candidates = corpus.flatMap((document) => {
+  // Title and heading identity candidates come from the prepared search index.
+  // If there are no safe candidates, retain the established complete scan.
+  const searchableCorpus = preparedCandidates?.length ? preparedCandidates : corpus;
+  const candidates = searchableCorpus.flatMap((document) => {
     const labels = [document.title, ...canonicalPageLabels(document)].filter(visible);
     return labels.map((title) => ({ document, title, authority:
       normalizeSearchText(title) === normalizeSearchText(document.title) ? 3 :

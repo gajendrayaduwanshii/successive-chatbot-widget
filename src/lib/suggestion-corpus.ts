@@ -1,7 +1,7 @@
 import { fetchAllPublishedContent } from "./successive-api";
 import { buildSearchIndex, type SuccessiveSearchDocument } from "./search-index";
-import { storeRefreshedSearchIndex } from "./search-retriever";
-import { readPersistentSearchIndex, writePersistentSearchIndex } from "./persistent-search-index";
+import { getPreparedSearchCorpus, storeRefreshedSearchIndex } from "./search-retriever";
+import { writePersistentSearchIndex } from "./persistent-search-index";
 
 type SuggestionCorpusState = {
   cache?: { loadedAt: number; documents: SuccessiveSearchDocument[] };
@@ -19,18 +19,9 @@ export async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]>
   if (state.cache && Date.now() - state.cache.loadedAt < 60 * 60_000)
     return state.cache.documents;
   if (!state.build) {
-    state.build = readPersistentSearchIndex()
-      .then(async (persisted) => {
-        if (persisted?.documents.length) {
-          state.cache = { loadedAt: Date.now(), documents: persisted.documents };
-          await storeRefreshedSearchIndex(persisted.documents, persisted.preparedIdentityIndex);
-          return persisted.documents;
-        }
-        const items = await fetchAllPublishedContent();
-        const documents = buildSearchIndex(items);
+    state.build = getPreparedSearchCorpus()
+      .then((documents) => {
         state.cache = { loadedAt: Date.now(), documents };
-        await storeRefreshedSearchIndex(documents);
-        await writePersistentSearchIndex(documents);
         return documents;
       })
       .finally(() => { state.build = undefined; });
