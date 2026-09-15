@@ -14,6 +14,7 @@ The chatbot now uses a prepared JSON search index instead of downloading and ind
 
 ```text
 Hourly GitHub workflow
+  -> authenticated request to the deployed Vercel refresh route
   -> fetch complete WordPress content
   -> build the search index
   -> atomically replace private Blob JSON
@@ -32,8 +33,8 @@ If Blob is not configured or temporarily unavailable, the application preserves 
 - `src/lib/suggestion-corpus.ts`: reads Blob first; publishes a newly built corpus index to Blob.
 - `src/lib/search-retriever.ts`: uses the Blob index before rebuilding from WordPress.
 - `src/lib/successive-api.ts`: supports a forced refresh for scheduled rebuilds.
-- `scripts/refresh-search-index.ts`: builds and uploads the index outside a Vercel request.
-- `.github/workflows/refresh-search-index.yml`: runs the refresh hourly and can be run manually.
+- `src/app/api/internal/refresh-search-index/route.ts`: protected production refresh route.
+- `.github/workflows/refresh-search-index.yml`: invokes that route hourly and can be run manually.
 - `package.json`: adds `npm run corpus:refresh` and the required packages.
 
 ## Vercel setup
@@ -45,13 +46,14 @@ If Blob is not configured or temporarily unavailable, the application preserves 
 
 ## GitHub setup
 
-Add this repository secret:
+Create the same random value for `CRON_SECRET` in both locations:
 
-| Name | Value |
-| --- | --- |
-| `BLOB_READ_WRITE_TOKEN` | The read-write token for the connected private Vercel Blob store. |
+| Location | Name | Value |
+| --- | --- | --- |
+| Vercel project environment variables (Production) | `CRON_SECRET` | A new random secret chosen by you. |
+| GitHub repository Actions secrets | `CRON_SECRET` | The exact same value. |
 
-The workflow uses this secret only to write the refreshed private search-index file. It does not pull Vercel environment variables, which intentionally return `[SENSITIVE]` placeholders in GitHub Actions.
+The GitHub workflow does not receive `BLOB_READ_WRITE_TOKEN`. The deployed Vercel application already has that sensitive token and performs the private Blob write after validating `CRON_SECRET`.
 
 ## First production index
 
