@@ -4,6 +4,7 @@ import {
   fetchAllPublishedContent,
 } from "./successive-api";
 import { readPersistentSearchIndex } from "./persistent-search-index";
+import { hydratePreparedIdentityIndex, type PreparedIdentityIndex } from "./search-index-preparation";
 import { detectIntent, type Intent } from "./intent-detector";
 import { contentIdentity } from "./conversation-context";
 import {
@@ -128,11 +129,12 @@ async function persistIndex(documents: SuccessiveSearchDocument[]): Promise<void
 /** Updates the active and persisted index after a successful corpus warmup. */
 export async function storeRefreshedSearchIndex(
   documents: SuccessiveSearchDocument[],
+  preparedIdentityIndex?: PreparedIdentityIndex,
 ): Promise<void> {
   if (process.env.NODE_ENV === "test") return;
   cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
   lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: documents.length };
-  prewarmSearchIndexDerivedData(documents);
+  prewarmSearchIndexDerivedData(documents, preparedIdentityIndex);
   await persistIndex(documents);
 }
 
@@ -1487,9 +1489,18 @@ function fullIndexInverseDocumentFrequency(
 
 function prewarmSearchIndexDerivedData(
   documents: SuccessiveSearchDocument[],
+  preparedIdentityIndex?: PreparedIdentityIndex,
 ): void {
-  identityVocabulary(documents);
-  exactIdentityLookup(documents);
+  const hydrated = preparedIdentityIndex
+    ? hydratePreparedIdentityIndex(documents, preparedIdentityIndex)
+    : undefined;
+  if (hydrated) {
+    identityVocabularyCache.set(documents, hydrated.vocabulary);
+    exactIdentityLookupCache.set(documents, hydrated.exactIdentityLookup);
+  } else {
+    identityVocabulary(documents);
+    exactIdentityLookup(documents);
+  }
   fullIndexInverseDocumentFrequency(documents);
 }
 
@@ -1506,15 +1517,17 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
   const persisted = await readPersistedIndex();
   if (persisted?.length) {
     cachedIndex = { documents: persisted, expiresAt: Date.now() + INDEX_CACHE_MS };
+    prewarmSearchIndexDerivedData(persisted);
     lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: persisted.length };
     return persisted;
   }
   const shared = await readPersistentSearchIndex();
-  if (shared?.length) {
-    cachedIndex = { documents: shared, expiresAt: Date.now() + INDEX_CACHE_MS };
-    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: shared.length };
-    void persistIndex(shared);
-    return shared;
+  if (shared?.documents.length) {
+    cachedIndex = { documents: shared.documents, expiresAt: Date.now() + INDEX_CACHE_MS };
+    prewarmSearchIndexDerivedData(shared.documents, shared.preparedIdentityIndex);
+    lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: shared.documents.length };
+    void persistIndex(shared.documents);
+    return shared.documents;
   }
   if (indexBuildPromise) {
     lastIndexDiagnostics = { ...lastIndexDiagnostics, cache: "shared" };

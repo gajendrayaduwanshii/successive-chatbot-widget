@@ -21,10 +21,10 @@ export async function getSuggestionCorpus(): Promise<SuccessiveSearchDocument[]>
   if (!state.build) {
     state.build = readPersistentSearchIndex()
       .then(async (persisted) => {
-        if (persisted?.length) {
-          state.cache = { loadedAt: Date.now(), documents: persisted };
-          await storeRefreshedSearchIndex(persisted);
-          return persisted;
+        if (persisted?.documents.length) {
+          state.cache = { loadedAt: Date.now(), documents: persisted.documents };
+          await storeRefreshedSearchIndex(persisted.documents, persisted.preparedIdentityIndex);
+          return persisted.documents;
         }
         const items = await fetchAllPublishedContent();
         const documents = buildSearchIndex(items);

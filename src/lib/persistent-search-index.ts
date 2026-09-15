@@ -1,13 +1,15 @@
 import { get, put } from "@vercel/blob";
 import type { SuccessiveSearchDocument } from "./search-index";
+import { buildPreparedIdentityIndex, type PreparedIdentityIndex } from "./search-index-preparation";
 
 const BLOB_PATHNAME = "successive-chatbot/search-index.json";
-const INDEX_VERSION = 1;
+const INDEX_VERSION = 2;
 
-type PersistedIndex = {
+export type PersistedSearchIndex = {
   version: number;
   loadedAt: number;
   documents: SuccessiveSearchDocument[];
+  preparedIdentityIndex?: PreparedIdentityIndex;
 };
 
 function blobToken(): string | undefined {
@@ -19,17 +21,24 @@ function blobToken(): string | undefined {
  * back to .next/cache when Blob storage has not been configured.
  */
 export async function readPersistentSearchIndex(): Promise<
-  SuccessiveSearchDocument[] | undefined
+  PersistedSearchIndex | undefined
 > {
   const token = blobToken();
   if (!token) return undefined;
   try {
     const result = await get(BLOB_PATHNAME, { access: "private", token });
     if (!result || result.statusCode !== 200) return undefined;
-    const value = (await new Response(result.stream).json()) as Partial<PersistedIndex>;
-    if (value.version !== INDEX_VERSION || !Array.isArray(value.documents))
+    const value = (await new Response(result.stream).json()) as Partial<PersistedSearchIndex>;
+    if ((value.version !== 1 && value.version !== INDEX_VERSION) || !Array.isArray(value.documents))
       return undefined;
-    return value.documents;
+    return {
+      version: INDEX_VERSION,
+      loadedAt: typeof value.loadedAt === "number" ? value.loadedAt : Date.now(),
+      documents: value.documents,
+      preparedIdentityIndex: value.version === INDEX_VERSION
+        ? value.preparedIdentityIndex
+        : undefined,
+    };
   } catch {
     // Blob outages must not turn a valid on-demand corpus rebuild into an error.
     return undefined;
@@ -45,10 +54,11 @@ export async function writePersistentSearchIndex(
 ): Promise<void> {
   const token = blobToken();
   if (!token) return;
-  const body: PersistedIndex = {
+  const body: PersistedSearchIndex = {
     version: INDEX_VERSION,
     loadedAt: Date.now(),
     documents,
+    preparedIdentityIndex: buildPreparedIdentityIndex(documents),
   };
   await put(BLOB_PATHNAME, JSON.stringify(body), {
     access: "private",
