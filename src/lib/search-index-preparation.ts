@@ -3,6 +3,7 @@ import { normalizeSearchText, type SuccessiveSearchDocument } from "./search-ind
 export type PreparedIdentityIndex = {
   vocabulary: Array<[string, number]>;
   exactIdentityLookup: Array<[string, number[]]>;
+  candidateLookup: Array<[string, number[]]>;
 };
 
 /**
@@ -15,10 +16,17 @@ export function buildPreparedIdentityIndex(
 ): PreparedIdentityIndex {
   const vocabulary = new Map<string, number>();
   const exactIdentityLookup = new Map<string, number[]>();
+  const candidateLookup = new Map<string, number[]>();
   documents.forEach((document, documentIndex) => {
     const vocabularySource = `${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.headings.join(" ")}`;
     normalizeSearchText(vocabularySource).split(" ").filter((token) => token.length >= 5)
       .forEach((token) => vocabulary.set(token, (vocabulary.get(token) ?? 0) + 1));
+    normalizeSearchText(vocabularySource).split(" ").filter((token) => token.length >= 4)
+      .forEach((token) => {
+        const matches = candidateLookup.get(token) ?? [];
+        if (!matches.includes(documentIndex)) matches.push(documentIndex);
+        candidateLookup.set(token, matches);
+      });
     [document.normalizedTitle, normalizeSearchText(document.slug.replace(/-/g, " ")), ...document.aliases]
       .filter(Boolean)
       .forEach((identity) => {
@@ -30,6 +38,7 @@ export function buildPreparedIdentityIndex(
   return {
     vocabulary: [...vocabulary],
     exactIdentityLookup: [...exactIdentityLookup],
+    candidateLookup: [...candidateLookup],
   };
 }
 
