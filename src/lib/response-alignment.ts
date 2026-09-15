@@ -461,6 +461,7 @@ export function inlineLinkMatches(
   corpus: SuccessiveSearchDocument[],
   answer: string,
   preparedCandidates?: SuccessiveSearchDocument[],
+  allowFullFallback = true,
 ): SearchMatch[] {
   const evidence = matches.flatMap(({ document, localEvidence, selectedPassages, matchedFields }) =>
     localEvidence?.passages ?? (matchedFields.includes("exact-embedded-entity") || matchedFields.includes("embedded-structural-parent")
@@ -472,7 +473,9 @@ export function inlineLinkMatches(
   };
   // Title and heading identity candidates come from the prepared search index.
   // If there are no safe candidates, retain the established complete scan.
-  const searchableCorpus = preparedCandidates?.length ? preparedCandidates : corpus;
+  const searchableCorpus = preparedCandidates?.length
+    ? preparedCandidates
+    : allowFullFallback ? corpus : [];
   const candidates = searchableCorpus.flatMap((document) => {
     const labels = [document.title, ...canonicalPageLabels(document)].filter(visible);
     return labels.map((title) => ({ document, title, authority:

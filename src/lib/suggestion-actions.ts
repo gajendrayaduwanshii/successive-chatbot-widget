@@ -298,13 +298,14 @@ function relationStrength(source: SuccessiveSearchDocument, candidate: Successiv
  * Corpus-wide, content-first action discovery. Each action captures the exact
  * accepted result identities; the click path revalidates those same identities.
  */
-export function buildGlobalRelatedContentActions({ source, corpus, candidateCorpus, userSubject, recentActionIds = [], limit = 3 }: {
+export function buildGlobalRelatedContentActions({ source, corpus, candidateCorpus, userSubject, recentActionIds = [], limit = 3, allowFullFallback = true }: {
   source: SuccessiveSearchDocument;
   corpus: SuccessiveSearchDocument[];
   candidateCorpus?: SuccessiveSearchDocument[];
   userSubject?: string;
   recentActionIds?: string[];
   limit?: number;
+  allowFullFallback?: boolean;
 }): SuggestionAction[] {
   const recent = new Set(recentActionIds);
   const groups = new Map<SuccessiveSearchDocument["role"], Array<{ document: SuccessiveSearchDocument; score: number }>>();
@@ -342,7 +343,7 @@ export function buildGlobalRelatedContentActions({ source, corpus, candidateCorp
     .slice(0, limit);
   // A narrowed identity pool is an optimization only. If it cannot produce
   // navigation, preserve the established full-corpus fallback and quality.
-  if (candidateCorpus?.length && candidateCorpus.length < corpus.length && !actions.length)
+  if (allowFullFallback && candidateCorpus?.length && candidateCorpus.length < corpus.length && !actions.length)
     return buildGlobalRelatedContentActions({ source, corpus, userSubject, recentActionIds, limit });
   return actions;
 }

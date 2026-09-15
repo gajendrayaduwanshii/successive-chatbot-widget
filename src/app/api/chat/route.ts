@@ -2112,10 +2112,12 @@ export async function POST(request: NextRequest) {
       buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
-    const standaloneDeterministicQuery = !usedSemanticUnderstanding &&
-      !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage;
-    const reuseInitialRetrieval = Boolean(exactTitleLock) || (standaloneDeterministicQuery &&
-      normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage));
+    const equivalentRetrievalInput =
+      normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage);
+    // Query equivalence is independent of whether semantic understanding was
+    // used. When both passes rank the identical input, a second full-index
+    // scan cannot add literal evidence or alter the eligible document scope.
+    const reuseInitialRetrieval = Boolean(exactTitleLock) || equivalentRetrievalInput;
     const initialRetrievalStartedAt = performance.now();
     const initialRetrieval = await retrieveFromIndex(
       retrievalMessage,
@@ -2887,6 +2889,7 @@ export async function POST(request: NextRequest) {
       responseCorpus,
       categoryAnswer,
       bodyLinkCandidates,
+      false,
     );
     const validatedBodyUrls = bodyLinkMatches.map(({ document }) => document.url);
     const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
@@ -2951,6 +2954,7 @@ export async function POST(request: NextRequest) {
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
           limit: 3,
+          allowFullFallback: false,
         })
       : [];
     const suggestionActions = relatedEvidenceActions
