@@ -13,12 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run corpus:refresh
+      - name: Request the protected Vercel refresh route
+        run: >-
+          curl --fail-with-body --retry 2 --retry-delay 5
+          --request POST
+          --header "Authorization: Bearer $CRON_SECRET"
+          https://successive-chatbot-widget.vercel.app/api/internal/refresh-search-index
         env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
