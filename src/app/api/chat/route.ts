@@ -339,6 +339,7 @@ export async function POST(request: NextRequest) {
   let finalLlmDurationMs = 0;
   let contextConstructionDurationMs = 0;
   let preRetrievalApplicationDurationMs = 0;
+  let reusedInitialRetrievalForLiteral = false;
   const origin = request.headers.get("origin");
   const cors = corsHeaders(origin);
   const isSameOrigin = origin === new URL(request.url).origin;
@@ -2039,30 +2040,37 @@ export async function POST(request: NextRequest) {
     );
     const retrievalStartedAt = performance.now();
     // Semantic expansion can occasionally over-constrain a short, valid
-    // visitor query. Always run a deterministic literal plan against the same
-    // cached corpus and merge it, making cold/warm answers independent of a
-    // single interpretation without adding another WordPress request. The two
-    // plans do not depend on one another, so run them concurrently.
+    // visitor query. A literal plan protects that case. For a standalone
+    // deterministic query whose normalized plan is already identical, reusing
+    // the first result preserves the same evidence while avoiding an identical
+    // full-index scan.
     const literalUnderstanding = applyStructuralBroadQueryRules(
       buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
-    const [initialRetrieval, literalRetrieval] = await Promise.all([
-      retrieveFromIndex(
-        retrievalMessage,
-        isNamedSuccessivePersonQuery ? "general" : intent,
-        effectiveMessage,
-        shouldDeduplicate ? seenContentKeys : new Set<string>(),
-        understanding,
-      ),
-      retrieveFromIndex(
-        effectiveMessage,
-        isNamedSuccessivePersonQuery ? "general" : intent,
-        effectiveMessage,
-        shouldDeduplicate ? seenContentKeys : new Set<string>(),
-        literalUnderstanding,
-      ),
-    ]);
+    const reuseInitialRetrieval = !usedSemanticUnderstanding &&
+      !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage &&
+      normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage);
+    const initialRetrievalPromise = retrieveFromIndex(
+      retrievalMessage,
+      isNamedSuccessivePersonQuery ? "general" : intent,
+      effectiveMessage,
+      shouldDeduplicate ? seenContentKeys : new Set<string>(),
+      understanding,
+    );
+    const [initialRetrieval, literalRetrieval] = reuseInitialRetrieval
+      ? await initialRetrievalPromise.then((result) => [result, result] as const)
+      : await Promise.all([
+          initialRetrievalPromise,
+          retrieveFromIndex(
+            effectiveMessage,
+            isNamedSuccessivePersonQuery ? "general" : intent,
+            effectiveMessage,
+            shouldDeduplicate ? seenContentKeys : new Set<string>(),
+            literalUnderstanding,
+          ),
+        ]);
+    reusedInitialRetrievalForLiteral = reuseInitialRetrieval;
     let retrieval = initialRetrieval;
     const strongestByDocument = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
       const key = `${match.document.type}:${match.document.id}`;
@@ -2892,6 +2900,7 @@ export async function POST(request: NextRequest) {
       totalDurationMs,
       applicationDurationMs,
       preRetrievalApplicationDurationMs: roundedPreRetrievalApplicationDurationMs,
+      reusedInitialRetrievalForLiteral,
       titleResolutionCorpusLookupMs: Math.round(titleResolutionTimings.corpusLookupMs),
       titleResolutionStructuredFallbackMs: Math.round(titleResolutionTimings.structuredFallbackMs),
       understandingDurationMs: roundedUnderstandingDurationMs,
