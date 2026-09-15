@@ -4,6 +4,10 @@ export interface HistoryMessage {
   role: ChatRole;
   content: string;
 }
+export interface SeenContent {
+  title: string;
+  url: string;
+}
 export interface ChatMessage {
   id: string;
   role: ChatRole;

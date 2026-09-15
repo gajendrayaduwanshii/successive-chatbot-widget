@@ -6,6 +6,7 @@ import {
 import { getEnv } from "./env";
 import { htmlToParagraphs, htmlToText, safeHttpUrl } from "./html-utils";
 import type { WordPressItem } from "@/types/wordpress";
+import { extractServiceType } from "./content-normalizer";
 
 export interface SuccessiveSearchChunk {
   id: string;
@@ -24,14 +25,74 @@ export interface SuccessiveSearchDocument {
   headings: string[];
   descriptions: string[];
   faqItems: Array<{ question: string; answer: string }>;
+  structuredFields: import("./acf-extractor").StructuredAcfField[];
+  structuredLinks: Array<{ title?: string; url: string; path: string }>;
+  /** Authored page/post body, separate from recursively flattened ACF fields. */
+  editorTextSegments?: string[];
   textSegments: string[];
   chunks: SuccessiveSearchChunk[];
   combinedText: string;
+  internalLinks: string[];
   url: string;
   image?: string;
   modified?: string;
+  parentId?: number;
+  menuOrder?: number;
+  taxonomyTerms: string[];
+  sectionKey?: string;
   contentQuality: number;
   productLike: boolean;
+  service_type?: string;
+  role:
+    | "company"
+    | "global_capabilities"
+    | "culture"
+    | "careers"
+    | "awards"
+    | "partners"
+    | "service"
+    | "technology"
+    | "industry"
+    | "partner"
+    | "case_study"
+    | "blog"
+    | "press_release"
+    | "resource"
+    | "editorial"
+    | "career"
+    | "job_listing"
+    | "product"
+    | "accelerator"
+    | "leadership"
+    | "location"
+    | "event"
+    | "webinar"
+    | "whitepaper"
+    | "report"
+    | "media"
+    | "contact"
+    | "page";
+  capabilityProfile: {
+    identityTerms: string[];
+    problemTerms: string[];
+    outcomeTerms: string[];
+    technologyTerms: string[];
+    businessFunctionTerms: string[];
+    industryTerms: string[];
+    activityTerms: string[];
+  };
+  relatedCapabilities: Array<{
+    documentId: number;
+    score: number;
+    evidence: Array<"explicit-reference" | "internal-link" | "phrase" | "technology" | "problem-outcome" | "taxonomy" | "distinctive-concepts">;
+  }>;
+  topicProfile: {
+    titleTerms: string[];
+    headingTerms: string[];
+    metadataTerms: string[];
+    primaryTopics: string[];
+    secondaryTopics: string[];
+  };
 }
 
 const rendered = (value: WordPressItem["title"] | WordPressItem["content"]) =>
@@ -39,13 +100,204 @@ const rendered = (value: WordPressItem["title"] | WordPressItem["content"]) =>
 
 const CHUNK_TARGET_CHARS = 1800;
 const CHUNK_OVERLAP_CHARS = 320;
+const PROFILE_STOPWORDS = new Set([
+  "successive", "digital", "service", "services", "solution", "solutions",
+  "company", "business", "technology", "technologies", "help", "using", "use",
+  "new", "best", "more", "with", "from", "into", "your", "their", "about",
+  "page", "learn", "read", "explore", "overview", "approach", "provide",
+  "of", "to", "in", "on", "an", "as", "at", "by", "or", "and", "the",
+]);
+const GENERIC_RELATION_TERMS = new Set([
+  ...PROFILE_STOPWORDS,
+  "growth", "operations", "operation", "platform", "performance",
+  "development", "management", "process", "system", "systems", "data",
+  "application", "applications", "experience", "enterprise", "modern",
+  "improve", "support", "team", "teams", "work", "value", "customer",
+]);
+
+function profileTerms(value: string): string[] {
+  return normalizeSearchText(value)
+    .split(" ")
+    .filter((term) => term.length > 1 && !PROFILE_STOPWORDS.has(term));
+}
+
+function buildTopicProfile(
+  title: string,
+  slug: string,
+  headings: string[],
+  aliases: string[],
+  serviceType: string | undefined,
+) {
+  const titleTerms = [...new Set(profileTerms(title))];
+  const headingTerms = [...new Set(headings.flatMap(profileTerms))];
+  const metadataTerms = [
+    ...new Set(profileTerms(`${slug.replace(/-/g, " ")} ${aliases.join(" ")} ${serviceType ?? ""}`)),
+  ];
+  const authority = new Map<string, number>();
+  titleTerms.forEach((term) => authority.set(term, (authority.get(term) ?? 0) + 5));
+  metadataTerms.forEach((term) => authority.set(term, (authority.get(term) ?? 0) + 3));
+  headingTerms.forEach((term) => authority.set(term, (authority.get(term) ?? 0) + 2));
+  const ranked = [...authority]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([term]) => term);
+  return {
+    titleTerms,
+    headingTerms,
+    metadataTerms,
+    primaryTopics: ranked.slice(0, 8),
+    secondaryTopics: ranked.slice(8, 24),
+  };
+}
 
 export function normalizeSearchText(value: string): string {
   return htmlToText(value)
+    .normalize("NFKD")
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/&/g, " and ")
     .toLowerCase()
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Presentation blocks remain available for links and CTAs, but are not factual answer evidence. */
+export function isPresentationStructuredPath(path: string): boolean {
+  const segments = path.toLowerCase().replace(/\[\d+\]/g, "").split(/[._-]+/).filter(Boolean);
+  return segments.some((segment) => [
+    "cta", "button", "banner", "footer", "navigation", "nav", "contact", "form", "leadmagnet",
+  ].includes(segment));
+}
+
+/** Authored body plus non-presentation structured fields for factual composition. */
+export function factualDocumentEvidence(document: Pick<SuccessiveSearchDocument, "editorTextSegments" | "structuredFields" | "textSegments">): string[] {
+  const factual = deduplicateSegments([
+    ...(document.editorTextSegments ?? []),
+    ...document.structuredFields
+      .filter((field) => field.kind === "text" && !isPresentationStructuredPath(field.path))
+      .map((field) => field.value),
+  ]);
+  // Legacy/test documents without source-path provenance retain their existing
+  // content; production documents have authored/structured provenance.
+  return factual.length ? factual : document.textSegments;
+}
+
+export type ServiceSchemaType = "service" | "sub-service" | "expertise" | "pillar";
+
+/** One source-schema vocabulary for every service-family eligibility gate. */
+export function normalizeServiceSchemaType(value: string | undefined): ServiceSchemaType | null {
+  const normalized = normalizeSearchText(value ?? "").replace(/\s+/g, "-");
+  if (normalized === "piller") return "pillar";
+  if (["service", "sub-service", "expertise", "pillar"].includes(normalized))
+    return normalized as ServiceSchemaType;
+  return null;
+}
+
+export function isServiceFamilySchemaType(value: string | undefined): boolean {
+  return normalizeServiceSchemaType(value) !== null;
+}
+
+/** Maps a source subtype to the public portfolio taxonomy without losing its display subtype. */
+export function servicePortfolioTaxonomyType(value: string | undefined): "service" | "expertise" | "pillar" | null {
+  const normalized = normalizeServiceSchemaType(value);
+  return normalized === "sub-service" ? "service" : normalized;
+}
+
+function documentRole(item: WordPressItem, slug: string, serviceType?: string): SuccessiveSearchDocument["role"] {
+  const type = item.type ?? "page";
+  const identity = normalizeSearchText(`${typeof item.title === "string" ? item.title : item.title?.rendered ?? ""} ${slug}`);
+  const acf = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
+    ? item.acf as Record<string, unknown>
+    : {};
+  if (Array.isArray(acf.core_values) || Array.isArray(acf.executive_management)) return "company";
+  if (Array.isArray(acf.capabilities_categories)) return "global_capabilities";
+  if (Array.isArray(acf.partnerships_repeater)) return "partners";
+  if (Array.isArray(acf.advantage_slider)) return "careers";
+  // Current and future service landing pages may omit the legacy
+  // `service_type` field. Their structured offering collection is a stronger,
+  // topic-independent service signal than a page title convention.
+  if (Array.isArray(acf.services_repeater) && acf.services_repeater.length > 0) return "service";
+  if (slug === "our-culture") return "culture";
+  if (slug === "awards") return "awards";
+  if (slug === "contact") return "contact";
+  if (type.includes("case")) return "case_study";
+  if (type === "post") return "blog";
+  if (type.includes("accelerator")) return "accelerator";
+  if (type.includes("media")) return "media";
+  if (type.includes("whitepaper") || /\bwhitepaper\b/.test(identity)) return "whitepaper";
+  if (type.includes("webinar") || /\bwebinar\b/.test(identity)) return "webinar";
+  if (type.includes("event") || /\bevent\b/.test(identity)) return "event";
+  if (type.includes("report") || /\breport\b/.test(identity)) return "report";
+  if (type === "page" && /\b(?:partner|partnership|alliance)\b/.test(identity)) return "partner";
+  if (type === "press-release") return "press_release";
+  if (type === "product") return "product";
+  if (type === "award") return "awards";
+  if (type === "industries") return "industry";
+  if (type === "partners") return "partner";
+  if (/\b(?:leadership|executive|management team|board of directors)\b/.test(identity)) return "leadership";
+  if (/\b(?:location|office|headquarters|hq)\b/.test(identity)) return "location";
+  if (type === "careers" || slug === "careers") return "career";
+  if (["post", "thought-leadership", "employee-perspective", "press-release", "media-coverage"].includes(type))
+    return "editorial";
+  if (/whitepaper|ebook|webinar|event|resource/.test(`${type} ${slug}`)) return "resource";
+  if (isServiceFamilySchemaType(serviceType)) return "service";
+  if (["about", "about-us", "home"].includes(slug)) return "company";
+  return "page";
+}
+
+function capabilityProfile(
+  title: string,
+  slug: string,
+  headings: string[],
+  descriptions: string[],
+  serviceType?: string,
+) {
+  const identityTerms = [...new Set(profileTerms(`${title} ${slug.replace(/-/g, " ")} ${serviceType ?? ""} ${headings.slice(0, 8).join(" ")}`))];
+  const problemText = descriptions.filter((value) => /\b(?:challenge|problem|struggl|reduce|improve|moderniz|slow|cost|risk|manual|scale|secure|visibility|fragment|legacy|complex|inefficien)/i.test(value)).join(" ");
+  const outcomeText = descriptions.filter((value) => /\b(?:benefit|outcome|accelerat|optimi|automat|efficien|growth|performance|scalab|resilien|agility|experience|visibility|saving)/i.test(value)).join(" ");
+  return {
+    identityTerms,
+    problemTerms: [...new Set(profileTerms(problemText))].slice(0, 80),
+    outcomeTerms: [...new Set(profileTerms(outcomeText))].slice(0, 80),
+    technologyTerms: [],
+    businessFunctionTerms: [],
+    industryTerms: [],
+    activityTerms: [],
+  };
+}
+
+function structuredProfileTerms(item: WordPressItem) {
+  const result = {
+    identityTerms: [] as string[], problemTerms: [] as string[],
+    outcomeTerms: [] as string[], technologyTerms: [] as string[],
+    businessFunctionTerms: [] as string[], industryTerms: [] as string[],
+    activityTerms: [] as string[],
+  };
+  const visit = (value: unknown, key = "") => {
+    if (value == null || value === false || value === "") return;
+    if (typeof value === "string") {
+      if (/^(?:https?:|\d+$)/i.test(value.trim())) return;
+      const terms = profileTerms(value);
+      if (!terms.length) return;
+      if (/challenge|problem|pain|issue|gap|risk|constraint/i.test(key)) result.problemTerms.push(...terms);
+      if (/benefit|outcome|impact|result|value|advantage|goal/i.test(key)) result.outcomeTerms.push(...terms);
+      if (/technolog|platform|tool|stack|framework|integration/i.test(key)) result.technologyTerms.push(...terms);
+      if (/industry|sector|vertical|market/i.test(key)) result.industryTerms.push(...terms);
+      if (/function|operation|workflow|process|department|team/i.test(key)) result.businessFunctionTerms.push(...terms);
+      if (/solution|service|capabilit|implementation|approach|method|deliver|use.case/i.test(key)) result.activityTerms.push(...terms);
+      if (/title|heading|badge|meta|hero/i.test(key)) result.identityTerms.push(...terms);
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((child) => visit(child, key));
+    if (typeof value === "object")
+      Object.entries(value as Record<string, unknown>).forEach(([childKey, child]) => visit(child, childKey));
+  };
+  visit(item.acf);
+  return Object.fromEntries(
+    Object.entries(result).map(([key, terms]) => [key, [...new Set(terms)].slice(0, 120)]),
+  ) as typeof result;
 }
 
 function splitLongParagraph(value: string): string[] {
@@ -155,16 +407,60 @@ export function normalizeWordPressUrl(value: string): string {
   }
 }
 
+/**
+ * Keep only navigable, first-party destinations from authored content. Media
+ * paths and arbitrary ACF metadata are not resource relationships.
+ */
+function firstPartyContentPath(value: string): string | undefined {
+  try {
+    const publicSite = new URL(getEnv().SUCCESSIVE_PUBLIC_SITE_URL);
+    const target = new URL(value.replace(/&amp;/g, "&"), publicSite);
+    const sameHost = target.hostname === publicSite.hostname ||
+      target.hostname.replace(/^www\./, "") === publicSite.hostname.replace(/^www\./, "");
+    if (!sameHost) return undefined;
+    const path = target.pathname.replace(/\/$/, "");
+    if (!path || /^\/(?:wp-content|wp-includes)\b/i.test(path) ||
+        /\.(?:avif|gif|jpe?g|png|svg|webp|pdf|mp4|webm)$/i.test(path)) return undefined;
+    return path;
+  } catch {
+    return undefined;
+  }
+}
+
+function authoredInternalLinks(content: string, acfLinks: Array<{ url: string }>): string[] {
+  const contentUrls = [
+    ...(content.match(/\bhref\s*=\s*["']([^"']+)["']/gi) ?? [])
+      .map((attribute) => attribute.match(/["']([^"']+)["']/)?.[1] ?? ""),
+    ...(content.match(/https?:\/\/[^\s"'<>\\]+/gi) ?? []),
+  ];
+  return [...new Set([...contentUrls, ...acfLinks.map(({ url }) => url)]
+    .map(firstPartyContentPath)
+    .filter((path): path is string => Boolean(path)))];
+}
+
 export function buildSearchDocument(
   item: WordPressItem,
+  deepAnalysis = true,
 ): SuccessiveSearchDocument {
   const extracted = extractAcfContent(item.acf);
+  const acfSectionLabels = item.acf && typeof item.acf === "object" && !Array.isArray(item.acf)
+    ? Object.entries(item.acf).flatMap(([key, value]) => {
+        if (!Array.isArray(value) || value.length === 0) return [];
+        if (/^(?:image|logo|icon|video|gallery|slider|banner|cta|button)/i.test(key))
+          return [];
+        const label = key.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+        return label.length >= 3 ? [label] : [];
+      })
+    : [];
   const title = htmlToText(rendered(item.title)) || "Untitled";
   const editor = deduplicateSegments([
     ...htmlToParagraphs(rendered(item.excerpt)),
     ...htmlToParagraphs(rendered(item.content)),
   ]);
-  const headings = deduplicateSegments(extracted.headings);
+  const headings = deduplicateSegments([
+    ...acfSectionLabels,
+    ...extracted.headings,
+  ]);
   const descriptions = deduplicateSegments([
     ...editor,
     ...extracted.descriptions,
@@ -206,7 +502,12 @@ export function buildSearchDocument(
     )
     .map((token) => token[0])
     .join("");
-  const explicitAcronyms = [...headings, ...descriptions, ...textSegments]
+  const titleAcronyms = titleTokens.flatMap((_, start) =>
+    Array.from({ length: Math.min(5, titleTokens.length - start) - 1 }, (__, offset) =>
+      titleTokens.slice(start, start + offset + 2).map((token) => token[0]).join(""),
+    ),
+  ).filter((value) => value.length >= 3 && value.length <= 5);
+  const explicitAcronyms = headings
     .flatMap((text) => text.match(/\b[A-Z]{3,6}\b/g) ?? [])
     .filter((value) => !["FAQ", "HTML", "HTTPS"].includes(value));
   const aliases = deduplicateSegments([
@@ -215,6 +516,7 @@ export function buildSearchDocument(
     named ? `successive ${named}` : "",
     named ?? "",
     acronym.length >= 3 && acronym.length <= 6 ? acronym : "",
+    ...titleAcronyms,
     ...explicitAcronyms,
   ]).map(normalizeSearchText);
   const fieldNames =
@@ -224,15 +526,25 @@ export function buildSearchDocument(
   const combinedText = normalizeSearchText(
     [title, item.slug, ...headings, ...descriptions, ...textSegments].join(" "),
   );
+  // Structural navigation links remain necessary even when expensive semantic
+  // cross-document analysis is disabled for the full corpus.
+  const internalLinks = authoredInternalLinks(rendered(item.content), extracted.links);
   // Title/headings lead the first chunk, while every editor and recursive ACF
   // text segment remains searchable in the subsequent overlapping chunks.
   const chunks = buildSearchChunks(item.id, [
     title,
-    ...headings,
+    ...headings.map((heading) =>
+      heading.length < 20 && !/^[A-Z0-9]{2,6}$/.test(heading)
+        ? `Content section: ${heading}`
+        : heading,
+    ),
     ...textSegments,
   ]);
   const productLike =
     item.type === "product" ||
+    ((item.type === "press-release" || item.type === "media-coverage") &&
+      (/\b(?:launches?|unveils?|introduces?)\b/.test(normalizedTitle) ||
+        /\b(?:product|platform)\b/.test(combinedText))) ||
     (item.type === "page" &&
       (/product|platform/i.test(`${title} ${item.slug} ${fieldNames}`) ||
         /content intelligence platform/i.test(combinedText)));
@@ -248,6 +560,25 @@ export function buildSearchDocument(
     typeof item.featured_image === "string"
       ? item.featured_image
       : (item.featured_image?.url ?? item.featured_image?.source_url);
+  const serviceType = extractServiceType(item.acf);
+  const role = documentRole(item, item.slug ?? "", serviceType);
+  const taxonomyTerms = [...new Set([
+    ...(item.categories ?? []).map(String), ...(item.tags ?? []).map(String),
+    ...Object.entries(item.taxonomy ?? {}).flatMap(([name, values]) => [name, ...values.map(String)]),
+  ])];
+  const sectionKey = (() => {
+    try {
+      const parts = new URL(item.link ?? item.url ?? "").pathname.split("/").filter(Boolean);
+      return parts.length > 1 ? parts[0] : undefined;
+    } catch { return undefined; }
+  })();
+  const structured = deepAnalysis
+    ? structuredProfileTerms(item)
+    : {
+        identityTerms: [], problemTerms: [], outcomeTerms: [],
+        technologyTerms: [], businessFunctionTerms: [], industryTerms: [],
+        activityTerms: [],
+      };
   return {
     id: item.id,
     type: item.type ?? "page",
@@ -258,23 +589,222 @@ export function buildSearchDocument(
     headings,
     descriptions,
     faqItems: extracted.faqItems,
+    structuredFields: extracted.structuredFields,
+    structuredLinks: extracted.links,
+    editorTextSegments: editor,
     textSegments,
     chunks,
     combinedText,
+    internalLinks: [...new Set(internalLinks)],
     url: normalizeWordPressUrl(item.link ?? ""),
     image:
       normalizeWordPressUrl(featured ?? extracted.images[0]?.url ?? "") ||
       undefined,
-    modified: item.modified ?? item.date,
+    modified: item.date ?? item.modified,
+    parentId: typeof item.parent === "number" && item.parent > 0 ? item.parent : undefined,
+    menuOrder: typeof item.menu_order === "number" ? item.menu_order : undefined,
+    taxonomyTerms,
+    sectionKey,
     contentQuality,
     productLike,
+    service_type: serviceType,
+    role,
+    capabilityProfile: (() => {
+      const profile = deepAnalysis
+        ? capabilityProfile(
+            title,
+            item.slug ?? "",
+            headings,
+            descriptions,
+            serviceType,
+          )
+        : {
+            identityTerms: [...new Set(profileTerms(
+              `${title} ${(item.slug ?? "").replace(/-/g, " ")} ${serviceType ?? ""}`,
+            ))],
+            problemTerms: [], outcomeTerms: [], technologyTerms: [],
+            businessFunctionTerms: [], industryTerms: [], activityTerms: [],
+          };
+      return {
+        identityTerms: [...new Set([...profile.identityTerms, ...structured.identityTerms])],
+        problemTerms: [...new Set([...profile.problemTerms, ...structured.problemTerms])],
+        outcomeTerms: [...new Set([...profile.outcomeTerms, ...structured.outcomeTerms])],
+        technologyTerms: structured.technologyTerms,
+        businessFunctionTerms: structured.businessFunctionTerms,
+        industryTerms: structured.industryTerms,
+        activityTerms: structured.activityTerms,
+      };
+    })(),
+    relatedCapabilities: [],
+    topicProfile: buildTopicProfile(
+      title,
+      item.slug ?? "",
+      deepAnalysis ? headings : [],
+      deepAnalysis ? aliases : [],
+      serviceType,
+    ),
   };
 }
 
 export function buildSearchIndex(
   items: WordPressItem[],
 ): SuccessiveSearchDocument[] {
-  return items
-    .map(buildSearchDocument)
+  // Deep cross-document analysis is valuable for focused datasets, but doing
+  // it synchronously for the full WordPress corpus blocks the Node event loop.
+  const deepAnalysis = items.length <= 250;
+  const documents = items
+    .map((item) => buildSearchDocument(item, deepAnalysis))
     .filter((doc) => doc.url && doc.title !== "Untitled");
+  // Preserve authoritative outgoing WordPress/ACF links even for the full
+  // corpus. Semantic cross-document analysis is intentionally bounded, but a
+  // direct link from the exact base record is cheap structural evidence and
+  // must not disappear merely because the corpus exceeds the deep-analysis
+  // limit.
+  const attachStructuralRelations = () => {
+    const byPath = new Map(documents.map((document) => {
+      try { return [new URL(document.url).pathname.replace(/\/$/, ""), document] as const; }
+      catch { return ["", document] as const; }
+    }).filter(([path]) => path));
+    for (const document of documents) {
+      const linked = document.internalLinks
+        .map((path) => byPath.get(path.replace(/\/$/, "")))
+        .filter((candidate): candidate is SuccessiveSearchDocument => Boolean(candidate) && candidate!.id !== document.id);
+      const structural = [...new Map(linked.map((candidate) => [candidate.id, {
+        documentId: candidate.id,
+        score: 0.92,
+        evidence: ["internal-link" as const],
+      }])).values()];
+      document.relatedCapabilities = [...new Map([
+        ...document.relatedCapabilities,
+        ...structural,
+      ].map((relation) => [relation.documentId, relation])).values()];
+    }
+  };
+  if (!deepAnalysis) {
+    attachStructuralRelations();
+    return documents;
+  }
+  const services = documents.filter((document) => document.role === "service");
+  const meaningful = (terms: string[]) => new Set(
+    terms.filter((term) => term.length > 3 && !GENERIC_RELATION_TERMS.has(term)),
+  );
+  const phrases = (document: SuccessiveSearchDocument) => {
+    const source = normalizeSearchText([
+      document.title,
+      ...document.headings.slice(0, 10),
+      ...document.descriptions.slice(0, 12),
+    ].join(" ")).split(" ");
+    const result = new Set<string>();
+    for (const size of [2, 3]) {
+      for (let index = 0; index <= source.length - size; index++) {
+        const words = source.slice(index, index + size);
+        if (words.some((word) => GENERIC_RELATION_TERMS.has(word) || word.length < 3)) continue;
+        result.add(words.join(" "));
+      }
+    }
+    return result;
+  };
+  const serviceProfiles = new Map(services.map((service) => {
+    const problemOutcomeTerms = meaningful([
+      ...service.capabilityProfile.problemTerms,
+      ...service.capabilityProfile.outcomeTerms,
+    ]);
+    const taxonomyTerms = meaningful([
+      ...service.capabilityProfile.industryTerms,
+      ...service.capabilityProfile.businessFunctionTerms,
+    ]);
+    return [service.id, {
+      service,
+      phrases: phrases(service),
+      terms: meaningful([
+        ...service.capabilityProfile.identityTerms,
+        ...service.capabilityProfile.problemTerms,
+        ...service.capabilityProfile.outcomeTerms,
+        ...service.capabilityProfile.technologyTerms,
+        ...service.capabilityProfile.activityTerms,
+      ]),
+      technologyTerms: meaningful(service.capabilityProfile.technologyTerms),
+      problemOutcomeTerms,
+      taxonomyTerms,
+      identity: ` ${service.normalizedTitle} ${service.aliases.join(" ")} `,
+      path: normalizeSearchText(service.slug),
+    }];
+  }));
+  const servicesByTerm = new Map<string, Set<number>>();
+  serviceProfiles.forEach(({ terms }, serviceId) => {
+    terms.forEach((term) => {
+      const matches = servicesByTerm.get(term) ?? new Set<number>();
+      matches.add(serviceId);
+      servicesByTerm.set(term, matches);
+    });
+  });
+  for (const document of documents) {
+    if (document.role === "service") continue;
+    const evidenceTerms = meaningful([
+      ...document.capabilityProfile.identityTerms,
+      ...document.capabilityProfile.problemTerms,
+      ...document.capabilityProfile.outcomeTerms,
+      ...document.capabilityProfile.technologyTerms,
+      ...document.capabilityProfile.activityTerms,
+    ]);
+    const candidateIds = new Set<number>();
+    evidenceTerms.forEach((term) =>
+      servicesByTerm.get(term)?.forEach((serviceId) => candidateIds.add(serviceId)),
+    );
+    const documentPhrases = phrases(document);
+    const documentTechnologyTerms = meaningful(document.capabilityProfile.technologyTerms);
+    const documentProblemOutcomeTerms = meaningful([
+      ...document.capabilityProfile.problemTerms,
+      ...document.capabilityProfile.outcomeTerms,
+    ]);
+    const documentTaxonomyTerms = meaningful([
+      ...document.capabilityProfile.industryTerms,
+      ...document.capabilityProfile.businessFunctionTerms,
+    ]);
+    document.relatedCapabilities = [...candidateIds]
+      .map((serviceId) => serviceProfiles.get(serviceId)!)
+      .map(({ service, phrases: servicePhrases, terms: serviceTerms, technologyTerms, problemOutcomeTerms, taxonomyTerms, identity: serviceIdentity, path: servicePath }) => {
+        const evidence: SuccessiveSearchDocument["relatedCapabilities"][number]["evidence"] = [];
+        const documentIdentity = ` ${document.normalizedTitle} ${document.aliases.join(" ")} `;
+        const explicitReference = service.aliases.some((alias) => alias.split(" ").length >= 2 && document.combinedText.includes(alias));
+        if (explicitReference || documentIdentity.includes(` ${service.normalizedTitle} `)) evidence.push("explicit-reference");
+        const linked = document.internalLinks.some((link) => {
+          const normalizedLink = normalizeSearchText(link);
+          return normalizedLink === servicePath || normalizedLink.endsWith(` ${servicePath}`);
+        });
+        if (linked) evidence.push("internal-link");
+        const sharedPhrases = [...documentPhrases].filter((phrase) => servicePhrases.has(phrase));
+        if (sharedPhrases.length >= 2) evidence.push("phrase");
+        const technologyOverlap = [...documentTechnologyTerms]
+          .filter((term) => technologyTerms.has(term));
+        if (technologyOverlap.length && technologyOverlap.some((term) => serviceIdentity.includes(` ${term} `))) evidence.push("technology");
+        const problemOutcomeOverlap = [...documentProblemOutcomeTerms]
+          .filter((term) => problemOutcomeTerms.has(term));
+        if (problemOutcomeOverlap.length >= 3) evidence.push("problem-outcome");
+        const taxonomyOverlap = [...documentTaxonomyTerms]
+          .filter((term) => taxonomyTerms.has(term));
+        if (taxonomyOverlap.length >= 2) evidence.push("taxonomy");
+        const distinctiveOverlap = [...evidenceTerms].filter((term) => serviceTerms.has(term));
+        if (distinctiveOverlap.length >= 4) evidence.push("distinctive-concepts");
+        let score = 0;
+        if (evidence.includes("explicit-reference")) score += 0.48;
+        if (evidence.includes("internal-link")) score += 0.42;
+        if (evidence.includes("phrase")) score += Math.min(0.3, sharedPhrases.length * 0.06);
+        if (evidence.includes("technology")) score += 0.25;
+        if (evidence.includes("problem-outcome")) score += Math.min(0.22, problemOutcomeOverlap.length * 0.04);
+        if (evidence.includes("taxonomy")) score += 0.12;
+        if (evidence.includes("distinctive-concepts")) score += Math.min(0.16, distinctiveOverlap.length * 0.025);
+        return { documentId: service.id, score: Math.min(1, Math.round(score * 1000) / 1000), evidence };
+      })
+      .filter((relation) => relation.score >= 0.42 && (
+        relation.evidence.includes("explicit-reference") ||
+        relation.evidence.includes("internal-link") ||
+        relation.evidence.includes("technology") ||
+        relation.evidence.length >= 2
+      ))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+  }
+  attachStructuralRelations();
+  return documents;
 }

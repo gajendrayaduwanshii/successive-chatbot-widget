@@ -4,7 +4,11 @@ import { rankContent } from "./relevance-score";
 import { fetchAllPublishedContent } from "./successive-api";
 import type { NormalizedContent } from "@/types/wordpress";
 
-/** Retrieve and rank across every published Successive post, page and user. */
+/**
+ * @deprecated Compatibility helper for older callers/tests. `/api/chat` uses
+ * the profile-aware index in `search-retriever.ts`; do not add ranking logic
+ * here.
+ */
 export async function retrieveContent(query: string): Promise<{
   intent: ReturnType<typeof detectIntent>;
   items: NormalizedContent[];

@@ -1,0 +1,27 @@
+name: Refresh chatbot search index
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vercel env pull .env.local --environment=production --yes --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_LVDLYT5f1eq424CJGjc7Ut0R
+          VERCEL_PROJECT_ID: prj_eWPKTPyzWRyGrTvLnpbIsolkea0K
+      - run: npm run corpus:refresh

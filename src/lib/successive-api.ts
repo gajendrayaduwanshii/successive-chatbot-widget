@@ -1,6 +1,6 @@
-import { unstable_cache } from "next/cache";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { getEnv } from "./env";
-import { htmlToParagraphs } from "./html-utils";
 import type { WordPressItem } from "@/types/wordpress";
 
 export class SuccessiveApiError extends Error {
@@ -28,13 +28,108 @@ const CONTENT_COLLECTIONS = [
 ] as const;
 
 type Collection = (typeof CONTENT_COLLECTIONS)[number];
+// The API supports 100 items per page. A size of 10 multiplies cold-start
+// network requests and makes the first chat request appear to hang.
+const PAGE_SIZE = 100;
+const WORDPRESS_CONCURRENCY = 4;
+const CORPUS_TTL_MS = 60 * 60 * 1000;
+const CORPUS_STALE_MS = 2 * 60 * 60 * 1000;
+const CANONICAL_TTL_MS = 60 * 60 * 1000;
+const CANONICAL_STALE_MS = 2 * 60 * 60 * 1000;
+const PERSISTED_CORPUS_PATH = path.join(process.cwd(), ".next", "cache", "successive-corpus.json");
+
+export interface ContentLoadDiagnostics {
+  cache: "hit" | "miss" | "stale";
+  durationMs: number;
+  failedCollections: string[];
+  partial: boolean;
+  itemCount: number;
+}
+
+let corpusCache:
+  | { items: WordPressItem[]; loadedAt: number; diagnostics: ContentLoadDiagnostics }
+  | undefined;
+let corpusBuildPromise: Promise<WordPressItem[]> | undefined;
+const canonicalCache = new Map<string, { items: WordPressItem[]; loadedAt: number }>();
+const canonicalRequests = new Map<string, Promise<WordPressItem[]>>();
+let lastDiagnostics: ContentLoadDiagnostics = {
+  cache: "miss",
+  durationMs: 0,
+  failedCollections: [],
+  partial: false,
+  itemCount: 0,
+};
+
+async function readPersistedCorpus(): Promise<WordPressItem[] | undefined> {
+  if (process.env.NODE_ENV === "test") return undefined;
+  try {
+    const parsed = JSON.parse(await readFile(PERSISTED_CORPUS_PATH, "utf8")) as {
+      loadedAt?: number;
+      items?: WordPressItem[];
+    };
+    if (!parsed.loadedAt || !Array.isArray(parsed.items) ||
+        Date.now() - parsed.loadedAt >= CORPUS_TTL_MS)
+      return undefined;
+    return parsed.items;
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistCorpus(items: WordPressItem[]): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await mkdir(path.dirname(PERSISTED_CORPUS_PATH), { recursive: true });
+    await writeFile(PERSISTED_CORPUS_PATH, JSON.stringify({ loadedAt: Date.now(), items }));
+  } catch {
+    // A read-only deployment can still use the in-memory cache safely.
+  }
+}
+
+export function getContentLoadDiagnostics(): ContentLoadDiagnostics {
+  return { ...lastDiagnostics, failedCollections: [...lastDiagnostics.failedCollections] };
+}
+
+async function mapBounded<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(values.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < values.length) {
+      const index = cursor++;
+      try {
+        results[index] = { status: "fulfilled", value: await operation(values[index]!) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, worker),
+  );
+  return results;
+}
+
+const customContentType = (collection: Collection): string => {
+  if (collection === "posts") return "post";
+  if (collection === "pages") return "page";
+  return collection;
+};
 
 function endpoint(collection: Collection, params?: URLSearchParams): string {
   const base = getEnv().SUCCESSIVE_API_BASE_URL.replace(/\/$/, "");
   const query = new URLSearchParams(params);
-  query.set("per_page", query.get("per_page") ?? "100");
-  query.set("_embed", "1");
-  return `${base}/${collection}?${query}`;
+  const slug = query.get("slug");
+  if (collection === "pages" && slug) {
+    return `${base}/pages/${encodeURIComponent(slug)}`;
+  }
+  query.delete("slug");
+  query.set("type", customContentType(collection));
+  query.set("per_page", query.get("per_page") ?? String(PAGE_SIZE));
+  return `${base}/content?${query}`;
 }
 
 async function fetchPage(
@@ -50,7 +145,7 @@ async function fetchPage(
   try {
     const response = await fetch(endpoint(collection, query), {
       signal: controller.signal,
-      next: { revalidate: 300 },
+      next: { revalidate: 3600 },
       headers: { Accept: "application/json" },
     });
     if (!response.ok) {
@@ -60,14 +155,16 @@ async function fetchPage(
       );
     }
     const json: unknown = await response.json();
-    if (!Array.isArray(json)) {
+    const detailResponse = collection === "pages" && params.has("slug");
+    const items = detailResponse && json && !Array.isArray(json) ? [json] : json;
+    if (!Array.isArray(items)) {
       throw new SuccessiveApiError(
         `WordPress ${collection} endpoint returned invalid data`,
         "invalid",
       );
     }
     return {
-      items: json as WordPressItem[],
+      items: items as WordPressItem[],
       totalPages: Math.max(
         1,
         Number(response.headers.get("X-WP-TotalPages") ?? "1") || 1,
@@ -99,85 +196,48 @@ async function fetchCollection(
 ): Promise<WordPressItem[]> {
   const first = await fetchPage(collection, 1, params);
   if (first.totalPages <= 1) return first.items;
-  const rest = await Promise.all(
-    Array.from({ length: first.totalPages - 1 }, (_, index) =>
-      fetchPage(collection, index + 2, params),
+  const pages = Array.from({ length: first.totalPages - 1 }, (_, index) => index + 2);
+  const rest = await mapBounded(pages, WORDPRESS_CONCURRENCY, (page) =>
+    fetchPage(collection, page, params),
+  );
+  return [
+    ...first.items,
+    ...rest.flatMap((result) =>
+      result.status === "fulfilled" ? result.value.items : [],
     ),
-  );
-  return [...first.items, ...rest.flatMap(({ items }) => items)];
+  ];
 }
 
-const renderedContent = (item: WordPressItem): string =>
-  typeof item.content === "string"
-    ? item.content
-    : (item.content?.rendered ?? "");
-
-const readableContentLength = (item: WordPressItem): number =>
-  htmlToParagraphs(renderedContent(item)).join(" ").length;
-
-async function enrichRenderedContent(
-  item: WordPressItem,
-  attempt = 0,
-): Promise<WordPressItem> {
-  if (!item.link) return item;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
-  try {
-    const response = await fetch(item.link, {
-      signal: controller.signal,
-      next: { revalidate: 300 },
-      headers: {
-        Accept: "text/html",
-        "User-Agent": "Mozilla/5.0 SuccessiveAIContentIndexer/1.0",
-      },
-    });
-    if (!response.ok) {
-      return attempt === 0 ? enrichRenderedContent(item, 1) : item;
-    }
-    const html = await response.text();
-    const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1];
-    // A successful document without <main> uses a different template. Retrying
-    // the identical response cannot add that element, so retain its REST data.
-    if (!main) return item;
-    const contentOnly = main
-      .replace(
-        /<(?:form|nav|footer|aside|noscript|svg|dialog)\b[^>]*>[\s\S]*?<\/(?:form|nav|footer|aside|noscript|svg|dialog)>/gi,
-        " ",
-      )
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
-    const plainText = htmlToParagraphs(contentOnly).join("\n");
-    if (!plainText) return item;
-    return { ...item, content: { rendered: plainText } };
-  } catch {
-    // The REST summary remains usable if the rendered page is unavailable.
-    return attempt === 0 ? enrichRenderedContent(item, 1) : item;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function enrichWithConcurrency(
-  items: WordPressItem[],
-  concurrency = 32,
-): Promise<WordPressItem[]> {
-  const enriched = [...items];
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < items.length) {
-      const index = cursor++;
-      enriched[index] = await enrichRenderedContent(items[index]!);
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, items.length) }, worker),
-  );
-  return enriched;
+async function fetchCanonicalPage(slug: string): Promise<WordPressItem[]> {
+  if (process.env.NODE_ENV === "test")
+    return fetchCollection("pages", new URLSearchParams({ slug }));
+  const now = Date.now();
+  const cached = canonicalCache.get(slug);
+  if (cached && now - cached.loadedAt < CANONICAL_TTL_MS) return cached.items;
+  const pending = canonicalRequests.get(slug);
+  if (pending) return cached && now - cached.loadedAt < CANONICAL_STALE_MS
+    ? cached.items
+    : pending;
+  const request = fetchCollection("pages", new URLSearchParams({ slug }))
+    .then((items) => {
+      if (items.length) canonicalCache.set(slug, { items, loadedAt: Date.now() });
+      return items;
+    })
+    .catch((error) => {
+      if (cached && Date.now() - cached.loadedAt < CANONICAL_STALE_MS) return cached.items;
+      throw error;
+    })
+    .finally(() => canonicalRequests.delete(slug));
+  canonicalRequests.set(slug, request);
+  return request;
 }
 
 async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
-  const settled = await Promise.allSettled(
-    CONTENT_COLLECTIONS.map((collection) => fetchCollection(collection)),
+  const startedAt = Date.now();
+  const settled = await mapBounded(
+    CONTENT_COLLECTIONS,
+    WORDPRESS_CONCURRENCY,
+    (collection) => fetchCollection(collection),
   );
   const items = settled.flatMap((result) =>
     result.status === "fulfilled" ? result.value : [],
@@ -187,39 +247,62 @@ async function fetchAllPublishedContentUncached(): Promise<WordPressItem[]> {
     if (failure?.status === "rejected") throw failure.reason;
     return [];
   }
-  // Pages and case studies are always template-hydrated because their REST
-  // bodies are commonly empty or summary-only. Other custom collections use
-  // public HTML when their REST body is insufficient. Posts keep their strong
-  // REST body and hydrate only the exceptional empty record.
-  const itemsToHydrate = items.filter(
-    (item) =>
-      item.type === "page" ||
-      item.type === "case_study" ||
-      (item.type === "post"
-        ? readableContentLength(item) === 0
-        : readableContentLength(item) < 500),
+  const failedCollections = CONTENT_COLLECTIONS.filter(
+    (_, index) => settled[index]?.status === "rejected",
   );
-  const enrichedItems = await enrichWithConcurrency(itemsToHydrate);
-  const enrichedByKey = new Map(
-    enrichedItems.map((item) => [`${item.type}:${item.id}`, item]),
-  );
-  return items.map(
-    (item) => enrichedByKey.get(`${item.type}:${item.id}`) ?? item,
-  );
+  lastDiagnostics = {
+    cache: "miss",
+    durationMs: Date.now() - startedAt,
+    failedCollections: [...failedCollections],
+    partial: failedCollections.length > 0,
+    itemCount: items.length,
+  };
+  await persistCorpus(items);
+  return items;
 }
 
-const fetchCachedPublishedContent = unstable_cache(
-  fetchAllPublishedContentUncached,
-  ["successive-hydrated-content-v1"],
-  { revalidate: 300 },
-);
-
-export async function fetchAllPublishedContent(): Promise<WordPressItem[]> {
-  // Tests use deterministic fetch mocks; production uses Vercel's shared data
-  // cache so a hydrated 900+ document corpus is reused across function instances.
-  return process.env.NODE_ENV === "test"
-    ? fetchAllPublishedContentUncached()
-    : fetchCachedPublishedContent();
+export async function fetchAllPublishedContent(options: { forceRefresh?: boolean } = {}): Promise<WordPressItem[]> {
+  if (process.env.NODE_ENV === "test") return fetchAllPublishedContentUncached();
+  const forceRefresh = options.forceRefresh === true;
+  const now = Date.now();
+  if (!forceRefresh && corpusCache && now - corpusCache.loadedAt < CORPUS_TTL_MS) {
+    lastDiagnostics = { ...corpusCache.diagnostics, cache: "hit", durationMs: 0 };
+    return corpusCache.items;
+  }
+  const persisted = forceRefresh ? undefined : await readPersistedCorpus();
+  if (persisted?.length) {
+    const diagnostics: ContentLoadDiagnostics = {
+      cache: "hit", durationMs: 0, failedCollections: [], partial: false, itemCount: persisted.length,
+    };
+    corpusCache = { items: persisted, loadedAt: now, diagnostics };
+    lastDiagnostics = diagnostics;
+    return persisted;
+  }
+  if (corpusBuildPromise) {
+    if (corpusCache && now - corpusCache.loadedAt < CORPUS_STALE_MS) {
+      lastDiagnostics = { ...corpusCache.diagnostics, cache: "stale", durationMs: 0 };
+      return corpusCache.items;
+    }
+    return corpusBuildPromise;
+  }
+  // The full payload exceeds Next's per-entry Data Cache limit. Existing
+  // process/persisted caches and this shared promise own corpus reuse.
+  corpusBuildPromise = fetchAllPublishedContentUncached()
+    .then((items) => {
+      corpusCache = { items, loadedAt: Date.now(), diagnostics: lastDiagnostics };
+      return items;
+    })
+    .catch((failure) => {
+      if (corpusCache && Date.now() - corpusCache.loadedAt < CORPUS_STALE_MS) {
+        lastDiagnostics = { ...corpusCache.diagnostics, cache: "stale", durationMs: 0 };
+        return corpusCache.items;
+      }
+      throw failure;
+    })
+    .finally(() => {
+      corpusBuildPromise = undefined;
+    });
+  return corpusBuildPromise;
 }
 
 export async function fetchRelevantRenderedPages(
@@ -230,7 +313,7 @@ export async function fetchRelevantRenderedPages(
       "pages",
       new URLSearchParams({ slug: "custom-web-app-development" }),
     );
-    return enrichWithConcurrency(canonicalPages);
+    return canonicalPages;
   }
   let searches = [query];
   if (/\bai\b.*\b(?:service|services|solution|solutions)\b/i.test(query)) {
@@ -252,12 +335,11 @@ export async function fetchRelevantRenderedPages(
       fulfilledItems(searchSettled).map((page) => [page.id, page]),
     ).values(),
   ].slice(0, 10);
-  return enrichWithConcurrency(pages);
+  return pages;
 }
 
 /**
- * Compatibility adapter for the original chatbot call sites. It translates the
- * old custom content paths into Successive's standard WordPress v2 endpoints.
+ * Compatibility adapter for chatbot call sites using Successive custom v1.
  */
 export async function fetchSuccessive(path: string): Promise<WordPressItem[]> {
   const url = new URL(path, "https://adapter.local");
@@ -266,13 +348,16 @@ export async function fetchSuccessive(path: string): Promise<WordPressItem[]> {
   if (search) params.set("search", search);
 
   if (url.pathname.startsWith("/pages/")) {
-    params.set("slug", url.pathname.slice("/pages/".length));
-    return enrichWithConcurrency(await fetchCollection("pages", params));
+    return fetchCanonicalPage(url.pathname.slice("/pages/".length));
   }
   if (url.pathname === "/pages") return fetchCollection("pages", params);
   if (url.pathname === "/posts") return fetchCollection("posts", params);
   const requestedType = url.searchParams.get("type");
   if (requestedType === "post") return fetchCollection("posts", params);
   if (requestedType === "page") return fetchCollection("pages", params);
+  const collection = CONTENT_COLLECTIONS.find((candidate) =>
+    customContentType(candidate) === requestedType || candidate === requestedType,
+  );
+  if (collection) return fetchCollection(collection, params);
   return fetchAllPublishedContent();
 }

@@ -13,7 +13,7 @@ export function ResultCard({
       {card.image && <img src={card.image} alt="" loading="lazy" />}
       <div className="result-content">
         <span className="badge">
-          {card.badge || card.type.replace("-", " ")}
+          {card.service_type || card.badge || card.type.replace("-", " ")}
         </span>
         <h3>{card.title}</h3>
         <p>{card.description}</p>

@@ -1,20 +1,64 @@
 "use client";
 import { ArrowRight, Bot, ExternalLink, UserRound } from "lucide-react";
+import { useEffect, useState, type Ref } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as Message } from "@/types/chat";
+import type { SuggestionAction } from "@/lib/llm/schemas";
+import { ResultCard } from "./result-card";
 export function ChatMessage({
   message,
   onSuggestion,
   onRetry,
+  animate = false,
+  onAnimationProgress,
+  onAnimationComplete,
+  messageRowRef,
+  messageRowId,
 }: {
   message: Message;
-  onSuggestion: (value: string) => void;
+  onSuggestion: (value: string, action?: SuggestionAction) => void;
   onRetry: (value: string) => void;
+  animate?: boolean;
+  onAnimationProgress?: () => void;
+  onAnimationComplete?: () => void;
+  messageRowRef?: Ref<HTMLDivElement>;
+  messageRowId?: string;
 }) {
   const assistant = message.role === "assistant";
+  const answer = message.response?.answer ?? message.content;
+  // Legacy strings are display-ineligible: only server-validated structured
+  // actions carry the result identities required for deterministic execution.
+  const suggestionActions = (message.response?.suggestionActions ?? []).filter((action) =>
+    action.intent === "CONTENT_DISCOVERY" && Boolean(action.resultKeys?.length));
+  const [visibleAnswer, setVisibleAnswer] = useState(animate ? "" : answer);
+
+  useEffect(() => {
+    if (!assistant || !animate) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const reducedMotionTimer = window.setTimeout(() => {
+        setVisibleAnswer(answer);
+        onAnimationComplete?.();
+      }, 0);
+      return () => window.clearTimeout(reducedMotionTimer);
+    }
+
+    let index = 0;
+    const charactersPerTick = Math.max(1, Math.ceil(answer.length / 140));
+    const timer = window.setInterval(() => {
+      index = Math.min(index + charactersPerTick, answer.length);
+      setVisibleAnswer(answer.slice(0, index));
+      onAnimationProgress?.();
+      if (index === answer.length) {
+        window.clearInterval(timer);
+        onAnimationComplete?.();
+      }
+    }, 22);
+    return () => window.clearInterval(timer);
+  }, [animate, answer, assistant, onAnimationComplete, onAnimationProgress]);
+
   return (
-    <div className={`message-row ${assistant ? "assistant" : "user"}`}>
+    <div id={messageRowId} ref={messageRowRef} className={`message-row ${assistant ? "assistant" : "user"}`}>
       <div className="avatar" aria-hidden>
         {assistant ? <Bot size={17} /> : <UserRound size={17} />}
       </div>
@@ -34,7 +78,7 @@ export function ChatMessage({
                 ),
               }}
             >
-              {message.response?.answer ?? message.content}
+              {visibleAnswer}
             </ReactMarkdown>
           ) : (
             message.content
@@ -48,7 +92,14 @@ export function ChatMessage({
             </button>
           )}
         </div>
-        {message.response?.sources.length ? (
+        {!animate && message.response?.cards.length ? (
+          <div className="card-grid">
+            {message.response.cards.map((card) => (
+              <ResultCard key={`${card.type}:${card.url}`} card={card} />
+            ))}
+          </div>
+        ) : null}
+        {!animate && message.response?.sources.length ? (
           <details className="sources">
             <summary>Sources ({message.response.sources.length})</summary>
             <div>
@@ -73,11 +124,11 @@ export function ChatMessage({
             </div>
           </details>
         ) : null}
-        {message.response?.suggestions.length ? (
+        {!animate && suggestionActions.length ? (
           <div className="suggestions">
-            {message.response.suggestions.map((s) => (
-              <button key={s} onClick={() => onSuggestion(s)}>
-                <span>{s}</span>
+            {suggestionActions.map((action) => (
+              <button key={action.id} onClick={() => onSuggestion(action.label, action)}>
+                <span>{action.label}</span>
                 <ArrowRight size={16} aria-hidden="true" />
               </button>
             ))}

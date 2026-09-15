@@ -3,20 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --webpack",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "node scripts/e2e-conversation-test.mjs",
+    "corpus:refresh": "tsx scripts/refresh-search-index.ts"
   },
   "dependencies": {
-    "@ag-ui/client": "^0.0.57",
-    "@ag-ui/core": "^0.0.57",
-    "@copilotkit/react-core": "^1.63.2",
-    "@copilotkit/react-ui": "^1.63.2",
+    "@vercel/blob": "^2.8.0",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "latest",
@@ -38,6 +37,7 @@
     "jsdom": "latest",
     "prettier": "latest",
     "tailwindcss": "latest",
+    "tsx": "^4.23.13",
     "typescript": "latest",
     "vitest": "latest"
   },

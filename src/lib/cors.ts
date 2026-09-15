@@ -9,10 +9,18 @@ export function corsHeaders(origin: string | null) {
     .map((x) => x.trim().replace(/\/$/, ""))
     .filter(Boolean);
   const normalizedOrigin = origin?.replace(/\/$/, "") ?? null;
-  const isAllowed = !normalizedOrigin || allowed.includes(normalizedOrigin);
+  // Plain-HTML local widget demos opened via file:// send `Origin: null`.
+  // Permit that opaque origin only during local development; production must
+  // continue using the explicit website allowlist.
+  const isLocalFileDevelopment =
+    normalizedOrigin === "null" && process.env.NODE_ENV !== "production";
+  const isAllowed =
+    !normalizedOrigin ||
+    isLocalFileDevelopment ||
+    allowed.includes(normalizedOrigin);
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Chat-Metrics",
     Vary: "Origin",
   };
   if (normalizedOrigin && isAllowed)

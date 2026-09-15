@@ -75,12 +75,15 @@ export const widgetMessageSchema = z
       "SUCCESSIVE_CHAT_RESIZE",
       "SUCCESSIVE_CHAT_UNREAD",
       "SUCCESSIVE_CHAT_ERROR",
+      "SUCCESSIVE_CHAT_SUBMIT",
+      "SUCCESSIVE_CHAT_SUBMIT_ACK",
     ]),
     payload: z
       .object({
         height: z.number().int().min(450).max(850).optional(),
         count: z.number().int().min(0).max(99).optional(),
-        message: z.string().max(200).optional(),
+        message: z.string().max(1000).optional(),
+        id: z.string().max(100).optional(),
       })
       .optional(),
   })

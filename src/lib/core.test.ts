@@ -33,37 +33,572 @@ import {
   normalizeWordPressUrl,
 } from "./search-index";
 import {
+  detectRequestedServiceTypes,
+  isBroadAiServicesQuery,
+  isRequestedContentTypeCompatible,
+  isUseCaseQuery,
+  matchesRequestedServiceType,
   normalizeQuery,
   rankSearchDocument,
+  requestedCollection,
+  requestsSpecificServiceTaxonomy,
   retrieveFromIndex,
 } from "./search-retriever";
 import { fetchAllPublishedContent } from "./successive-api";
 import {
   canUseEnglishQueryDirectly,
+  normalizeInformalEnglish,
   prepareEnglishQuery,
 } from "./query-language";
-import { greetingResponse, isGreeting } from "./conversation";
+import {
+  greetingResponse,
+  isGenericHelpRequest,
+  isGreeting,
+} from "./conversation";
+import { sanitizeGroundedAnswerOpening } from "./response-format";
+import { extractPublishedContactDetails } from "./contact-details";
+import {
+  asksForAnotherResult,
+  buildConversationRetrievalQuery,
+  buildRelatedServiceRetrievalQuery,
+  contentIdentitiesFromAssistantHistory,
+  contentIdentity,
+  isVagueBusinessDiscovery,
+  shouldDeduplicateDiscoveryResults,
+  resolveOfferedResourceFollowUp,
+  resolveUnsupportedAlternativeFollowUp,
+  isAmbiguousResultSetReference,
+  continuesOffTopicContext,
+} from "./conversation-context";
+import { buildDeterministicUnderstanding, resolveConversationUnderstanding } from "./query-understanding";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
 });
 
+describe("off-topic conversation context", () => {
+  it.each([
+    ["Who won yesterday's cricket match?", "What's the score?"],
+    ["Will it rain today?", "What about tomorrow?"],
+    ["Tell me about that movie", "Who stars in it?"],
+  ])("retains off-topic scope: %s -> %s", (first, followUp) => {
+    expect(continuesOffTopicContext(followUp, [{ role: "user", content: first }])).toBe(true);
+  });
+
+  it("allows an explicit Successive topic switch", () => {
+    expect(continuesOffTopicContext("What cloud services does Successive offer?", [
+      { role: "user", content: "What's the weather?" },
+    ])).toBe(false);
+  });
+});
+
+describe("named resource follow-ups", () => {
+  const offered = "I couldn't find that exact published item. I found a related blog, '[API Testing](https://successive.tech/blog/api-testing/)'. Would you like me to summarize that instead?";
+
+  it("resolves an affirmative reply to the explicitly offered resource and type", () => {
+    expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: offered }]))
+      .toBe("Summarize 'API Testing' blog");
+  });
+
+  it("resolves ordinal selection without searching for the ordinal text", () => {
+    const prior = "Related articles: [First](https://successive.tech/blog/first/) and [Second](https://successive.tech/blog/second/).";
+    expect(resolveOfferedResourceFollowUp("the second one", [{ role: "assistant", content: prior }]))
+      .toBe("Summarize 'Second' article");
+  });
+
+  it.each([
+    ["the last one", "Third"], ["the next one", "Second"], ["the other one", "Second"],
+  ])("resolves extended ordinal selection: %s", (message, title) => {
+    const prior = "Results: [First](https://successive.tech/first/) [Second](https://successive.tech/second/) [Third](https://successive.tech/third/).";
+    expect(resolveOfferedResourceFollowUp(message, [{ role: "assistant", content: prior }])).toContain(title);
+  });
+
+  it("does not let a generic yes inherit an arbitrary old link", () => {
+    expect(resolveOfferedResourceFollowUp("Yes", [{ role: "assistant", content: "See [About](https://successive.tech/about-us/)." }]))
+      .toBeUndefined();
+  });
+
+  it("turns acceptance of an unsupported-query alternative into public case-study discovery", () => {
+    const prior = "I couldn’t confirm Successive’s current internal projects from the available public content. I can instead show you Successive’s published case studies or publicly announced customer work.";
+    expect(resolveUnsupportedAlternativeFollowUp("yes", [{ role: "assistant", content: prior }]))
+      .toBe("Show me Successive published case studies");
+  });
+});
+
+describe("ambiguous result-set references", () => {
+  it("clarifies a bare reference when a listing has multiple validated targets", () => {
+    expect(isAmbiguousResultSetReference("Tell me more about that", [
+      { role: "user", content: "Show services" },
+      { role: "assistant", content: "[Cloud](https://successive.tech/cloud/) and [Data](https://successive.tech/data/)" },
+    ])).toBe(true);
+  });
+  it("keeps a dependent reference when the user has an active subject", () => {
+    expect(isAmbiguousResultSetReference("What about it?", [
+      { role: "user", content: "Tell me about DevSecOps" },
+      { role: "assistant", content: "[DevSecOps](https://successive.tech/devsecops/) and [Security](https://successive.tech/security/)" },
+    ])).toBe(false);
+  });
+});
+
 describe("intent detection", () => {
   it("detects Successive website intents", () => {
     expect(detectIntent("Tell me about Successive services")).toBe("products");
     expect(detectIntent("who is Successive")).toBe("about");
+    expect(detectIntent("can you explain your successive")).toBe("about");
+    expect(detectIntent("Tell me about your company")).toBe("about");
     expect(detectIntent("Show customer stories")).toBe("case_studies");
+    expect(detectIntent("any example")).toBe("case_studies");
+    expect(detectIntent("show me another example")).toBe("case_studies");
+    expect(detectIntent("what servies you provid")).toBe("products");
+    expect(detectIntent("more serivces")).toBe("products");
+    expect(detectIntent("any webniar for cloud")).toBe("events");
+    expect(detectIntent("show case stduy")).toBe("case_studies");
+    expect(detectIntent("we need app devlopment")).toBe("products");
     expect(detectIntent("Book a demo")).toBe("contact");
-    expect(detectIntent("I need help")).toBe("contact");
+    expect(detectIntent("What locations do you have?")).toBe("contact");
+    expect(detectIntent("Show office locations")).toBe("contact");
+    expect(detectIntent("I need help")).toBe("general");
     expect(detectIntent("about")).toBe("about");
     expect(detectIntent("customers")).toBe("case_studies");
+    expect(detectIntent("latest whitepaper")).toBe("resources");
+    expect(detectIntent("whitepeper")).toBe("resources");
+    expect(detectIntent("whtieperper")).toBe("resources");
     expect(
       detectIntent(
         "Web apps strengthen online presence and engage customers across browsers.",
       ),
     ).toBe("general");
     expect(detectIntent("industers")).toBe("page");
+    expect(
+      detectIntent(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+      ),
+    ).toBe("general");
+  });
+});
+
+describe("generic help requests", () => {
+  it("catches vague and fragmented help prompts before retrieval", () => {
+    expect(isGenericHelpRequest("I need help")).toBe(true);
+    expect(isGenericHelpRequest("i wan thelp")).toBe(true);
+    expect(isGenericHelpRequest("help")).toBe(true);
+    expect(isGenericHelpRequest("I need help with AI services")).toBe(false);
+    expect(isGenericHelpRequest("Help me find a cloud case study")).toBe(false);
+  });
+});
+
+describe("published contact details", () => {
+  it("extracts only contact details actually published in ACF", () => {
+    expect(
+      extractPublishedContactDetails({
+        offices: [
+          { phone: "+1 (315) 818-3656", address: "325 N Saint Paul St, Dallas" },
+          { phone: "+91 (120) 425-9482", email: "hello@example.com" },
+        ],
+      }),
+    ).toEqual({
+      phones: ["+1 (315) 818-3656", "+91 (120) 425-9482"],
+      emails: ["hello@example.com"],
+      addresses: ["325 N Saint Paul St, Dallas"],
+    });
+  });
+});
+
+describe("answer opening formatting", () => {
+  const title = "Crafting An Effective AI Strategy to Drive Business Growth";
+  const url = "https://successive.tech/blog/ai-strategy/";
+
+  it("removes a retrieved page title from the start in common markdown forms", () => {
+    for (const opening of [
+      title,
+      `## ${title}`,
+      `**${title}**`,
+      `[${title}](${url})`,
+      `**[${title}](${url})**`,
+    ]) {
+      expect(
+        sanitizeGroundedAnswerOpening(
+          `${opening}\n\nSuccessive offers relevant AI services.`,
+          [title],
+        ),
+      ).toBe("Successive offers relevant AI services.");
+    }
+  });
+
+  it("merges adjacent same-URL word links into one natural title link", () => {
+    expect(
+      sanitizeGroundedAnswerOpening(
+        `A summary first.\n\n[Crafting](${url}) [An](${url}) [Effective](${url}) [AI](${url}) provides context.`,
+        [title],
+      ),
+    ).toContain(`[Crafting An Effective AI](${url}) provides context.`);
+  });
+});
+
+describe("multi-turn conversation context", () => {
+  it("preserves a requested content type across a what-about topic switch", () => {
+    const current = buildDeterministicUnderstanding("What about retail?");
+    const resolved = resolveConversationUnderstanding(current, [
+      { role: "user", content: "Show healthcare case studies" },
+      { role: "assistant", content: "Healthcare examples" },
+    ]);
+    expect(resolved.understanding.topics).toContain("retail");
+    expect(resolved.understanding.requestedContentType).toBe("case-study");
+  });
+  it("does not inherit a previous resource type when a new explicit subject contains a pronoun", () => {
+    const current = buildDeterministicUnderstanding("What is React? Does Successive use it?");
+    const resolved = resolveConversationUnderstanding(current, [
+      { role: "user", content: "Read article: Corent ComPaaS Guide" },
+      { role: "assistant", content: "A published Corent article." },
+    ]);
+    expect(resolved.understanding.topics).toContain("react");
+    expect(resolved.understanding.topics.join(" ")).not.toContain("corent");
+    expect(resolved.understanding.requestedContentType).toBeNull();
+  });
+  it("grounds related-service follow-ups in the latest assistant sources", () => {
+    const history = [
+      { role: "user" as const, content: "more blogs" },
+      {
+        role: "assistant" as const,
+        content:
+          "Read [AI in Supply Chain](https://successive.tech/ai-supply-chain/) and [Retail AI](https://successive.tech/retail-ai/).",
+      },
+    ];
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me related Successive services",
+        history,
+      ),
+    ).toBe("AI in Supply Chain. Retail AI. related Successive services");
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me relevant Successive services",
+        history,
+      ),
+    ).toBe("AI in Supply Chain. Retail AI. related Successive services");
+  });
+
+  it("turns a related-service suggestion after fallback into broad discovery", () => {
+    expect(
+      buildRelatedServiceRetrievalQuery(
+        "Show me relevant Successive services",
+        [
+          { role: "user", content: "gajedran" },
+          {
+            role: "assistant",
+            content:
+              "I could not find reliable information in the available Successive website content.",
+          },
+        ],
+      ),
+    ).toBe(
+      "digital transformation cloud data artificial intelligence experience design services",
+    );
+  });
+  it("uses the latest explicit subject for a referential content transition", () => {
+    const query = buildConversationRetrievalQuery("Any case studies?", [
+      { role: "user", content: "I work in healthcare." },
+      { role: "assistant", content: "How can we help?" },
+      { role: "user", content: "We want to improve hospital operations." },
+      { role: "assistant", content: "AI may help." },
+      { role: "user", content: "Can AI help us as well?" },
+    ]);
+    expect(query).toContain("ai");
+    expect(query).not.toContain("healthcare");
+    expect(query).not.toContain("hospital operations");
+    expect(query).toContain("Any case studies?");
+  });
+
+  it("carries AI context into a misspelled request for more services", () => {
+    expect(
+      buildConversationRetrievalQuery("more serivces", [
+        { role: "user", content: "ai service" },
+        { role: "assistant", content: "Generative AI and AI strategy" },
+      ]),
+    ).toBe("ai more serivces");
+    expect(asksForAnotherResult("more serivces")).toBe(true);
+    expect(shouldDeduplicateDiscoveryResults("more serivces", "products")).toBe(
+      true,
+    );
+  });
+
+  it.each(["other Kagen products", "Are there other Kagen products?", "more cloud services", "another healthcare case study"])(
+    "recognizes subject-qualified requests for another result: %s", (query) => {
+      expect(asksForAnotherResult(query)).toBe(true);
+    });
+
+  it("resets retrieval context when the visitor explicitly changes topic", () => {
+    expect(
+      buildConversationRetrievalQuery(
+        "Actually I am more interested in cloud",
+        [{ role: "user", content: "Show me AI services" }],
+      ),
+    ).toBe("Actually I am more interested in cloud");
+  });
+
+  it.each([
+    ["React", "Node.js services"],
+    ["AI consulting", "Cloud services"],
+    ["Healthcare", "Retail case studies"],
+    ["Kagen VOICE", "Kagen ADD"],
+    ["AWS partnership", "Google Cloud partnership"],
+    ["Application modernization", "DevOps blogs"],
+    ["Cloud", "Healthcare whitepapers"],
+  ])("replaces an old explicit subject generically: %s -> %s", (oldTopic, current) => {
+    expect(buildConversationRetrievalQuery(current, [
+      { role: "user", content: oldTopic },
+      { role: "assistant", content: `Information about ${oldTopic}` },
+    ])).toBe(current);
+  });
+
+  it.each([
+    ["Tell me more", null],
+    ["What services?", "service"],
+    ["Any case studies?", "case-study"],
+    ["Any blogs?", "blog"],
+    ["How can this help?", null],
+  ])("inherits the active subject for a contextual follow-up: %s", (current, contentType) => {
+    const query = buildConversationRetrievalQuery(current, [
+      { role: "user", content: "Geospatial engineering" },
+      { role: "assistant", content: "Geospatial engineering overview" },
+    ]);
+    expect(query).toContain("geospatial");
+    expect(query).toContain(current);
+    expect(buildDeterministicUnderstanding(current).requestedContentType).toBe(contentType);
+  });
+
+  it.each([
+    "Compare React and Angular",
+    "AWS vs Google Cloud",
+    "Can Node.js work with React?",
+    "How does AI help healthcare?",
+  ])("preserves all current subjects without adding an old one: %s", (current) => {
+    const query = buildConversationRetrievalQuery(current, [
+      { role: "user", content: "Retail commerce" },
+      { role: "assistant", content: "Retail overview" },
+    ]);
+    expect(query).toBe(current);
+    expect(query.toLowerCase()).not.toContain("retail");
+  });
+
+  it("keeps a standalone AI services query independent from old history", () => {
+    expect(
+      buildConversationRetrievalQuery("ai services", [
+        { role: "user", content: "Which industries can use GIS?" },
+        { role: "assistant", content: "Agriculture and healthcare." },
+        { role: "user", content: "Do you have any webinars?" },
+      ]),
+    ).toBe("ai services");
+  });
+
+  it("keeps a misspelled whitepaper query independent from old history", () => {
+    expect(
+      buildConversationRetrievalQuery("whitepeper", [
+        { role: "user", content: "Show me AI services" },
+      ]),
+    ).toBe("whitepeper");
+  });
+
+  it("does not contaminate explicit suggestion titles with old About context", () => {
+    const history = [
+      { role: "user" as const, content: "About Successive" },
+      { role: "assistant" as const, content: "Successive company overview" },
+    ];
+    expect(buildConversationRetrievalQuery("Innovation", history)).toBe(
+      "Innovation",
+    );
+    expect(buildConversationRetrievalQuery("Successive Digital", history)).toBe(
+      "Successive Digital",
+    );
+    expect(
+      buildConversationRetrievalQuery("Digital Transformation", history),
+    ).toBe("Digital Transformation");
+    expect(
+      buildConversationRetrievalQuery(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+        history,
+      ),
+    ).toBe(
+      "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+    );
+  });
+
+  it("distinguishes detail requests from requests for unseen results", () => {
+    expect(
+      asksForAnotherResult(
+        "Tell me more about Unleash Creativity with a Trusted Creative Design Company",
+      ),
+    ).toBe(false);
+    expect(asksForAnotherResult("show me another service")).toBe(true);
+    expect(asksForAnotherResult("more")).toBe(true);
+  });
+
+  it("deduplicates only explicit requests for unseen results", () => {
+    expect(shouldDeduplicateDiscoveryResults("show blogs", "blogs")).toBe(false);
+    expect(
+      shouldDeduplicateDiscoveryResults("show me another blog", "blogs"),
+    ).toBe(true);
+    expect(
+      shouldDeduplicateDiscoveryResults("more services", "products"),
+    ).toBe(true);
+    expect(
+      shouldDeduplicateDiscoveryResults(
+        "Since Successive only works with startups, what services for enterprises?",
+        "products",
+      ),
+    ).toBe(false);
+    expect(
+      shouldDeduplicateDiscoveryResults("Digital Transformation", "general"),
+    ).toBe(false);
+    expect(
+      shouldDeduplicateDiscoveryResults(
+        "Tell me more about Digital Transformation",
+        "general",
+      ),
+    ).toBe(false);
+    expect(shouldDeduplicateDiscoveryResults("About Successive", "about")).toBe(
+      false,
+    );
+    expect(shouldDeduplicateDiscoveryResults("Contact Us", "contact")).toBe(
+      false,
+    );
+  });
+
+  it("matches previously shown content by canonical URL or normalized title", () => {
+    expect(
+      contentIdentity("AI Strategy", "https://successive.ai/ai-strategy/"),
+    ).toEqual(["url:https://successive.ai/ai-strategy", "title:ai strategy"]);
+  });
+
+  it("recovers seen content from older clients that only send answer history", () => {
+    expect(
+      contentIdentitiesFromAssistantHistory([
+        { role: "user", content: "ai services" },
+        {
+          role: "assistant",
+          content:
+            "See [Generative AI Consulting](https://successive.ai/gen-ai/).",
+        },
+      ]),
+    ).toEqual([
+      "url:https://successive.ai/gen-ai",
+      "title:generative ai consulting",
+    ]);
+  });
+
+  it("does not let an old collection override a new all-services request", () => {
+    expect(
+      buildConversationRetrievalQuery("all service", [
+        { role: "user", content: "all whitepaper" },
+        { role: "assistant", content: "Here are the whitepapers." },
+      ]),
+    ).toBe("all service");
+  });
+
+  it("recognizes fragmented discovery prompts", () => {
+    expect(isVagueBusinessDiscovery("Need help")).toBe(true);
+    expect(isVagueBusinessDiscovery("Cloud migration help")).toBe(false);
+  });
+
+  it("recognizes generic service recommendation requests with typos", () => {
+    expect(isVagueBusinessDiscovery("i need some suggetion for services")).toBe(
+      true,
+    );
+    expect(isVagueBusinessDiscovery("recommend services for my business")).toBe(
+      true,
+    );
+  });
+});
+
+describe("service type query filtering", () => {
+  it("recognizes use-case requests for any topic", () => {
+    expect(isUseCaseQuery("i want use case of ai")).toBe(true);
+    expect(isUseCaseQuery("Show cloud applications for business")).toBe(true);
+    expect(isUseCaseQuery("Give me healthcare use cases")).toBe(true);
+    expect(isUseCaseQuery("AI services")).toBe(false);
+  });
+
+  it("treats generic AI services as a complete portfolio query", () => {
+    expect(isBroadAiServicesQuery("ai services")).toBe(true);
+    expect(isBroadAiServicesQuery("Show me Successive AI services")).toBe(true);
+    expect(isBroadAiServicesQuery("What AI/ML services does Successive provide?")).toBe(true);
+    expect(isBroadAiServicesQuery("generative ai services")).toBe(false);
+    expect(isBroadAiServicesQuery("AI strategy consulting services")).toBe(
+      false,
+    );
+  });
+  it("maps dropdown wording and common misspellings to strict ACF values", () => {
+    expect(detectRequestedServiceTypes("show cloud pillar services")).toEqual([
+      "service",
+      "pillar",
+    ]);
+    expect(detectRequestedServiceTypes("show piller")).toEqual(["pillar"]);
+    expect(detectRequestedServiceTypes("AI expert")).toEqual(["expertise"]);
+    expect(detectRequestedServiceTypes("service pillar exper")).toEqual([
+      "service",
+      "pillar",
+      "expertise",
+    ]);
+  });
+
+  it("keeps only documents matching the requested ACF service type", () => {
+    expect(matchesRequestedServiceType("cloud pillar services", "Pillar")).toBe(
+      true,
+    );
+    expect(
+      matchesRequestedServiceType("cloud pillar services", "Expertise"),
+    ).toBe(false);
+    expect(matchesRequestedServiceType("cloud service", "Sub-service")).toBe(
+      true,
+    );
+    expect(matchesRequestedServiceType("service pillar", "Piller")).toBe(true);
+    expect(matchesRequestedServiceType("service pillar", "Sub-service")).toBe(
+      true,
+    );
+    expect(matchesRequestedServiceType("service pillar", "Expertise")).toBe(
+      false,
+    );
+    expect(matchesRequestedServiceType("cloud services", undefined)).toBe(
+      false,
+    );
+  });
+
+  it("treats ordinary services as a service family but preserves explicit taxonomy filters", () => {
+    expect(requestsSpecificServiceTaxonomy("Node.js services")).toBe(false);
+    expect(requestsSpecificServiceTaxonomy("Node.js expertise")).toBe(true);
+    expect(requestsSpecificServiceTaxonomy("digital engineering pillars")).toBe(true);
+  });
+});
+describe("collection pagination requests", () => {
+  it("routes more/another requests through every repeatable collection", () => {
+    const expected = new Map([
+      ["more blogs", "blogs and insights"],
+      ["another case study", "case studies"],
+      ["more industries", "industries"],
+      ["next webinar", "webinars and events"],
+      ["more accelerators", "accelerators"],
+      ["other awards", "awards and recognitions"],
+      ["more partners", "partners and alliances"],
+      ["more careers", "career pages"],
+      ["more press releases", "PR and media coverage"],
+      ["more thought leadership", "thought leadership"],
+      ["more employee perspectives", "employee perspectives"],
+      ["more expertise", "expertise pages"],
+      ["more pillars", "service pillars"],
+    ]);
+    for (const [query, label] of expected)
+      expect(requestedCollection(query)?.label).toBe(label);
+  });
+
+  it("keeps more services available for topic-aware semantic retrieval", () => {
+    expect(requestedCollection("more services")).toBeUndefined();
+    expect(requestedCollection("list all services")?.label).toBe("services");
+    expect(requestedCollection("What products are available?")?.label).toBe("products");
+    expect(requestedCollection("Show available accelerators.")?.label).toBe("accelerators");
+    const awards = requestedCollection("What awards has Successive received?");
+    expect(awards?.label).toBe("awards and recognitions");
+    expect(awards?.matches({ type: "page", role: "awards" } as never)).toBe(true);
   });
 });
 describe("short topic query normalization", () => {
@@ -73,6 +608,7 @@ describe("short topic query normalization", () => {
     expect(normalizeQuery("careers")).toBe("careers jobs");
     expect(normalizeQuery("industers")).toBe("industries industry");
     expect(normalizeQuery("ai servies fhfghf")).toBe("ai services");
+    expect(normalizeQuery("ai serivces")).toBe("ai services");
   });
 });
 describe("query language preparation", () => {
@@ -122,6 +658,7 @@ describe("assistant response transport normalization", () => {
           url: "https://successive.ai/example",
           image: "not-a-url",
           badge: "B".repeat(80),
+          service_type: "Sub-service",
         },
       ],
       suggestions: ["S".repeat(200)],
@@ -140,6 +677,7 @@ describe("assistant response transport normalization", () => {
       description: "D".repeat(500),
       image: undefined,
       badge: "B".repeat(50),
+      service_type: "Sub-service",
     });
     expect(result.data.suggestions[0]).toHaveLength(160);
     expect(result.data.sources[0]?.title).toHaveLength(200);
@@ -269,7 +807,7 @@ describe("structured responses", () => {
   });
 });
 // These tests document the custom Kagen endpoint contract retained in the
-// reference project. Successive uses standard wp/v2 collections; its adapter
+// reference project. Successive uses custom v1 collections; its adapter
 // has dedicated tests in successive-api.test.ts.
 describe.skip("legacy custom WordPress retrieval", () => {
   it("returns every product and excludes other content for a product-list query", async () => {
@@ -670,6 +1208,15 @@ describe("widget configuration", () => {
     ).toBe("https://successive.ai");
     vi.unstubAllEnvs();
   });
+  it("allows file-origin widget demos only outside production", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    expect(corsHeaders("null")).toMatchObject({
+      isAllowed: true,
+      headers: { "Access-Control-Allow-Origin": "null" },
+    });
+    vi.stubEnv("NODE_ENV", "production");
+    expect(corsHeaders("null").isAllowed).toBe(false);
+  });
   it("protects duplicate initialization and exposes only the public API", () => {
     const script = readFileSync("public/successive-chat-widget.js", "utf8");
     expect(script).toContain(
@@ -677,11 +1224,56 @@ describe("widget configuration", () => {
     );
     for (const method of ["open", "close", "toggle", "destroy", "isOpen"])
       expect(script).toContain(`${method}:`);
-    expect(script).toContain("event.origin !== widgetOrigin");
-    expect(script).toContain("event.source !== frame.contentWindow");
+    expect(script).not.toContain('document.createElement("iframe")');
+    expect(script).toContain("fetch(config.apiUrl");
+    expect(script).toContain("safeUrl(value");
   });
 });
 describe("complete ACF search indexing", () => {
+  it("recognizes a structured offering page as a service without a legacy service_type", () => {
+    const document = buildSearchDocument({
+      id: 2602,
+      type: "page",
+      slug: "new-capability-offering",
+      link: "https://successive.ai/new-capability-offering/",
+      title: { rendered: "New Capability Offering" },
+      acf: {
+        hero_description: "A published business capability.",
+        services_repeater: [{ heading: "Strategy and implementation" }],
+      },
+    });
+    expect(document.role).toBe("service");
+  });
+
+  it("accepts an untyped structured offering page for generic service discovery", () => {
+    const document = buildSearchDocument({
+      id: 2601,
+      type: "page",
+      slug: "future-offering",
+      link: "https://successive.ai/future-offering/",
+      title: { rendered: "Future Capability Proof of Concept" },
+      acf: {
+        hero_description: "Our program helps organizations validate ideas and implement scalable solutions.",
+      },
+    });
+    expect(document.role).toBe("page");
+    expect(isRequestedContentTypeCompatible(document, "service")).toBe(true);
+  });
+
+  it("preserves the service type used by service story cards", () => {
+    const document = buildSearchDocument({
+      id: 2603,
+      type: "page",
+      slug: "full-stack-development-company",
+      link: "https://successive.ai/full-stack-development-company/",
+      title: { rendered: "Full-Stack Development Services" },
+      acf: {
+        service_type: "Sub-service",
+        description2: "Complete full-stack service content.",
+      },
+    });
+    expect(document.service_type).toBe("Sub-service");
+  });
   it("preserves paragraphs and overlap while chunking long content", () => {
     const chunks = buildSearchChunks(10, [
       `First paragraph ${"foundation ".repeat(90)}`,
@@ -777,9 +1369,7 @@ describe("complete ACF search indexing", () => {
     expect(normalizeQuery("Do you know about Successive EYE?")).toBe(
       "successive eye",
     );
-    expect(normalizeQuery("Please explain Successive ADD")).toBe(
-      "successive add",
-    );
+    expect(normalizeQuery("Please explain Successive ADD")).toBe("successive add");
   });
   it("does not treat an isolated EYE acronym as the Successive EYE entity", () => {
     const document = buildSearchDocument({
@@ -869,6 +1459,95 @@ describe("complete ACF search indexing", () => {
     const result = await retrieveFromIndex("Successive UNKNOWN");
     expect(result.reliableMatchFound).toBe(false);
     expect(result.matches).toEqual([]);
+  });
+  it("keeps legal pages out of AI use-case results", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                id: 1,
+                type: "page",
+                slug: "terms-of-services",
+                link: "https://successive.tech/terms-of-services/",
+                title: { rendered: "Terms of Services" },
+                content: {
+                  rendered:
+                    "<p>AI applications and use cases are mentioned in shared website content. This privacy policy explains how user information is handled.</p>",
+                },
+              },
+              {
+                id: 2,
+                type: "post",
+                slug: "enterprise-ai-applications-benefits-challenges",
+                link: "https://successive.tech/blog/enterprise-ai-applications-benefits-challenges/",
+                title: {
+                  rendered:
+                    "Enterprise AI Applications, Benefits and Challenges",
+                },
+                content: {
+                  rendered:
+                    "<h2>Enterprise AI use cases</h2><p>Businesses use conversational AI for customer self-service, marketing support, finance workflows, and enterprise operations.</p>",
+                },
+              },
+              {
+                id: 3,
+                type: "post",
+                slug: "generative-ai-in-customer-experience",
+                link: "https://successive.tech/blog/generative-ai-in-customer-experience/",
+                title: { rendered: "Generative AI in Customer Experience" },
+                content: {
+                  rendered:
+                    "<p>Generative AI helps customers self-assist through conversational experiences and personalized support.</p>",
+                },
+              },
+              {
+                id: 4,
+                type: "post",
+                slug: "cloud-computing-use-cases",
+                link: "https://successive.tech/blog/cloud-computing-use-cases/",
+                title: { rendered: "Cloud Computing Use Cases" },
+                content: {
+                  rendered:
+                    "<p>Cloud applications support scalable infrastructure, modernization, disaster recovery, and data analytics workloads.</p>",
+                },
+              },
+            ]),
+            {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-WP-TotalPages": "1",
+              },
+            },
+          ),
+      ),
+    );
+    const result = await retrieveFromIndex("i want use case of ai");
+    expect(result.reliableMatchFound).toBe(true);
+    expect(result.collectionLabel).toBe("use cases");
+    expect(result.matches.map(({ document }) => document.slug)).toContain(
+      "enterprise-ai-applications-benefits-challenges",
+    );
+    expect(result.matches.map(({ document }) => document.slug)).not.toContain(
+      "terms-of-services",
+    );
+    expect(
+      result.matches.every((match) =>
+        match.matchedFields.includes("topic-use-case"),
+      ),
+    ).toBe(true);
+
+    const cloudResult = await retrieveFromIndex("show cloud use cases");
+    expect(cloudResult.reliableMatchFound).toBe(true);
+    expect(cloudResult.matches[0]?.document.slug).toBe(
+      "cloud-computing-use-cases",
+    );
+    expect(
+      cloudResult.matches.map(({ document }) => document.slug),
+    ).not.toContain("terms-of-services");
   });
   it("retrieves an article from an exact sentence in the middle of its body", async () => {
     vi.stubGlobal(
@@ -969,6 +1648,17 @@ describe("complete ACF search indexing", () => {
     expect(result.matches[0]?.document.id).toBe(900);
     expect(result.matches[0]?.matchedFields).toContain("semantic-expansion");
   });
+  it("normalizes bounded routing language and strips explicit reset wrappers", () => {
+    expect(normalizeInformalEnglish("Switching topics, tell me about platform engineering"))
+      .toBe("tell me about platform engineering");
+    expect(normalizeInformalEnglish("leaving careers aside, tell me about data services"))
+      .toBe("tell me about data services");
+    expect(normalizeInformalEnglish("need a qoute for integration work"))
+      .toBe("need a quote for integration work");
+    expect(normalizeInformalEnglish("do u support native apps rn?"))
+      .toBe("do you support native apps right now?");
+  });
+
   it.skip("surfaces legacy custom WordPress API failures", async () => {
     vi.stubGlobal(
       "fetch",

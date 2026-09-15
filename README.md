@@ -5,25 +5,24 @@ Digital's public WordPress content. This is a separate project; the sibling
 Kagen chatbot is not modified.
 
 See [Successive Content API Audit](docs/SUCCESSIVE_CONTENT_API_AUDIT.md) for
-the live page-wise and post-wise API coverage, content completeness, pagination,
-and HTML-hydration requirements.
+the live page-wise and post-wise API coverage and pagination behavior.
 
 ## Data sources
 
-The server reads every paginated record from the public WordPress v2 content
-collections, including:
+The server reads every paginated record from Successive's complete custom v1
+content API:
 
-- `https://successive.tech/wp-json/wp/v2/posts`
-- `https://successive.tech/wp-json/wp/v2/pages`
+- `https://successive.tech/wp-json/successive-digital/v1/content?type=post`
+- `https://successive.tech/wp-json/successive-digital/v1/content?type=page`
+- `https://successive.tech/wp-json/successive-digital/v1/pages/{slug}`
 - `accelerators`, `award`, `careers`, `case_study`, `employee-perspective`
 - `industries`, `media-coverage`, `partners`, `press-release`
 - `thought-leadership`
 
-Posts and pages are requested with `_embed=1`, so featured media and author
-details are available to the content normalizer without calling the users
-endpoint. Industry REST records contain only summaries, so their seven public
-pages are additionally hydrated from the rendered `<main>` content. The derived
-search index is cached for five minutes.
+The custom endpoint returns complete recursive ACF payloads. The chatbot indexes
+editor content and nested ACF fields directly without calling the standard
+WordPress API or scraping rendered HTML. The derived search index is cached for
+five minutes.
 
 ## Setup
 

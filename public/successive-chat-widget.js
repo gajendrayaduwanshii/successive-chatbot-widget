@@ -2,7 +2,6 @@
   "use strict";
 
   if (window.SuccessiveChat && window.SuccessiveChat.__initialized) return;
-
   var script = document.currentScript;
   if (!script) {
     var scripts = document.querySelectorAll(
@@ -20,6 +19,11 @@
   }
   var widgetOrigin = scriptUrl.origin;
   var data = script.dataset || {};
+  // Demo presentation mode. Keep response data and renderers intact so these
+  // sections can be restored with a UI-only flag change after the demo.
+  var SHOW_RESULT_CARDS = false;
+  var SHOW_SOURCES = false;
+  var SHOW_SUGGESTIONS = false;
   var clamp = function (value, fallback, min, max) {
     var parsed = Number.parseInt(value || "", 10);
     return Number.isFinite(parsed)
@@ -30,8 +34,9 @@
     var text = typeof value === "string" ? value.trim() : "";
     return text ? text.slice(0, max) : fallback;
   };
-  var isHex = function (value) {
-    return /^#[0-9a-f]{6}$/i.test(value || "");
+  var optionalText = function (value, fallback, max) {
+    if (value == null) return fallback;
+    return String(value).trim().slice(0, max);
   };
   var safeUrl = function (value, fallback) {
     if (!value) return fallback;
@@ -47,13 +52,48 @@
     return fallback;
   };
   var bool = function (value, fallback) {
-    if (value == null) return fallback;
-    return String(value).toLowerCase() === "true";
+    return value == null ? fallback : String(value).toLowerCase() === "true";
   };
-  var foreground = function (hex) {
-    var r = Number.parseInt(hex.slice(1, 3), 16);
-    var g = Number.parseInt(hex.slice(3, 5), 16);
-    var b = Number.parseInt(hex.slice(5, 7), 16);
+  var safeColor = function (value, fallback) {
+    var candidate = typeof value === "string" ? value.trim() : "";
+    if (!candidate) return fallback;
+    // Restrict accepted input to ordinary color notation before asking the
+    // browser to resolve it. This prevents CSS declaration injection while
+    // supporting values such as red, #f00, rgb(...), and hsl(...).
+    if (
+      !/^(?:[a-z]+|#[0-9a-f]{3,8}|rgba?\([\d.,%\s]+\)|hsla?\([\d.,%\s]+\))$/i.test(
+        candidate,
+      )
+    )
+      return fallback;
+    var probe = document.createElement("span");
+    probe.style.color = candidate;
+    if (!probe.style.color) return fallback;
+    document.documentElement.appendChild(probe);
+    var resolved = window.getComputedStyle(probe).color;
+    probe.remove();
+    return resolved || probe.style.color || fallback;
+  };
+  var foreground = function (color) {
+    var rgb = color.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+    var r = rgb
+      ? Number(rgb[1])
+      : Number.parseInt(
+          color.length === 4 ? color[1] + color[1] : color.slice(1, 3),
+          16,
+        );
+    var g = rgb
+      ? Number(rgb[2])
+      : Number.parseInt(
+          color.length === 4 ? color[2] + color[2] : color.slice(3, 5),
+          16,
+        );
+    var b = rgb
+      ? Number(rgb[3])
+      : Number.parseInt(
+          color.length === 4 ? color[3] + color[3] : color.slice(5, 7),
+          16,
+        );
     return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.62
       ? "#111827"
       : "#ffffff";
@@ -80,92 +120,697 @@
       "Hi! How can I help you explore Successive?",
       300,
     ),
-    primaryColor: isHex(data.primaryColor) ? data.primaryColor : "#0063ce",
+    primaryColor: safeColor(data.primaryColor, "#0063ce"),
     position: data.position === "bottom-left" ? "bottom-left" : "bottom-right",
-    buttonLabel: safeText(data.buttonLabel, "Chat with Successive", 40),
+    buttonLabel: optionalText(data.buttonLabel, "Chat with Successive", 40),
+    buttonIconUrl: safeUrl(data.buttonIconUrl, ""),
     logoUrl: safeUrl(data.logoUrl, ""),
     openByDefault: bool(data.openByDefault, false),
     zIndex: clamp(data.zIndex, 2147483000, 1000, 2147483646),
     width: clamp(data.width, 400, 320, 520),
     height: clamp(data.height, 650, 450, 850),
     mobileFullscreen: bool(data.mobileFullscreen, true),
+    promptInputId: safeText(data.promptInputId, "", 100),
+    promptTypingContentId: safeText(data.promptTypingContentId, "", 100),
+    promptButtonId: safeText(data.promptButtonId, "", 100),
+    debugMetrics: bool(data.debugMetrics, false),
+    containerId: safeText(data.containerId, "", 100),
   };
 
-  var root, launcher, panel, frame, closeHitArea, unread, style;
+  var storageKey = "successive-chat:conversation:v2";
+  var sessionKey = "successive-chat:session:v1";
+  var wrapper,
+    root,
+    launcher,
+    panel,
+    conversation,
+    input,
+    sendButton,
+    unread,
+    stylesheet;
   var open = false;
-  var ready = false;
+  var loading = false;
+  var messages = [];
+  var typewritingMessage = null;
+  var latestUserMessage = null;
+  var userMessageToAnchor = null;
+  var anchoringLatestRequest = false;
+  var revealLatestRequest = false;
+  var hasRenderedConversation = false;
+  var latestRequestTopOffset = 12;
+  var moveLatestRequestTowardTop = function () {
+    if (!anchoringLatestRequest || !conversation || !latestUserMessage) return;
+    var anchor = document.getElementById(latestUserMessage.anchorId);
+    if (!anchor) return;
+    var distanceToTarget =
+      anchor.getBoundingClientRect().top -
+      conversation.getBoundingClientRect().top -
+      latestRequestTopOffset;
+    if (distanceToTarget <= 2) {
+      anchoringLatestRequest = false;
+      userMessageToAnchor = null;
+      return;
+    }
+    conversation.scrollTop += Math.min(distanceToTarget, 18);
+  };
+  var sessionId = "";
+  var unbindPromptInput = null;
+  var stopPromptTyping = null;
+  var loadingStatusTimer = null;
   var previousOverflow = "";
   var mobileQuery = window.matchMedia("(max-width: 640px)");
-  var iconChat =
-    '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>';
-  var iconClose =
-    '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+  var icon = function (path, size) {
+    return (
+      '<svg aria-hidden="true" width="' +
+      (size || 18) +
+      '" height="' +
+      (size || 18) +
+      '" viewBox="0 0 24 24"><path d="' +
+      path +
+      '"></path></svg>'
+    );
+  };
+  var chatIcon =
+    "M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z";
+  var closeIcon = "M18 6 6 18M6 6l12 12";
+  var botIcon =
+    "M12 8V4H8m-2 4h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Zm3 5v2m6-2v2M2 12h2m16 0h2";
+  var userIcon = "M20 21a8 8 0 0 0-16 0m8-11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z";
+  var sendIcon = "m22 2-7 20-4-9-9-4Zm0 0L11 13";
+  var trashIcon = "M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m5 5v6m4-6v6";
+  var externalIcon =
+    "M15 3h6v6m0-6-9 9m7 1v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6";
   var dispatch = function (name, detail) {
     window.dispatchEvent(
       new CustomEvent("successive-chat:" + name, { detail: detail || {} }),
     );
+  };
+  var create = function (tag, className, text) {
+    var element = document.createElement(tag);
+    if (className) element.className = className;
+    if (text != null) element.textContent = text;
+    return element;
   };
   var setPageLock = function (locked) {
     if (!(config.mobileFullscreen && mobileQuery.matches)) return;
     if (locked) {
       previousOverflow = document.documentElement.style.overflow;
       document.documentElement.style.overflow = "hidden";
-    } else {
-      document.documentElement.style.overflow = previousOverflow;
+    } else document.documentElement.style.overflow = previousOverflow;
+  };
+  var save = function () {
+    try {
+      sessionStorage.setItem(storageKey, JSON.stringify(messages));
+    } catch {}
+  };
+  var validLink = function (value) {
+    return safeUrl(value, "");
+  };
+  var validatedSuccessiveLink = function (value) {
+    var href = validLink(value);
+    if (!href) return "";
+    try {
+      var hostname = new URL(href).hostname.toLowerCase();
+      return hostname === "successive.tech" || hostname.endsWith(".successive.tech")
+        ? href
+        : "";
+    } catch {
+      return "";
     }
   };
-  var buildFrame = function () {
-    if (frame) return;
-    frame = document.createElement("iframe");
-    frame.className = "successive-chat-frame";
-    frame.title = config.title;
-    frame.referrerPolicy = "strict-origin-when-cross-origin";
-    frame.setAttribute(
-      "sandbox",
-      "allow-scripts allow-same-origin allow-forms allow-popups",
-    );
-    var params = new URLSearchParams({
-      title: config.title,
-      welcomeMessage: config.welcomeMessage,
-      primaryColor: config.primaryColor,
-      position: config.position,
-      buttonLabel: config.buttonLabel,
-      apiUrl: config.apiUrl,
-      parentOrigin: window.location.origin,
+  var appendInline = function (parent, text) {
+    var pattern =
+      /\*\*\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)\*\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
+    var cursor = 0;
+    var match;
+    while ((match = pattern.exec(text))) {
+      if (match.index > cursor)
+        parent.appendChild(
+          document.createTextNode(text.slice(cursor, match.index)),
+        );
+      if (match[1] || match[3]) {
+        var label = match[1] || match[3];
+        var href = validLink(match[2] || match[4]);
+        if (href) {
+          var link = create("a", "", label);
+          link.href = href;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.addEventListener("click", function () {
+            dispatch("link-clicked", { cardType: "inline" });
+          });
+          if (match[1]) {
+            var boldLink = create("strong");
+            boldLink.appendChild(link);
+            parent.appendChild(boldLink);
+          } else parent.appendChild(link);
+        } else parent.appendChild(document.createTextNode(label));
+      } else {
+        var strong = create("strong", "", match[5]);
+        parent.appendChild(strong);
+      }
+      cursor = pattern.lastIndex;
+    }
+    if (cursor < text.length)
+      parent.appendChild(document.createTextNode(text.slice(cursor)));
+  };
+  var renderAnswer = function (parent, answer) {
+    var lines = String(answer || "").split(/\r?\n/);
+    var list = null;
+    lines.forEach(function (raw) {
+      var line = raw.trim();
+      if (!line) {
+        list = null;
+        return;
+      }
+      var heading = line.match(/^#{1,3}\s+(.+)$/);
+      var item = line.match(/^[-*]\s+(.+)$/);
+      if (heading) {
+        list = null;
+        var h = create("h3");
+        appendInline(h, heading[1]);
+        parent.appendChild(h);
+      } else if (item) {
+        if (!list) {
+          list = create("ul");
+          parent.appendChild(list);
+        }
+        var li = create("li");
+        appendInline(li, item[1]);
+        list.appendChild(li);
+      } else {
+        list = null;
+        var p = create("p");
+        appendInline(p, line);
+        parent.appendChild(p);
+      }
     });
-    if (config.logoUrl) params.set("logoUrl", config.logoUrl);
-    frame.src = widgetOrigin + "/embed?" + params.toString();
-    panel.appendChild(frame);
+  };
+  var renderCards = function (wrap, cards) {
+    if (!Array.isArray(cards) || !cards.length) return;
+    var grid = create("div", "card-grid");
+    cards.forEach(function (card) {
+      if (!card || !validLink(card.url)) return;
+      var article = create("article", "result-card");
+      var imageUrl = validLink(card.image);
+      if (imageUrl) {
+        var image = create("img");
+        image.src = imageUrl;
+        image.alt = "";
+        image.loading = "lazy";
+        article.appendChild(image);
+      }
+      var content = create("div", "result-content");
+      content.appendChild(
+        create(
+          "span",
+          "badge",
+          card.service_type ||
+            card.badge ||
+            String(card.type || "page").replace("-", " "),
+        ),
+      );
+      content.appendChild(
+        create("h3", "", safeText(card.title, "Result", 200)),
+      );
+      content.appendChild(create("p", "", safeText(card.description, "", 500)));
+      var link = create("a", "", "Explore " + safeText(card.title, "this page", 200) + " ");
+      link.href = validLink(card.url);
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.insertAdjacentHTML("beforeend", icon(externalIcon, 14));
+      link.addEventListener("click", function () {
+        dispatch("link-clicked", { cardType: card.type || "page" });
+      });
+      content.appendChild(link);
+      article.appendChild(content);
+      grid.appendChild(article);
+    });
+    if (grid.childNodes.length) wrap.appendChild(grid);
+  };
+  var renderSources = function (wrap, sources) {
+    if (!Array.isArray(sources) || !sources.length) return;
+    var details = create("details", "sources");
+    details.appendChild(
+      create("summary", "", "Sources (" + sources.length + ")"),
+    );
+    var links = create("div");
+    sources.forEach(function (source) {
+      var href = source && validLink(source.url);
+      if (!href) return;
+      var link = create("a", "", safeText(source.title, "Source", 200) + " ");
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.insertAdjacentHTML("beforeend", icon(externalIcon, 12));
+      link.addEventListener("click", function () {
+        dispatch("link-clicked", { cardType: "source" });
+      });
+      links.appendChild(link);
+    });
+    details.appendChild(links);
+    wrap.appendChild(details);
+  };
+  var renderSuggestions = function (wrap, actions) {
+    if (!Array.isArray(actions) || !actions.length) return;
+    var box = create("div", "suggestions");
+    actions.forEach(function (action) {
+      if (!action || typeof action !== "object" || !action.id || !action.intent) return;
+      var value = safeText(action.label, "", 160);
+      if (!value) return;
+      var button = create("button");
+      button.type = "button";
+      button.appendChild(create("span", "", value));
+      button.insertAdjacentHTML("beforeend", icon("m9 18 6-6-6-6", 16));
+      button.addEventListener("click", function () {
+        sendMessage(value, action);
+      });
+      box.appendChild(button);
+    });
+    wrap.appendChild(box);
+  };
+  var contextualLinkLabel = function (item, answer) {
+    var title = safeText(item.title, "", 200);
+    var identity = safeText(
+      [title, item.type, item.badge, item.service_type, answer].filter(Boolean).join(" "),
+      "",
+      500,
+    ).toLowerCase();
+    var conciseTitle = title
+      .replace(/\s+(?:for|to|with|driving|powering|transforming|accelerating|enabling|delivering)\b.*$/i, "")
+      .replace(/:\s+.*$/, "")
+      .trim() || title;
+    if (/\bleadership\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "leadership team", suffix: " to learn more about Successive's leadership.",
+    };
+    if (/\b(?:office|location|contact)\b/.test(identity)) return {
+      prefix: "Explore ", anchor: "Successive's office locations", suffix: " for contact and location details.",
+    };
+    if (/\bcase[ -]?stud(?:y|ies)\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "full case study", suffix: " for more details on the solution and business impact.",
+    };
+    if (/\b(?:post|blog|article)\b/.test(identity)) return {
+      prefix: "Read the ", anchor: "full article", suffix: " for additional insights and practical guidance.",
+    };
+    if (/\b(?:resource|whitepaper|ebook)\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "full resource", suffix: " for deeper insights and practical guidance.",
+    };
+    if (/\b(?:product|kagen|accelerator)\b/.test(identity) && conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about its capabilities and applications.",
+    };
+    if (/\bindustry\b/.test(identity) && conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about Successive's industry capabilities and solutions.",
+    };
+    if (/\bpartner|partnership\b/.test(identity)) return {
+      prefix: "Explore the ", anchor: "partnership", suffix: " to learn more about the collaboration and related capabilities.",
+    };
+    if (conciseTitle) return {
+      prefix: "Explore ", anchor: conciseTitle, suffix: " to learn more about Successive's capabilities and approach.",
+    };
+    return null;
+  };
+  var renderContextualLink = function (wrap, response) {
+    // The API owns the one final contextual CTA, including category-aware
+    // wording and validated identity. Do not synthesize a second CTA from
+    // hidden cards/sources in the client.
+    if (!response || typeof response.answer !== "string") return;
+    if (response.answer) return;
+    var candidates = [];
+    (Array.isArray(response.sources) ? response.sources : []).forEach(function (source) {
+      if (source) candidates.push(source);
+    });
+    (Array.isArray(response.cards) ? response.cards : []).forEach(function (card) {
+      if (card) candidates.push(card);
+    });
+    var answer = response.answer;
+    for (var index = 0; index < candidates.length; index += 1) {
+      var candidate = candidates[index];
+      var href = validatedSuccessiveLink(candidate.url);
+      if (!href) continue;
+      var cta = contextualLinkLabel(candidate, answer);
+      if (!cta) continue;
+      var escapedHref = href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp("(?:Explore|Read|View|Meet)[^\\n]*\\]\\(" + escapedHref + "\\)", "i").test(answer)) continue;
+      var paragraph = create("p", "contextual-cta");
+      paragraph.appendChild(document.createTextNode(cta.prefix));
+      var link = create("a", "contextual-link", cta.anchor);
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.addEventListener("click", function () {
+        dispatch("link-clicked", { cardType: "contextual" });
+      });
+      paragraph.appendChild(link);
+      paragraph.appendChild(document.createTextNode(cta.suffix));
+      wrap.appendChild(paragraph);
+      return;
+    }
+  };
+  var executableSuggestions = function (response) {
+    if (Array.isArray(response && response.suggestionActions) && response.suggestionActions.length)
+      return response.suggestionActions.filter(function (action) {
+        return action && action.intent === "CONTENT_DISCOVERY" && Array.isArray(action.resultKeys) && action.resultKeys.length;
+      });
+    return [];
+  };
+  var renderMessage = function (message) {
+    var assistant = message.role === "assistant";
+    var row = create(
+      "div",
+      "message-row " + (assistant ? "assistant" : "user"),
+    );
+    var avatar = create("div", "avatar");
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.innerHTML = icon(assistant ? botIcon : userIcon, 17);
+    row.appendChild(avatar);
+    var wrap = create("div", "message-wrap");
+    if (assistant)
+      wrap.appendChild(create("div", "message-author", "Successive Assistant"));
+    var bubble = create("div", "bubble");
+    if (assistant && message === typewritingMessage) {
+      var answer = message.response?.answer || message.content;
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        renderAnswer(bubble, answer);
+        typewritingMessage = null;
+      } else {
+        renderAnswer(bubble, answer);
+        bubble.setAttribute("aria-label", answer);
+        var walker = document.createTreeWalker(
+          bubble,
+          window.NodeFilter.SHOW_TEXT,
+        );
+        var textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        var characters = [];
+        textNodes.forEach(function (textNode) {
+          var fragment = document.createDocumentFragment();
+          Array.from(textNode.nodeValue || "").forEach(function (character) {
+            var characterNode = document.createElement("span");
+            characterNode.textContent = character;
+            characterNode.style.display = "none";
+            fragment.appendChild(characterNode);
+            characters.push(characterNode);
+          });
+          textNode.parentNode.replaceChild(fragment, textNode);
+        });
+        var index = 0;
+        var charactersPerTick = Math.max(
+          1,
+          Math.ceil(characters.length / 140),
+        );
+        var timer = window.setInterval(function () {
+          var nextIndex = Math.min(index + charactersPerTick, characters.length);
+          for (; index < nextIndex; index += 1)
+            characters[index].style.display = "inline";
+          moveLatestRequestTowardTop();
+          if (index === characters.length) {
+            window.clearInterval(timer);
+            typewritingMessage = null;
+            if (message.response) {
+              renderContextualLink(bubble, message.response);
+              if (SHOW_RESULT_CARDS) renderCards(wrap, message.response.cards);
+              if (SHOW_SOURCES) renderSources(wrap, message.response.sources);
+              if (SHOW_SUGGESTIONS)
+                renderSuggestions(wrap, executableSuggestions(message.response));
+            }
+          }
+        }, 22);
+      }
+    } else if (assistant)
+      renderAnswer(bubble, message.response?.answer || message.content);
+    else bubble.textContent = message.content;
+    if (message.failedPrompt) {
+      var retry = create("button", "retry", "Try again");
+      retry.type = "button";
+      retry.addEventListener("click", function () {
+        sendMessage(message.failedPrompt);
+      });
+      bubble.appendChild(retry);
+    }
+    wrap.appendChild(bubble);
+    if (assistant && message.response && message !== typewritingMessage) {
+      renderContextualLink(bubble, message.response);
+      if (SHOW_RESULT_CARDS) renderCards(wrap, message.response.cards);
+      if (SHOW_SOURCES) renderSources(wrap, message.response.sources);
+      if (SHOW_SUGGESTIONS)
+        renderSuggestions(wrap, executableSuggestions(message.response));
+    }
+    row.appendChild(wrap);
+    if (message.anchorId) row.id = message.anchorId;
+    return row;
+  };
+  var renderConversation = function () {
+    if (!conversation) return;
+    var anchorRow = null;
+    var loadingRow = null;
+    conversation.replaceChildren();
+    conversation.appendChild(
+      create(
+        "p",
+        "chat-disclaimer",
+        "Successive AI answers from published Successive content. Please verify important information using the linked sources.",
+      ),
+    );
+    messages.forEach(function (message) {
+      var row = renderMessage(message);
+      conversation.appendChild(row);
+      if (message === userMessageToAnchor) anchorRow = row;
+    });
+    if (loading) {
+      var row = create("div", "message-row assistant");
+      var avatar = create("div", "avatar");
+      avatar.innerHTML = icon(botIcon, 16);
+      row.appendChild(avatar);
+      var typing = create("div", "typing");
+      typing.setAttribute("role", "status");
+      typing.setAttribute("aria-live", "polite");
+      typing.appendChild(
+        create("span", "typing-status", "Analyzing your request…"),
+      );
+      row.appendChild(typing);
+      conversation.appendChild(row);
+      loadingRow = row;
+    }
+    if (anchorRow) {
+      if (revealLatestRequest) {
+        anchorRow.scrollIntoView?.({ behavior: "auto", block: "nearest" });
+        loadingRow?.scrollIntoView?.({ behavior: "auto", block: "nearest" });
+        revealLatestRequest = false;
+      }
+      moveLatestRequestTowardTop();
+    }
+    else if (!hasRenderedConversation) conversation.scrollTop = conversation.scrollHeight;
+    hasRenderedConversation = true;
+  };
+  var seenContent = function () {
+    var seen = {};
+    messages.forEach(function (message) {
+      var response = message.response;
+      if (!response) return;
+      (response.sources || [])
+        .concat(
+          (response.cards || []).map(function (card) {
+            return { title: card.title, url: card.url };
+          }),
+        )
+        .forEach(function (item) {
+          var url = item && validLink(item.url);
+          if (url)
+            seen[url.replace(/\/$/, "").toLowerCase()] = {
+              title: item.title,
+              url: url,
+            };
+        });
+    });
+    return Object.keys(seen)
+      .map(function (key) {
+        return seen[key];
+      })
+      .slice(-500);
+  };
+  var history = function () {
+    return messages.slice(-10).map(function (message) {
+      return {
+        role: message.role,
+        content: message.response?.answer || message.content,
+      };
+    });
+  };
+  var setLoading = function (value) {
+    loading = value;
+    if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
+    loadingStatusTimer = null;
+    if (input) input.disabled = value;
+    if (sendButton)
+      sendButton.disabled = value || !input || input.value.trim().length < 2;
+    renderConversation();
+    if (value)
+      loadingStatusTimer = window.setTimeout(function () {
+        var status = wrapper?.querySelector(".typing-status");
+        if (status) status.textContent = "Preparing your response…";
+      }, 2200);
+  };
+  var sendMessage = function (value, suggestionAction) {
+    var message = typeof value === "string" ? value.trim() : "";
+    if (loading || message.length < 2 || message.length > 1000) return false;
+    var requestHistory = history();
+    var requestSeenContent = seenContent();
+    var userMessage = { role: "user", content: message, anchorId: "chat-request-" + Date.now() + "-" + messages.length };
+    messages.push(userMessage);
+    latestUserMessage = userMessage;
+    userMessageToAnchor = userMessage;
+    anchoringLatestRequest = true;
+    revealLatestRequest = true;
+    save();
+    openWidget();
+    setLoading(true);
+    dispatch("message-submitted", {
+      messageLengthCategory:
+        message.length < 80
+          ? "short"
+          : message.length < 300
+            ? "medium"
+            : "long",
+    });
+    var startedAt = performance.now();
+    var requestHeaders = { "Content-Type": "application/json" };
+    if (config.debugMetrics) requestHeaders["X-Chat-Metrics"] = "true";
+    fetch(config.apiUrl, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify({
+        message: message,
+        history: requestHistory,
+        seenContent: requestSeenContent,
+        sessionId: sessionId,
+        suggestionAction: suggestionAction ? {
+          id: suggestionAction.id,
+          intent: suggestionAction.intent,
+          contentType: suggestionAction.contentType,
+          targetContentType: suggestionAction.targetContentType,
+          subject: suggestionAction.subject,
+          contextType: suggestionAction.contextType,
+          sourcePageRole: suggestionAction.sourcePageRole,
+          targetResourceId: suggestionAction.targetResourceId,
+          targetUrl: suggestionAction.targetUrl,
+          relationType: suggestionAction.relationType,
+          sourceContext: suggestionAction.sourceContext,
+          topic: suggestionAction.topic,
+          entity: suggestionAction.entity,
+          relation: suggestionAction.relation,
+          resultKeys: suggestionAction.resultKeys,
+          sourceResource: suggestionAction.sourceResource,
+          query: suggestionAction.query,
+        } : undefined,
+      }),
+    })
+      .then(function (response) {
+        var metricsHeader = response.headers && typeof response.headers.get === "function"
+          ? response.headers.get("X-Chat-Metrics")
+          : null;
+        return response.json().then(function (json) {
+          if (!response.ok || !json || !json.data)
+            throw new Error(
+              json?.error?.message || "I couldn’t complete that request.",
+            );
+          return { data: json.data, metrics: metricsHeader };
+        });
+      })
+      .then(function (result) {
+        var response = result.data;
+        if (config.debugMetrics) {
+          var metrics;
+          try { metrics = result.metrics ? JSON.parse(result.metrics) : null; } catch (_) { metrics = null; }
+          var clientTotalDurationMs = Math.round(performance.now() - startedAt);
+          var applicationDurationMs = metrics
+            ? Math.max(0, metrics.totalDurationMs - metrics.understandingDurationMs - metrics.finalLlmDurationMs)
+            : null;
+          console.info("successive_chat_metrics", {
+            clientTotalDurationMs: clientTotalDurationMs,
+            applicationDurationMs: applicationDurationMs,
+            browserNetworkOverheadMs: metrics
+              ? Math.max(0, clientTotalDurationMs - metrics.totalDurationMs)
+              : null,
+            server: metrics || "The API did not include server timings.",
+          });
+        }
+        var assistantMessage = {
+          role: "assistant",
+          content: response.answer,
+          response: response,
+        };
+        typewritingMessage = assistantMessage;
+        messages.push(assistantMessage);
+        save();
+        if (!open) {
+          unread.textContent = "1";
+          unread.hidden = false;
+        }
+        dispatch("response-received", {
+          durationCategory:
+            performance.now() - startedAt < 6000 ? "normal" : "slow",
+          hasCards: Array.isArray(response.cards) && response.cards.length > 0,
+        });
+      })
+      .catch(function (error) {
+        var networkFailure =
+          error instanceof Error && /failed to fetch/i.test(error.message);
+        var assistantMessage = {
+          role: "assistant",
+          content: networkFailure
+            ? "The chat service could not be reached. If this is a local HTML test, make sure the chatbot server is running and refresh the page."
+            : error instanceof Error
+              ? error.message
+              : "Something went wrong. Please try again.",
+          failedPrompt: message,
+        };
+        typewritingMessage = assistantMessage;
+        messages.push(assistantMessage);
+        save();
+        dispatch("error", { code: "API_ERROR" });
+      })
+      .finally(function () {
+        setLoading(false);
+      });
+    return true;
   };
   var renderState = function () {
     if (!launcher || !panel) return;
     launcher.setAttribute("aria-expanded", String(open));
     launcher.setAttribute(
       "aria-label",
-      open ? "Close " + config.title : config.buttonLabel,
+      open ? "Close " + config.title : config.buttonLabel || "Chat with Successive",
     );
-    launcher.innerHTML =
-      (open ? iconClose : iconChat) +
-      (open ? "" : '<span class="successive-chat-label"></span>');
-    var label = launcher.querySelector(".successive-chat-label");
-    if (label) label.textContent = config.buttonLabel;
+    launcher.innerHTML = open
+      ? icon(closeIcon, 23)
+      : config.buttonIconUrl
+        ? ""
+        : icon(chatIcon, 23);
+    if (!open && config.buttonIconUrl) {
+      var launcherImage = create("img", "successive-chat-launcher-image");
+      launcherImage.src = config.buttonIconUrl;
+      launcherImage.alt = "";
+      launcherImage.setAttribute("aria-hidden", "true");
+      launcher.appendChild(launcherImage);
+    }
+    if (!open && config.buttonLabel)
+      launcher.appendChild(
+        create("span", "successive-chat-label", config.buttonLabel),
+      );
     panel.hidden = !open;
     root.classList.toggle("successive-chat-open", open);
   };
   var openWidget = function () {
     if (open) return;
-    buildFrame();
     open = true;
     unread.textContent = "";
     unread.hidden = true;
     renderState();
     setPageLock(true);
     dispatch("open");
-    if (ready && frame.contentWindow)
-      frame.contentWindow.postMessage(
-        { namespace: "successive-chat", type: "SUCCESSIVE_CHAT_OPEN" },
-        widgetOrigin,
-      );
+    window.setTimeout(function () {
+      input?.focus();
+    }, 0);
   };
   var closeWidget = function () {
     if (!open) return;
@@ -173,126 +818,258 @@
     renderState();
     setPageLock(false);
     dispatch("close");
-    if (ready && frame && frame.contentWindow)
-      frame.contentWindow.postMessage(
-        { namespace: "successive-chat", type: "SUCCESSIVE_CHAT_CLOSE" },
-        widgetOrigin,
-      );
   };
   var toggleWidget = function () {
     if (open) closeWidget();
     else openWidget();
   };
-  var onMessage = function (event) {
-    if (
-      !frame ||
-      event.origin !== widgetOrigin ||
-      event.source !== frame.contentWindow
-    )
-      return;
-    var message = event.data;
-    if (
-      !message ||
-      message.namespace !== "successive-chat" ||
-      typeof message.type !== "string"
-    )
-      return;
-    if (
-      [
-        "SUCCESSIVE_CHAT_READY",
-        "SUCCESSIVE_CHAT_CLOSE",
-        "SUCCESSIVE_CHAT_RESIZE",
-        "SUCCESSIVE_CHAT_UNREAD",
-        "SUCCESSIVE_CHAT_ERROR",
-      ].indexOf(message.type) < 0
-    )
-      return;
-    if (message.type === "SUCCESSIVE_CHAT_READY") {
-      ready = true;
-      dispatch("ready");
-    } else if (message.type === "SUCCESSIVE_CHAT_CLOSE") {
-      closeWidget();
-    } else if (
-      message.type === "SUCCESSIVE_CHAT_RESIZE" &&
-      message.payload &&
-      Number.isInteger(message.payload.height) &&
-      message.payload.height >= 450 &&
-      message.payload.height <= 850
-    ) {
-      panel.style.height = message.payload.height + "px";
-    } else if (
-      message.type === "SUCCESSIVE_CHAT_UNREAD" &&
-      message.payload &&
-      Number.isInteger(message.payload.count) &&
-      message.payload.count >= 0 &&
-      message.payload.count <= 99
-    ) {
-      unread.textContent = String(message.payload.count);
-      unread.hidden = open || message.payload.count === 0;
-    } else if (message.type === "SUCCESSIVE_CHAT_ERROR") {
-      dispatch("error", { code: "IFRAME_ERROR" });
-    }
+  var clearConversation = function () {
+    messages = [{ role: "assistant", content: config.welcomeMessage }];
+    latestUserMessage = null;
+    userMessageToAnchor = null;
+    anchoringLatestRequest = false;
+    revealLatestRequest = false;
+    save();
+    renderConversation();
+  };
+  var animatePromptPlaceholder = function (externalInput) {
+    var fallbackPrompt = externalInput.getAttribute("placeholder") || "What can we solve for you?";
+    var promptText = function () {
+      var source = config.promptTypingContentId
+        ? document.getElementById(config.promptTypingContentId)
+        : null;
+      var content = source ? String(source.textContent || "").trim() : "";
+      return content || fallbackPrompt;
+    };
+    var timer = null;
+    var character = 0;
+    var deleting = false;
+    var active = true;
+    var render = function () {
+      if (!active) return;
+      var prompt = promptText();
+      if (document.activeElement === externalInput || String(externalInput.value || "")) {
+        externalInput.placeholder = fallbackPrompt;
+        timer = window.setTimeout(render, 180);
+        return;
+      }
+      externalInput.placeholder = prompt.slice(0, character) + "|";
+      if (!deleting && character < prompt.length) {
+        character += 1;
+        timer = window.setTimeout(render, 55);
+      } else if (!deleting) {
+        deleting = true;
+        timer = window.setTimeout(render, 1800);
+      } else if (character > 0) {
+        character -= 1;
+        timer = window.setTimeout(render, 28);
+      } else {
+        deleting = false;
+        timer = window.setTimeout(render, 450);
+      }
+    };
+    var reset = function () {
+      if (!String(externalInput.value || "")) {
+        character = 0;
+        deleting = false;
+      }
+    };
+    externalInput.addEventListener("focus", reset);
+    externalInput.addEventListener("blur", reset);
+    externalInput.addEventListener("input", reset);
+    render();
+    return function () {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+      externalInput.placeholder = fallbackPrompt;
+      externalInput.removeEventListener("focus", reset);
+      externalInput.removeEventListener("blur", reset);
+      externalInput.removeEventListener("input", reset);
+    };
+  };
+  var bindPromptInput = function () {
+    if (!config.promptInputId) return;
+    var externalInput = document.getElementById(config.promptInputId);
+    if (!externalInput || !("value" in externalInput)) return;
+    var form = externalInput.form || externalInput.closest("form");
+    var button = config.promptButtonId
+      ? document.getElementById(config.promptButtonId)
+      : null;
+    var update = function () {
+      if (button)
+        button.disabled = String(externalInput.value || "").trim().length < 2;
+    };
+    var submit = function (event) {
+      if (event) event.preventDefault();
+      if (sendMessage(String(externalInput.value || "")))
+        externalInput.value = "";
+      update();
+    };
+    var keydown = function (event) {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      event.preventDefault();
+      submit(event);
+    };
+    externalInput.addEventListener("input", update);
+    externalInput.addEventListener("keydown", keydown);
+    if (form) form.addEventListener("submit", submit);
+    else if (button) button.addEventListener("click", submit);
+    stopPromptTyping = animatePromptPlaceholder(externalInput);
+    update();
+    unbindPromptInput = function () {
+      externalInput.removeEventListener("input", update);
+      externalInput.removeEventListener("keydown", keydown);
+      if (form) form.removeEventListener("submit", submit);
+      else if (button) button.removeEventListener("click", submit);
+      if (stopPromptTyping) stopPromptTyping();
+      stopPromptTyping = null;
+    };
   };
   var destroy = function () {
     setPageLock(false);
-    window.removeEventListener("message", onMessage);
-    if (root) root.remove();
-    if (style) style.remove();
+    if (unbindPromptInput) unbindPromptInput();
+    if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
+    if (wrapper) wrapper.remove();
+    else if (root) root.remove();
+    if (stylesheet) stylesheet.remove();
     delete window.SuccessiveChat;
   };
   var init = function () {
-    if (document.getElementById("successive-chat-widget-root")) return;
-    style = document.createElement("style");
-    style.id = "successive-chat-widget-styles";
-    style.textContent =
-      "#successive-chat-widget-root{--kc-primary:" +
-      config.primaryColor +
-      ";position:fixed;bottom:max(20px,env(safe-area-inset-bottom));" +
-      (config.position === "bottom-left" ? "left:20px" : "right:20px") +
-      ";z-index:" +
-      config.zIndex +
-      ';font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}' +
-      "#successive-chat-widget-root *{box-sizing:border-box}.successive-chat-launcher{margin-left:auto;display:flex;align-items:center;gap:9px;min-width:56px;height:56px;padding:0 18px;border:0;border-radius:999px;background:var(--kc-primary);color:#fff;box-shadow:0 12px 34px rgba(15,23,42,.28);font:700 14px inherit;cursor:pointer;transition:transform .18s,box-shadow .18s}.successive-chat-launcher:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(15,23,42,.35)}.successive-chat-launcher:focus-visible{outline:3px solid #a5b4fc;outline-offset:3px}.successive-chat-launcher svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.successive-chat-panel{position:absolute;bottom:70px;" +
-      (config.position === "bottom-left" ? "left:0" : "right:0") +
-      ";width:" +
-      config.width +
-      "px;height:" +
-      config.height +
-      "px;max-width:calc(100vw - 24px);max-height:calc(100vh - 104px);overflow:hidden;border-radius:18px;background:#fff;box-shadow:0 24px 80px rgba(2,6,23,.3);transform-origin:bottom " +
-      (config.position === "bottom-left" ? "left" : "right") +
-      ";animation:successive-chat-in .2s ease-out}.successive-chat-panel[hidden]{display:none}.successive-chat-frame{display:block;width:100%;height:100%;border:0}.successive-chat-close-hit-area{position:absolute;z-index:2;top:0;right:0;width:52px;height:58px;padding:0;border:0;background:transparent;cursor:pointer}.successive-chat-close-hit-area:focus-visible{outline:3px solid #fff;outline-offset:-6px;border-radius:10px}.successive-chat-unread{position:absolute;top:-4px;right:-4px;min-width:20px;height:20px;padding:0 5px;border:2px solid #fff;border-radius:999px;background:#ef4444;color:#fff;font:700 11px/16px sans-serif;text-align:center}.successive-chat-unread[hidden]{display:none}@keyframes successive-chat-in{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:none}}" +
-      "@media(max-width:640px){.successive-chat-label{display:none}.successive-chat-launcher{width:56px;padding:0;justify-content:center}" +
-      (config.mobileFullscreen
-        ? ".successive-chat-panel{position:fixed;inset:0;width:100vw;height:100dvh;max-width:none;max-height:none;border-radius:0}"
-        : "") +
-      "}@media(prefers-reduced-motion:reduce){.successive-chat-panel,.successive-chat-launcher{animation:none;transition:none}}";
-    document.head.appendChild(style);
-    root = document.createElement("div");
+    var staleRoot = document.getElementById("successive-chat-widget-root");
+    var staleWrapper = staleRoot?.closest(".successive-chat-widget-wrap");
+    if (staleWrapper) staleWrapper.remove();
+    else staleRoot?.remove();
+    document.getElementById("successive-chat-widget-styles")?.remove();
+    try {
+      sessionId = sessionStorage.getItem(sessionKey) || crypto.randomUUID();
+      sessionStorage.setItem(sessionKey, sessionId);
+      var saved = JSON.parse(sessionStorage.getItem(storageKey) || "null");
+      if (Array.isArray(saved)) messages = saved.slice(-100);
+    } catch {
+      sessionId = "session-" + Date.now().toString(36);
+    }
+    if (!messages.length)
+      messages = [{ role: "assistant", content: config.welcomeMessage }];
+    stylesheet = document.getElementById("successive-chat-widget-styles");
+    if (!stylesheet) {
+      stylesheet = create("link");
+      stylesheet.id = "successive-chat-widget-styles";
+      stylesheet.rel = "stylesheet";
+      stylesheet.href = safeUrl(
+        data.stylesUrl,
+        new URL("successive-chat-widget.css", scriptUrl).href,
+      );
+      document.head.appendChild(stylesheet);
+    }
+    wrapper = create("div", "successive-chat-widget-wrap");
+    root = create("div");
     root.id = "successive-chat-widget-root";
-    panel = document.createElement("div");
-    panel.className = "successive-chat-panel";
+    root.classList.add(
+      config.position === "bottom-left" ? "position-left" : "position-right",
+    );
+    if (config.mobileFullscreen) root.classList.add("mobile-fullscreen");
+    root.style.setProperty("--kc-primary", config.primaryColor);
+    root.style.setProperty(
+      "--kc-primary-foreground",
+      foreground(config.primaryColor),
+    );
+    root.style.setProperty("--kc-z-index", String(config.zIndex));
+    root.style.setProperty("--kc-width", config.width + "px");
+    root.style.setProperty("--kc-height", config.height + "px");
+    panel = create("div", "successive-chat-panel");
     panel.hidden = true;
-    closeHitArea = document.createElement("button");
-    closeHitArea.type = "button";
-    closeHitArea.className = "successive-chat-close-hit-area";
-    closeHitArea.setAttribute("aria-label", "Close chat");
-    closeHitArea.title = "Close chat";
-    closeHitArea.addEventListener("click", closeWidget);
-    panel.appendChild(closeHitArea);
-    launcher = document.createElement("button");
+    var chat = create("section", "successive-chat-ui");
+    chat.setAttribute("aria-label", config.title);
+    var header = create("div", "chat-header");
+    var title = create("div", "chat-title");
+    if (config.logoUrl) {
+      var logo = create("img", "chat-logo");
+      logo.src = config.logoUrl;
+      logo.alt = "";
+      title.appendChild(logo);
+    } else title.appendChild(create("span", "online"));
+    title.appendChild(document.createTextNode(config.title));
+    var actions = create("div", "chat-actions");
+    var clear = create("button");
+    clear.type = "button";
+    clear.setAttribute("aria-label", "Clear conversation");
+    clear.title = "Clear conversation";
+    clear.innerHTML = icon(trashIcon, 16);
+    clear.appendChild(create("span", "", "Clear"));
+    clear.addEventListener("click", clearConversation);
+    var close = create("button");
+    close.type = "button";
+    close.title = "Close chat";
+    close.setAttribute("aria-label", "Close chat");
+    close.innerHTML = icon(closeIcon, 18);
+    close.addEventListener("click", closeWidget);
+    actions.appendChild(clear);
+    actions.appendChild(close);
+    header.appendChild(title);
+    header.appendChild(actions);
+    conversation = create("div", "conversation");
+    conversation.setAttribute("aria-live", "polite");
+    var inputArea = create("div", "input-area");
+    input = create("textarea");
+    input.rows = 1;
+    input.maxLength = 1000;
+    input.placeholder = "Ask Successive anything…";
+    input.setAttribute("aria-label", "Message Successive assistant");
+    sendButton = create("button", "send");
+    sendButton.type = "button";
+    sendButton.setAttribute("aria-label", "Send message");
+    sendButton.innerHTML = icon(sendIcon, 18);
+    var submit = function () {
+      var value = input.value;
+      if (sendMessage(value)) input.value = "";
+      sendButton.disabled = loading || input.value.trim().length < 2;
+    };
+    input.addEventListener("input", function () {
+      sendButton.disabled = loading || input.value.trim().length < 2;
+    });
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        submit();
+      }
+    });
+    sendButton.addEventListener("click", submit);
+    sendButton.disabled = true;
+    inputArea.appendChild(input);
+    inputArea.appendChild(sendButton);
+    chat.appendChild(header);
+    chat.appendChild(conversation);
+    chat.appendChild(inputArea);
+    panel.appendChild(chat);
+    launcher = create("button", "successive-chat-launcher");
     launcher.type = "button";
-    launcher.className = "successive-chat-launcher";
-    launcher.style.color = foreground(config.primaryColor);
-    unread = document.createElement("span");
-    unread.className = "successive-chat-unread";
-    unread.hidden = true;
     launcher.addEventListener("click", toggleWidget);
+    unread = create("span", "successive-chat-unread");
+    unread.hidden = true;
     root.appendChild(panel);
     root.appendChild(launcher);
     root.appendChild(unread);
-    document.body.appendChild(root);
-    window.addEventListener("message", onMessage);
+    wrapper.appendChild(root);
+    var mountContainer = config.containerId
+      ? document.getElementById(config.containerId)
+      : null;
+    var externalInput = config.promptInputId
+      ? document.getElementById(config.promptInputId)
+      : null;
+    var externalButton = config.promptButtonId
+      ? document.getElementById(config.promptButtonId)
+      : null;
+    if (
+      mountContainer &&
+      ((externalInput && mountContainer.contains(externalInput)) ||
+        (externalButton && mountContainer.contains(externalButton)))
+    )
+      mountContainer = null;
+    (mountContainer || document.body).appendChild(wrapper);
+    renderConversation();
     renderState();
+    bindPromptInput();
+    dispatch("ready");
     if (config.openByDefault) openWidget();
   };
 
@@ -301,6 +1078,7 @@
     open: openWidget,
     close: closeWidget,
     toggle: toggleWidget,
+    sendMessage: sendMessage,
     destroy: destroy,
     isOpen: function () {
       return open;

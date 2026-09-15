@@ -13,7 +13,20 @@ const includes = (text: string, terms: string[]) =>
   terms.some((term) => text.includes(term));
 
 export function detectIntent(query: string): Intent {
-  const q = query.toLowerCase().replace(/\s+/g, " ").trim();
+  const q = query
+    .toLowerCase()
+    .replace(/\bservies\b/g, "services")
+    .replace(/\bserivces?\b/g, "services")
+    .replace(/\bsulutions?\b/g, "solutions")
+    .replace(/\bhelthcare\b/g, "healthcare")
+    .replace(/\bwebniars?\b/g, "webinars")
+    .replace(/\bwhitepepers?\b/g, "whitepapers")
+    .replace(/\bwhtieperpers?\b/g, "whitepapers")
+    .replace(/\bstduy\b/g, "study")
+    .replace(/\bdevlopment\b/g, "development")
+    .replace(/\breleted\b/g, "related")
+    .replace(/\s+/g, " ")
+    .trim();
   // Visitors often use navigation-style one or two word prompts. Treat those
   // as real content intents instead of requiring a full sentence.
   if (/^(about|about us|company|company info(?:rmation)?)$/.test(q))
@@ -28,10 +41,28 @@ export function detectIntent(query: string): Intent {
       "customer stories",
       "success story",
       "success stories",
+      "another example",
+      "similar example",
+      "similar work",
+      "done something similar",
+      "any example",
+      "any examples",
+      "example for this",
+      "examples for this",
     ])
   )
     return "case_studies";
-  if (includes(q, ["event", "events", "webinar", "webinars"])) return "events";
+  if (
+    includes(q, [
+      "event",
+      "events",
+      "webinar",
+      "webinars",
+      "which one should i attend",
+      "where can i register",
+    ])
+  )
+    return "events";
   if (
     includes(q, [
       "contact",
@@ -39,10 +70,15 @@ export function detectIntent(query: string): Intent {
       "talk to",
       "book a demo",
       "reach successive",
-      "need help",
-      "help me",
-      "get help",
-    ])
+      "where are successive offices",
+      "where are your offices",
+      "where is successive located",
+      "office locations",
+      "speak with someone",
+      "what should i do next",
+      "project estimate",
+      "get an estimate",
+    ]) || /\b(?:what|which|show|list)\b.*\b(?:office|location)s?\b/.test(q)
   )
     return "contact";
   if (
@@ -55,27 +91,39 @@ export function detectIntent(query: string): Intent {
   )
     return "product_detail";
   if (
-    includes(q, ["company", "who is successive", "successive ai"]) ||
+    includes(q, [
+      "who is successive",
+      "successive ai",
+    ]) ||
     /^(?:tell me )?about (?:successive|the company)$/.test(q)
   )
     return "about";
+  if (/^(?:tell me about|who is|what is) successive(?: digital)?[?.!]*$/.test(q))
+    return "about";
+  if (
+    /^(?:can you )?explain(?: about)? (?:your )?successive(?: digital)?[?.!]*$/.test(q) ||
+    /^(?:tell me about|explain|what is) (?:your|the) company[?.!]*$/.test(q)
+  )
+    return "about";
+  if (/\b(?:services?|consulting|development|capabilit(?:y|ies)|solutions?)\b/.test(q) ||
+      /\b(?:show|list|find|explore|what|which)\b.*\bproducts?\b/.test(q) ||
+      /\bkagen(?: add| voice)?\b/.test(q))
+    return "products";
   if (
     includes(q, [
-      "product",
-      "products",
-      "service",
-      "services",
-      "offering",
-      "offerings",
-      "development",
-      "consulting",
-      "solution",
-      "solutions",
-      "platform",
+      "resource",
+      "resources",
+      "whitepaper",
+      "whitepapers",
+      "white paper",
+      "white papers",
+      "whitepeper",
+      "whitepepers",
+      "whtieperper",
+      "whtieperpers",
     ])
   )
-    return "products";
-  if (includes(q, ["resource", "resources"])) return "resources";
+    return "resources";
   if (includes(q, ["blog", "article", "articles", "insight", "insights"]))
     return "blogs";
   if (

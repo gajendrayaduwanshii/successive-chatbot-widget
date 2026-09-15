@@ -7,11 +7,34 @@ export const cardSchema = z.object({
   url: z.string().url(),
   image: z.string().url().optional(),
   badge: z.string().max(50).optional(),
+  service_type: z.string().min(1).max(50).optional(),
 });
+export const suggestionActionSchema = z.object({
+  id: z.string().min(1).max(80),
+  label: z.string().min(2).max(160),
+  intent: z.enum(["CUSTOMER_WORK_DISCOVERY", "CONTENT_DISCOVERY", "PUBLIC_ORGANIZATION_OVERVIEW", "FOLLOW_UP_QUERY"]),
+  contentType: z.enum(["case-study", "customer-work"]).optional(),
+  targetContentType: z.string().min(1).max(80).optional(),
+  subject: z.string().min(1).max(200).optional(),
+  contextType: z.enum(["TOPIC_CONTEXT", "INDIVIDUAL_PAGE_CONTEXT", "CATEGORY_LISTING_CONTEXT"]).optional(),
+  sourcePageRole: z.string().min(1).max(80).optional(),
+  targetResourceId: z.string().min(3).max(100).optional(),
+  targetUrl: z.string().url().optional(),
+  relationType: z.enum(["PARENT", "CHILD", "SIBLING", "SAME_SECTION", "SAME_PAGE_GROUP", "DIRECTLY_CONNECTED"]).optional(),
+  sourceContext: z.string().max(80).optional(),
+  topic: z.string().max(200).optional(),
+  entity: z.string().max(200).optional(),
+  relation: z.enum(["ANSWER_EVIDENCE", "RELATED_TO_SOURCE", "COLLECTION_MEMBER", "CUSTOMER_WORK", "PUBLIC_ORGANIZATIONS"]).optional(),
+  resultKeys: z.array(z.string().min(3).max(100)).max(6).optional(),
+  sourceResource: z.string().url().optional(),
+  query: z.string().min(2).max(300).optional(),
+});
+export type SuggestionAction = z.infer<typeof suggestionActionSchema>;
 export const assistantResponseSchema = z.object({
   answer: z.string().min(1).max(8000),
   cards: z.array(cardSchema).max(6).default([]),
   suggestions: z.array(z.string().min(2).max(160)).max(4).default([]),
+  suggestionActions: z.array(suggestionActionSchema).max(4).optional(),
   sources: z
     .array(
       z.object({ title: z.string().min(1).max(200), url: z.string().url() }),
@@ -42,6 +65,10 @@ export function normalizeAssistantResponse(value: unknown) {
           badge:
             typeof card.badge === "string"
               ? card.badge.slice(0, 50)
+              : undefined,
+          service_type:
+            typeof card.service_type === "string"
+              ? card.service_type.slice(0, 50)
               : undefined,
         };
         const parsed = cardSchema.safeParse(normalized);
@@ -86,6 +113,7 @@ export function normalizeAssistantResponse(value: unknown) {
           .filter((value) => value.trim().length >= 2)
           .slice(0, 4)
       : [],
+    suggestionActions: Array.isArray(input.suggestionActions) ? input.suggestionActions : [],
     sources: sources.slice(0, 6),
   });
 }
