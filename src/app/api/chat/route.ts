@@ -355,6 +355,28 @@ export async function POST(request: NextRequest) {
       structuredFallbackNetworkMs: 0,
       structuredFallbackProcessingMs: 0,
     },
+    preOtherBreakdown: {
+      rateLimitAndGuardsMs: 0, queryPreparationMs: 0, deterministicUnderstandingMs: 0,
+      followupDecisionMs: 0, semanticBypassDecisionMs: 0, collectionResolutionMs: 0,
+      subjectResolutionMs: 0, exactTitleDecisionMs: 0, retrievalMessagePreparationMs: 0,
+      literalReusePreparationMs: 0, otherMs: 0,
+    },
+    literalRetrieval: {
+      reuseDecisionMs: 0, initialRetrievalMs: 0, secondRetrievalMs: 0,
+      candidateLookupMs: 0, candidateCount: 0, rankedDocumentCount: 0,
+      rankingMs: 0, reliabilityMs: 0, fullFallbackUsed: false,
+      fullFallbackMs: 0, fullFallbackDocumentCount: 0,
+    },
+    post: {
+      evidenceValidationMs: 0, matchAlignmentMs: 0, evidenceSelectionMs: 0,
+      structuralSupportMs: 0, deterministicAnswerMs: 0, evidencePackageMs: 0,
+      qualityGateMs: 0, sourceResolutionMs: 0, suggestionCorpusMs: 0,
+      inlineCandidateLookupMs: 0, inlineLinksMs: 0, inlineFullFallbackMs: 0,
+      navigationCandidateLookupMs: 0, navigationRelationshipScoringMs: 0,
+      navigationFullFallbackMs: 0, cardsCtaMs: 0, finalResponseShapingMs: 0,
+      serializationMs: 0, postOtherMs: 0, inlineCandidateCount: 0,
+      navigationCandidateCount: 0, inlineFullScanUsed: false, navigationFullScanUsed: false,
+    },
   };
   let understandingDurationMs = 0;
   let retrievalDurationMs = 0;
@@ -2089,6 +2111,7 @@ export async function POST(request: NextRequest) {
       !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage;
     const reuseInitialRetrieval = Boolean(exactTitleLock) || (standaloneDeterministicQuery &&
       normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage));
+    const initialRetrievalStartedAt = performance.now();
     const initialRetrieval = await retrieveFromIndex(
       retrievalMessage,
       isNamedSuccessivePersonQuery ? "general" : intent,
@@ -2096,6 +2119,7 @@ export async function POST(request: NextRequest) {
       shouldDeduplicate ? seenContentKeys : new Set<string>(),
       understanding,
     );
+    appTrace.literalRetrieval.initialRetrievalMs = performance.now() - initialRetrievalStartedAt;
     // For an independent deterministic question, a reliable first result is
     // already grounded in the normalized retrieval plan. Reserve the costly
     // literal whole-index fallback for an unresolved first pass; contextual
@@ -2105,7 +2129,11 @@ export async function POST(request: NextRequest) {
     // reliable, it is the complete query and a second raw fallback is not
     // needed. A weak or missing result still runs the literal fallback.
     const canReuseReliableInitial = !usedSemanticUnderstanding && initialRetrieval.reliableMatchFound;
-    const literalRetrieval = reuseInitialRetrieval || canReuseReliableInitial
+    const reuseDecisionStartedAt = performance.now();
+    const shouldReuseLiteral = reuseInitialRetrieval || canReuseReliableInitial;
+    appTrace.literalRetrieval.reuseDecisionMs = performance.now() - reuseDecisionStartedAt;
+    const literalRetrievalStartedAt = performance.now();
+    const literalRetrieval = shouldReuseLiteral
       ? initialRetrieval
       : await retrieveFromIndex(
           effectiveMessage,
@@ -2114,7 +2142,13 @@ export async function POST(request: NextRequest) {
           shouldDeduplicate ? seenContentKeys : new Set<string>(),
           literalUnderstanding,
         );
-    reusedInitialRetrievalForLiteral = reuseInitialRetrieval || canReuseReliableInitial;
+    appTrace.literalRetrieval.secondRetrievalMs = shouldReuseLiteral ? 0 : performance.now() - literalRetrievalStartedAt;
+    appTrace.literalRetrieval.candidateCount = literalRetrieval.candidates?.length ?? 0;
+    appTrace.literalRetrieval.rankedDocumentCount = literalRetrieval.candidates?.length ?? 0;
+    appTrace.literalRetrieval.rankingMs = literalRetrieval.timings?.rankingMs ?? 0;
+    appTrace.literalRetrieval.fullFallbackUsed = !shouldReuseLiteral && (literalRetrieval.candidates?.length ?? 0) >= literalRetrieval.indexedDocuments;
+    appTrace.literalRetrieval.fullFallbackDocumentCount = appTrace.literalRetrieval.fullFallbackUsed ? literalRetrieval.indexedDocuments : 0;
+    reusedInitialRetrievalForLiteral = shouldReuseLiteral;
     let retrieval = initialRetrieval;
     const strongestByDocument = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
       const key = `${match.document.type}:${match.document.id}`;
@@ -2961,6 +2995,12 @@ export async function POST(request: NextRequest) {
       0,
       totalDurationMs - roundedUnderstandingDurationMs - roundedFinalLlmDurationMs,
     );
+    const postRetrievalApplicationDurationMs = Math.max(
+      0,
+      applicationDurationMs - roundedPreRetrievalApplicationDurationMs - roundedRetrievalDurationMs - roundedContextConstructionDurationMs,
+    );
+    appTrace.preOtherBreakdown.otherMs = appTrace.pre.preOtherMs;
+    appTrace.post.postOtherMs = postRetrievalApplicationDurationMs;
     const chatMetrics = {
       totalDurationMs,
       applicationDurationMs,
@@ -2975,10 +3015,7 @@ export async function POST(request: NextRequest) {
       rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
       contextConstructionDurationMs: roundedContextConstructionDurationMs,
       finalLlmDurationMs: roundedFinalLlmDurationMs,
-      postRetrievalApplicationDurationMs: Math.max(
-        0,
-        applicationDurationMs - roundedPreRetrievalApplicationDurationMs - roundedRetrievalDurationMs - roundedContextConstructionDurationMs,
-      ),
+      postRetrievalApplicationDurationMs,
       wordpress: getContentLoadDiagnostics(),
       index: getIndexDiagnostics(),
       selectedDocuments: selectedMatches.length,
