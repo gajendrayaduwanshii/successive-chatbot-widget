@@ -132,6 +132,7 @@ export async function storeRefreshedSearchIndex(
   if (process.env.NODE_ENV === "test") return;
   cachedIndex = { documents, expiresAt: Date.now() + INDEX_CACHE_MS };
   lastIndexDiagnostics = { cache: "hit", durationMs: 0, documents: documents.length };
+  prewarmSearchIndexDerivedData(documents);
   await persistIndex(documents);
 }
 
@@ -1094,14 +1095,48 @@ function boundedTitleTypoStrength(document: SuccessiveSearchDocument, subject: s
   }) ? 0.97 : 0;
 }
 
-/** Corrects one-edit tokens only when the correction is owned by indexed identities. */
-function correctMinorTyposFromIndex(query: string, index: SuccessiveSearchDocument[]): string {
+const identityVocabularyCache = new WeakMap<
+  SuccessiveSearchDocument[],
+  Map<string, number>
+>();
+const exactIdentityLookupCache = new WeakMap<
+  SuccessiveSearchDocument[],
+  Map<string, SuccessiveSearchDocument[]>
+>();
+
+function identityVocabulary(index: SuccessiveSearchDocument[]): Map<string, number> {
+  const cached = identityVocabularyCache.get(index);
+  if (cached) return cached;
   const vocabulary = new Map<string, number>();
   index.forEach((document) => {
     const identity = `${document.normalizedTitle} ${document.slug.replace(/-/g, " ")} ${document.headings.join(" ")}`;
     normalizeSearchText(identity).split(" ").filter((token) => token.length >= 5)
       .forEach((token) => vocabulary.set(token, (vocabulary.get(token) ?? 0) + 1));
   });
+  identityVocabularyCache.set(index, vocabulary);
+  return vocabulary;
+}
+
+function exactIdentityLookup(index: SuccessiveSearchDocument[]): Map<string, SuccessiveSearchDocument[]> {
+  const cached = exactIdentityLookupCache.get(index);
+  if (cached) return cached;
+  const lookup = new Map<string, SuccessiveSearchDocument[]>();
+  index.forEach((document) => {
+    [document.normalizedTitle, normalizeSearchText(document.slug.replace(/-/g, " ")), ...document.aliases]
+      .filter(Boolean)
+      .forEach((identity) => {
+        const matches = lookup.get(identity) ?? [];
+        if (!matches.includes(document)) matches.push(document);
+        lookup.set(identity, matches);
+      });
+  });
+  exactIdentityLookupCache.set(index, lookup);
+  return lookup;
+}
+
+/** Corrects one-edit tokens only when the correction is owned by indexed identities. */
+function correctMinorTyposFromIndex(query: string, index: SuccessiveSearchDocument[]): string {
+  const vocabulary = identityVocabulary(index);
   return normalizeSearchText(query).split(" ").map((token) => {
     if (token.length < 5 || vocabulary.has(token)) return token;
     const candidates = [...vocabulary.entries()]
@@ -1450,6 +1485,14 @@ function fullIndexInverseDocumentFrequency(
   return idf;
 }
 
+function prewarmSearchIndexDerivedData(
+  documents: SuccessiveSearchDocument[],
+): void {
+  identityVocabulary(documents);
+  exactIdentityLookup(documents);
+  fullIndexInverseDocumentFrequency(documents);
+}
+
 async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
   // WordPress content is already revalidated every hour. Reusing the
   // derived index avoids repeated recursive ACF traversal and chunk generation
@@ -1540,7 +1583,9 @@ export function matchExactIndexedTitle(
       url: document.url,
     };
   };
-  const candidates = index
+  const exactCandidates = exactIdentityLookup(index).get(subject);
+  const candidateIndex = exactCandidates?.length ? exactCandidates : index;
+  const candidates = candidateIndex
     .map((document) => ({ document, strength: Math.max(
       directIdentityStrength(document, subject), boundedTitleTypoStrength(document, subject),
     ), definitionPassages: definitionQuery ? definitionEvidencePassages(document, subject) : [],
