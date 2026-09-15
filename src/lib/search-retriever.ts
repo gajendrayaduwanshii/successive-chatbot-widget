@@ -1598,6 +1598,28 @@ async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
 }
 
 /**
+ * Exposes the process-local prepared corpus to non-retrieval route consumers.
+ * This deliberately returns the same document array used by title resolution
+ * and retrieval, preserving its cache and in-flight-build deduplication.
+ */
+export async function getPreparedSearchCorpus(): Promise<SuccessiveSearchDocument[]> {
+  return loadSearchIndex();
+}
+
+/** Returns bounded title/slug/heading candidates from the prepared identity map. */
+export function preparedIdentityCandidates(
+  documents: SuccessiveSearchDocument[],
+  text: string,
+): SuccessiveSearchDocument[] {
+  const terms = normalizeSearchText(text).split(" ").filter((term) => term.length >= 4);
+  if (!terms.length) return [];
+  const candidates = new Set<SuccessiveSearchDocument>();
+  for (const term of terms)
+    for (const document of candidateLookup(documents).get(term) ?? []) candidates.add(document);
+  return [...candidates];
+}
+
+/**
  * Resolves only explicit lookup wrappers around a known indexed identity.
  * Intent-looking words inside the captured title remain part of that identity.
  */

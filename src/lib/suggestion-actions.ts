@@ -298,16 +298,21 @@ function relationStrength(source: SuccessiveSearchDocument, candidate: Successiv
  * Corpus-wide, content-first action discovery. Each action captures the exact
  * accepted result identities; the click path revalidates those same identities.
  */
-export function buildGlobalRelatedContentActions({ source, corpus, userSubject, recentActionIds = [], limit = 3 }: {
+export function buildGlobalRelatedContentActions({ source, corpus, candidateCorpus, userSubject, recentActionIds = [], limit = 3 }: {
   source: SuccessiveSearchDocument;
   corpus: SuccessiveSearchDocument[];
+  candidateCorpus?: SuccessiveSearchDocument[];
   userSubject?: string;
   recentActionIds?: string[];
   limit?: number;
 }): SuggestionAction[] {
   const recent = new Set(recentActionIds);
   const groups = new Map<SuccessiveSearchDocument["role"], Array<{ document: SuccessiveSearchDocument; score: number }>>();
-  for (const document of corpus) {
+  // Prepared title/heading candidates preserve the existing scorer while
+  // avoiding a corpus-wide relation pass for ordinary topical navigation.
+  // An unavailable lookup retains the original complete-corpus behavior.
+  const searchableCorpus = candidateCorpus?.length ? candidateCorpus : corpus;
+  for (const document of searchableCorpus) {
     if (document.id === source.id && document.type === source.type) continue;
     if (isBroadNavigationPage(document, userSubject ?? source.title)) continue;
     const score = relationStrength(source, document, userSubject ?? source.title);
@@ -316,7 +321,7 @@ export function buildGlobalRelatedContentActions({ source, corpus, userSubject, 
     group.push({ document, score });
     groups.set(document.role, group);
   }
-  return [...groups.entries()]
+  const actions = [...groups.entries()]
     .map(([role, values]) => ({ role, values: values.sort((a, b) => b.score - a.score).slice(0, 3) }))
     .sort((a, b) => b.values[0]!.score - a.values[0]!.score)
     .flatMap(({ role, values }): SuggestionAction[] => {
@@ -335,6 +340,11 @@ export function buildGlobalRelatedContentActions({ source, corpus, userSubject, 
       return resolveEligibleActionDocuments(action, corpus).length ? [action] : [];
     })
     .slice(0, limit);
+  // A narrowed identity pool is an optimization only. If it cannot produce
+  // navigation, preserve the established full-corpus fallback and quality.
+  if (candidateCorpus?.length && candidateCorpus.length < corpus.length && !actions.length)
+    return buildGlobalRelatedContentActions({ source, corpus, userSubject, recentActionIds, limit });
+  return actions;
 }
 
 const COMPANY_NAVIGATION_ROLES = new Set<SuccessiveSearchDocument["role"]>([
