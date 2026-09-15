@@ -2038,28 +2038,32 @@ export async function POST(request: NextRequest) {
       performance.now() - requestStartedAt - understandingDurationMs,
     );
     const retrievalStartedAt = performance.now();
-    let retrieval = await retrieveFromIndex(
-      retrievalMessage,
-      isNamedSuccessivePersonQuery ? "general" : intent,
-      effectiveMessage,
-      shouldDeduplicate ? seenContentKeys : new Set<string>(),
-      understanding,
-    );
     // Semantic expansion can occasionally over-constrain a short, valid
     // visitor query. Always run a deterministic literal plan against the same
     // cached corpus and merge it, making cold/warm answers independent of a
-    // single interpretation without adding another WordPress request.
+    // single interpretation without adding another WordPress request. The two
+    // plans do not depend on one another, so run them concurrently.
     const literalUnderstanding = applyStructuralBroadQueryRules(
       buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
-    const literalRetrieval = await retrieveFromIndex(
-      effectiveMessage,
-      isNamedSuccessivePersonQuery ? "general" : intent,
-      effectiveMessage,
-      shouldDeduplicate ? seenContentKeys : new Set<string>(),
-      literalUnderstanding,
-    );
+    const [initialRetrieval, literalRetrieval] = await Promise.all([
+      retrieveFromIndex(
+        retrievalMessage,
+        isNamedSuccessivePersonQuery ? "general" : intent,
+        effectiveMessage,
+        shouldDeduplicate ? seenContentKeys : new Set<string>(),
+        understanding,
+      ),
+      retrieveFromIndex(
+        effectiveMessage,
+        isNamedSuccessivePersonQuery ? "general" : intent,
+        effectiveMessage,
+        shouldDeduplicate ? seenContentKeys : new Set<string>(),
+        literalUnderstanding,
+      ),
+    ]);
+    let retrieval = initialRetrieval;
     const strongestByDocument = (matches: SearchMatch[]) => [...matches.reduce((best, match) => {
       const key = `${match.document.type}:${match.document.id}`;
       const existing = best.get(key);
