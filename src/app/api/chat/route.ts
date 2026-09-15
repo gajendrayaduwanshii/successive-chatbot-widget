@@ -2040,17 +2040,16 @@ export async function POST(request: NextRequest) {
     );
     const retrievalStartedAt = performance.now();
     // Semantic expansion can occasionally over-constrain a short, valid
-    // visitor query. A literal plan protects that case. For a standalone
-    // deterministic query whose normalized plan is already identical, reusing
-    // the first result preserves the same evidence while avoiding an identical
-    // full-index scan.
+    // visitor query. A literal plan protects that case. An exact title lock
+    // has already established the entity identity, so a second full-index scan
+    // cannot improve that proof and only adds CPU time.
     const literalUnderstanding = applyStructuralBroadQueryRules(
       buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
-    const reuseInitialRetrieval = !usedSemanticUnderstanding &&
+    const reuseInitialRetrieval = Boolean(exactTitleLock) || (!usedSemanticUnderstanding &&
       !parsed.data.history.length && !parsed.data.suggestionAction && !actionMessage &&
-      normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage);
+      normalizeSearchText(retrievalMessage) === normalizeSearchText(effectiveMessage));
     const initialRetrievalPromise = retrieveFromIndex(
       retrievalMessage,
       isNamedSuccessivePersonQuery ? "general" : intent,

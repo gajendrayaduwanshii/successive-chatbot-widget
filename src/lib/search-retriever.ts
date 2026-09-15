@@ -1501,7 +1501,10 @@ function prewarmSearchIndexDerivedData(
     identityVocabulary(documents);
     exactIdentityLookup(documents);
   }
-  fullIndexInverseDocumentFrequency(documents);
+  // IDF traverses every chunk in the full corpus. Keep it lazy: exact title
+  // resolution does not use ranking and should not pay for a complete corpus
+  // scan while a new server instance is becoming ready. Broad retrieval still
+  // builds and caches it on its first actual use.
 }
 
 async function loadSearchIndex(): Promise<SuccessiveSearchDocument[]> {
