@@ -340,6 +340,8 @@ export async function POST(request: NextRequest) {
   let contextConstructionDurationMs = 0;
   let preRetrievalApplicationDurationMs = 0;
   let reusedInitialRetrievalForLiteral = false;
+  let responseCorpusPromise: ReturnType<typeof getSuggestionCorpus> | undefined;
+  const getResponseCorpus = () => responseCorpusPromise ??= getSuggestionCorpus();
   const origin = request.headers.get("origin");
   const cors = corsHeaders(origin);
   const isSameOrigin = origin === new URL(request.url).origin;
@@ -2537,7 +2539,7 @@ export async function POST(request: NextRequest) {
     // The deterministic answer needs ranked evidence even when a question has
     // a dependent-looking grammatical shape but explicitly names its subject.
     const structuralSupport = selectedMatches[0]
-      ? structuralCanonicalSupport(selectedMatches[0], await getSuggestionCorpus())
+      ? structuralCanonicalSupport(selectedMatches[0], await getResponseCorpus())
       : undefined;
     const questionEvidencePackage = selectedMatches[0]
       ? buildGroundedEvidencePackage({
@@ -2796,7 +2798,7 @@ export async function POST(request: NextRequest) {
     const alignedMatches = [alignment.primary, ...alignment.related].filter(
       (match): match is SearchMatch => Boolean(match),
     );
-    const bodyLinkMatches = inlineLinkMatches(selectedMatches, await getSuggestionCorpus(), categoryAnswer);
+    const bodyLinkMatches = inlineLinkMatches(selectedMatches, await getResponseCorpus(), categoryAnswer);
     const validatedBodyUrls = bodyLinkMatches.map(({ document }) => document.url);
     const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
       retainValidatedInlineLinks(categoryAnswer, validatedBodyUrls),
@@ -2850,12 +2852,12 @@ export async function POST(request: NextRequest) {
     const relatedEvidenceActions = alignment.primary
       ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
-          corpus: await getSuggestionCorpus(),
+          corpus: await getResponseCorpus(),
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           limit: 3,
         }) : buildGlobalRelatedContentActions({
           source: alignment.primary.document,
-          corpus: await getSuggestionCorpus(),
+          corpus: await getResponseCorpus(),
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           recentActionIds: parsed.data.suggestionAction ? [parsed.data.suggestionAction.id] : [],
           limit: 3,
