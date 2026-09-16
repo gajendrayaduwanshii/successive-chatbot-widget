@@ -174,7 +174,7 @@ Preserve official Successive names and quoted text. Do not answer the question.`
     if (input.presentationBase !== undefined) return this.enhanceGroundedResponse(input.message, input.presentationBase);
     const env = getEnv();
     if (!env.AI_API_KEY) throw new Error("LLM is not configured");
-    const client = this.createClient(45000);
+    const client = this.createClient(15000);
     const context = compactRelatedContext(input.context);
     const result = await client.chat.completions.create({
       model: env.AI_MODEL,
