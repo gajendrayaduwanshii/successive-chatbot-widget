@@ -491,6 +491,7 @@ export async function POST(request: NextRequest) {
     englishQuery: normalizeMalformedInterrogative(preparedQuery.englishQuery),
   };
   appTrace.pre.normalizationTypoMs = performance.now() - normalizationStartedAt;
+  const recentHistory = parsed.data.history.slice(-8);
   const historyFollowupStartedAt = performance.now();
   const lastAssistantContent = [...parsed.data.history].reverse()
     .find((item) => item.role === "assistant")?.content ?? "";
@@ -542,17 +543,18 @@ export async function POST(request: NextRequest) {
   const intentFacetCollectionStartedAt = performance.now();
   const explicitTurnUnderstanding = buildDeterministicUnderstanding(preparedQuery.englishQuery);
   const rawFacetOnlyFollowUp = isFacetOnlyFollowUp(preparedQuery.englishQuery);
+  const canResolveHistoryFollowUp = recentHistory.length > 0;
   const effectiveMessage = actionMessage ?? ((explicitTurnUnderstanding.requestedContentType && !rawFacetOnlyFollowUp) || detectCommercialIntent(preparedQuery.englishQuery)
     ? preparedQuery.englishQuery
     : rawFacetOnlyFollowUp
       ? preparedQuery.englishQuery
-    : resolveUnsupportedAlternativeFollowUp(
-    preparedQuery.englishQuery,
-    parsed.data.history,
-  ) ?? resolveOfferedResourceFollowUp(
-    preparedQuery.englishQuery,
-    parsed.data.history,
-  ) ?? resolveStructuredFollowUpMessage(preparedQuery.englishQuery, parsed.data.history)
+    : (canResolveHistoryFollowUp
+      ? resolveUnsupportedAlternativeFollowUp(preparedQuery.englishQuery, parsed.data.history) ??
+        resolveOfferedResourceFollowUp(preparedQuery.englishQuery, parsed.data.history) ??
+        resolveStructuredFollowUpMessage(preparedQuery.englishQuery, parsed.data.history)
+      : /^(?:what industries do (?:you|successive) serve|which sectors do (?:you|successive) work in)$/i.test(preparedQuery.englishQuery.trim())
+        ? resolveStructuredFollowUpMessage(preparedQuery.englishQuery, [])
+        : undefined)
     ?? preparedQuery.englishQuery);
   // The raw current query owns an explicit informational subject. Contextual
   // rewrites are only a fallback for dependent/action turns; they must not
@@ -803,7 +805,11 @@ export async function POST(request: NextRequest) {
     }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
   }
 
-  if (!exactTitleLock && continuesOffTopicContext(preparedQuery.englishQuery, parsed.data.history)) {
+  if (!exactTitleLock && continuesOffTopicContext(
+    preparedQuery.englishQuery,
+    parsed.data.history,
+    preparedQuery.englishQuery === effectiveMessage ? explicitTurnUnderstanding : undefined,
+  )) {
     return NextResponse.json({ success: true, data: {
       answer: "I'm here to help with Successive Digital's services, capabilities, industries, case studies, resources, and related business technology questions.",
       cards: [], sources: [], suggestions: [], suggestionActions: [],
@@ -1180,10 +1186,9 @@ export async function POST(request: NextRequest) {
   // An explicit content-role request owns the turn. Do not let an incidental
   // structured fact in the previous answer (for example a board press release)
   // convert an "other products" request into leadership lookup.
-  const directStructuredRequest = understandContextualStructuredRequest(
-    effectiveMessage,
-    parsed.data.history.slice(-8),
-  ) ?? (exactTitleLock ? understandStructuredRequest(exactTitleLock.document.title) : null);
+  const directStructuredRequest = understandStructuredRequest(effectiveMessage) ??
+    (recentHistory.length ? understandContextualStructuredRequest(effectiveMessage, recentHistory) : null) ??
+    (exactTitleLock ? understandStructuredRequest(exactTitleLock.document.title) : null);
   const structuredAttributeOwnsTurn = ["technologies", "capabilities"].includes(directStructuredRequest?.attribute ?? "");
   // A bare recognized person role (for example, "ceo") can also resemble an
   // indexed alias. Its explicit structured role is stronger than that title
@@ -1284,12 +1289,14 @@ export async function POST(request: NextRequest) {
       // temporarily incomplete; no static company fact is used as fallback.
     }
   }
-  const hasExplicitCurrentSubject = !isFacetOnlyFollowUp(effectiveMessage) &&
+  const effectiveFacetOnlyFollowUp = normalizeSearchText(effectiveMessage) === normalizeSearchText(preparedQuery.englishQuery)
+    ? rawFacetOnlyFollowUp
+    : isFacetOnlyFollowUp(effectiveMessage);
+  const hasExplicitCurrentSubject = !effectiveFacetOnlyFollowUp &&
     (deterministicUnderstanding.topics.length > 0 ||
       deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry));
   // A standalone request cannot gain context-derived terms. Avoid two
   // identical conversation-state passes on the common no-history path.
-  const recentHistory = parsed.data.history.slice(-8);
   const deterministicWithContext = recentHistory.length
     ? resolveConversationUnderstanding(deterministicUnderstanding, recentHistory).understanding
     : deterministicUnderstanding;
@@ -1369,7 +1376,7 @@ export async function POST(request: NextRequest) {
     industry: hasExplicitCurrentSubject
       ? deterministicUnderstanding.industry
       : deterministicUnderstanding.industry ?? understanding.industry,
-    requestedContentType: isFacetOnlyFollowUp(effectiveMessage) &&
+    requestedContentType: effectiveFacetOnlyFollowUp &&
       !/\b(?:ebook|e book|resource|guide)\b/i.test(effectiveMessage)
       ? null
       : deterministicUnderstanding.requestedContentType,
@@ -1418,10 +1425,8 @@ export async function POST(request: NextRequest) {
     intent,
   );
   const seenContentKeys = new Set([
-    ...parsed.data.seenContent.flatMap(({ title, url }) =>
-      contentIdentity(title, url),
-    ),
-    ...contentIdentitiesFromAssistantHistory(parsed.data.history),
+    ...parsed.data.seenContent.flatMap(({ title, url }) => contentIdentity(title, url)),
+    ...(recentHistory.length ? contentIdentitiesFromAssistantHistory(parsed.data.history) : []),
   ]);
   const premiseVerificationQuery = understanding.containsPremise
     ? normalizeSearchText(effectiveMessage)
