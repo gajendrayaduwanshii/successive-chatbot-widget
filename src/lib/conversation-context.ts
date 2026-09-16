@@ -1,6 +1,6 @@
 import { normalizeSearchText } from "./search-index";
 import type { Intent } from "./intent-detector";
-import { buildDeterministicUnderstanding, buildRetrievalQuery, classifyFollowUpScope, isDependentFollowUp } from "./query-understanding";
+import { buildDeterministicUnderstanding, buildRetrievalQuery, classifyFollowUpScope, isDependentFollowUp, type QueryUnderstanding } from "./query-understanding";
 import { detectCommercialIntent } from "./commercial-intent";
 
 type HistoryMessage = { role: "user" | "assistant"; content: string };
@@ -186,8 +186,12 @@ export function resolveOfferedResourceFollowUp(
 }
 
 /** Keeps terse dependent turns inside a confidently off-topic conversation. */
-export function continuesOffTopicContext(message: string, history: HistoryMessage[]): boolean {
-  const current = buildDeterministicUnderstanding(message);
+export function continuesOffTopicContext(
+  message: string,
+  history: HistoryMessage[],
+  currentUnderstanding?: QueryUnderstanding,
+): boolean {
+  const current = currentUnderstanding ?? buildDeterministicUnderstanding(message);
   if (current.isOffTopic) return true;
   if (/\b(?:successive|kagen|services?|products?|case stud(?:y|ies)|careers?|jobs?|cloud|data|api|ai|security|contact|sales)\b/i.test(message))
     return false;
