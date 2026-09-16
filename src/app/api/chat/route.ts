@@ -1279,10 +1279,12 @@ export async function POST(request: NextRequest) {
   const hasExplicitCurrentSubject = !isFacetOnlyFollowUp(effectiveMessage) &&
     (deterministicUnderstanding.topics.length > 0 ||
       deterministicUnderstanding.entities.length > 0 || Boolean(deterministicUnderstanding.industry));
-  const deterministicWithContext = resolveConversationUnderstanding(
-    deterministicUnderstanding,
-    parsed.data.history.slice(-8),
-  ).understanding;
+  // A standalone request cannot gain context-derived terms. Avoid two
+  // identical conversation-state passes on the common no-history path.
+  const recentHistory = parsed.data.history.slice(-8);
+  const deterministicWithContext = recentHistory.length
+    ? resolveConversationUnderstanding(deterministicUnderstanding, recentHistory).understanding
+    : deterministicUnderstanding;
   // Reuse the already-resolved, ambiguity-checked indexed identity. Bare
   // canonical titles can contain problem words without asking for advice.
   const confidentStandaloneSubject = Boolean(
@@ -1370,10 +1372,12 @@ export async function POST(request: NextRequest) {
       ? deterministicUnderstanding.entities
       : deterministicUnderstanding.entities.length ? deterministicUnderstanding.entities : understanding.entities,
   };
-  understanding = applyStructuralBroadQueryRules(resolveConversationUnderstanding(
-    understanding,
-    parsed.data.history.slice(-8),
-  ).understanding, effectiveMessage);
+  understanding = applyStructuralBroadQueryRules(
+    recentHistory.length
+      ? resolveConversationUnderstanding(understanding, recentHistory).understanding
+      : understanding,
+    effectiveMessage,
+  );
   // Lock explicit indexed titles before generic intent routing. Words such as
   // cost, investment, development, or services inside a title are identity,
   // not commercial/navigation instructions.
@@ -2113,8 +2117,13 @@ export async function POST(request: NextRequest) {
     // visitor query. A literal plan protects that case. An exact title lock
     // has already established the entity identity, so a second full-index scan
     // cannot improve that proof and only adds CPU time.
+    // The deterministic understanding above already represents the effective
+    // request. Rebuilding it here repeated all subject/facet parsing before
+    // the literal safety pass.
     const literalUnderstanding = applyStructuralBroadQueryRules(
-      buildDeterministicUnderstanding(effectiveMessage),
+      normalizeSearchText(effectiveMessage) === normalizeSearchText(preparedQuery.englishQuery)
+        ? deterministicUnderstanding
+        : buildDeterministicUnderstanding(effectiveMessage),
       effectiveMessage,
     );
     const equivalentRetrievalInput =
@@ -2153,6 +2162,8 @@ export async function POST(request: NextRequest) {
           effectiveMessage,
           shouldDeduplicate ? seenContentKeys : new Set<string>(),
           literalUnderstanding,
+          true,
+          initialRetrieval.reusableEligibleDocuments,
         );
     appTrace.literalRetrieval.secondRetrievalMs = shouldReuseLiteral ? 0 : performance.now() - literalRetrievalStartedAt;
     appTrace.literalRetrieval.candidateLookupMs = literalRetrieval.timings?.candidateLookupMs ?? 0;
@@ -2968,6 +2979,7 @@ export async function POST(request: NextRequest) {
       ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
           corpus: responseCorpus,
+          candidateCorpus: navigationCandidates,
           userSubject: understanding.entities[0] ?? (understanding.topics.join(" ") || alignment.primary.document.title),
           limit: 3,
         }) : buildGlobalRelatedContentActions({
