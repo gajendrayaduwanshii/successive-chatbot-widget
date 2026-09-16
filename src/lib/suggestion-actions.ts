@@ -531,9 +531,11 @@ function individualRelationStrength(
 /** Structural navigation for a resolved individual page; semantic similarity
  * alone is deliberately insufficient and cross-category topic feeds are excluded.
  * Broad COMPANY_INFORMATION membership is not enough to render a suggestion. */
-export function buildIndividualPageNavigationActions({ source, corpus, userSubject, leadershipContext, excludedResultKeys = [], limit = 3 }: {
+export function buildIndividualPageNavigationActions({ source, corpus, candidateCorpus, userSubject, leadershipContext, excludedResultKeys = [], limit = 3 }: {
   source: SuccessiveSearchDocument;
   corpus: SuccessiveSearchDocument[];
+  /** Bounded identity candidates for optional route-level navigation. */
+  candidateCorpus?: SuccessiveSearchDocument[];
   userSubject?: string;
   leadershipContext?: LeadershipSuggestionContext;
   excludedResultKeys?: string[];
@@ -542,7 +544,11 @@ export function buildIndividualPageNavigationActions({ source, corpus, userSubje
   const excluded = new Set([documentActionKey(source), ...excludedResultKeys]);
   const personSubject = !leadershipContext && isPersonPrimarySubject(userSubject, source);
   const MIN_RELATION_SCORE = 50;
-  return corpus.flatMap((target): Array<{ target: SuccessiveSearchDocument; relationType: NonNullable<SuggestionAction["relationType"]>; score: number }> => {
+  // Route callers may deliberately provide an empty bounded set: navigation
+  // is optional there, so avoid turning a missing identity candidate into a
+  // 948-document relation scan. Existing callers retain the full corpus.
+  const searchableCorpus = candidateCorpus ?? corpus;
+  return searchableCorpus.flatMap((target): Array<{ target: SuccessiveSearchDocument; relationType: NonNullable<SuggestionAction["relationType"]>; score: number }> => {
     if (excluded.has(documentActionKey(target))) return [];
     if (leadershipContext && !locallySupportsLeadershipContext(target, leadershipContext)) return [];
     const mentionsSubject = Boolean(userSubject && candidateMentionsSubject(target, userSubject));

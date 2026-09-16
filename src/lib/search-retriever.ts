@@ -217,6 +217,12 @@ export interface RetrievalResult {
   collectionTotal?: number;
   collectionLabel?: string;
   candidates?: SearchMatch[];
+  /**
+   * The eligibility filter is independent of scoring for ordinary general
+   * retrieval. A materially different literal pass may reuse this bounded
+   * document set, while still computing its own candidates and scores.
+   */
+  reusableEligibleDocuments?: SuccessiveSearchDocument[];
   timings?: {
     indexLoadMs: number; relationshipScoringMs: number; rankingMs: number;
     candidateLookupMs: number; candidateCount: number; eligibleFilterMs: number;
@@ -2141,6 +2147,7 @@ export async function retrieveFromIndex(
   excludedContent = new Set<string>(),
   understanding?: QueryUnderstanding,
   allowCandidateLookup = true,
+  reusableEligibleDocuments?: SuccessiveSearchDocument[],
 ): Promise<RetrievalResult> {
   const retrievalStartedAt = performance.now();
   const baseIndex = await loadSearchIndex();
@@ -2723,7 +2730,7 @@ export async function retrieveFromIndex(
     };
   }
   const eligibleFilterStartedAt = performance.now();
-  let categoryIndex = index.filter((document) => {
+  let categoryIndex = reusableEligibleDocuments ?? index.filter((document) => {
     if (understanding?.requestedContentType &&
         !canonicalPageMatch(document, currentMessage) &&
         !isRequestedContentTypeCompatible(document, understanding.requestedContentType))
@@ -2810,13 +2817,15 @@ export async function retrieveFromIndex(
     return true;
   });
   eligibleFilterMs = performance.now() - eligibleFilterStartedAt;
+  const reusableEligibilitySet = categoryIndex;
   const candidateLookupStartedAt = performance.now();
   const candidateTerms = normalizeSearchText(`${query} ${currentMessage}`).split(" ")
     .filter((term) => term.length >= 4 && !STOPWORDS.has(term));
+  const eligibleDocuments = new Set(categoryIndex);
   const candidateCounts = new Map<SuccessiveSearchDocument, number>();
   if (allowCandidateLookup && candidateTerms.length >= 2) {
     candidateTerms.forEach((term) => candidateLookup(index).get(term)?.forEach((document) => {
-      if (categoryIndex.includes(document))
+      if (eligibleDocuments.has(document))
         candidateCounts.set(document, (candidateCounts.get(document) ?? 0) + 1);
     }));
     const minimumTermMatches = Math.min(2, new Set(candidateTerms).size);
@@ -2991,6 +3000,14 @@ export async function retrieveFromIndex(
                 ? "below relative relevance threshold"
                 : undefined,
     })),
+    // Only general, unconstrained retrieval has an eligibility set that is
+    // provably independent of the query wording. It is safe to carry this
+    // set into a literal retry; role/collection constrained paths recompute.
+    reusableEligibleDocuments:
+      intent === "general" && !understanding?.requestedContentType &&
+      !/\bfull stack\b/.test(normalizedQuery)
+        ? reusableEligibilitySet
+        : undefined,
     timings: {
       indexLoadMs: Math.round((indexLoadedAt - retrievalStartedAt) * 100) / 100,
       relationshipScoringMs: Math.round((relationshipsScoredAt - indexLoadedAt) * 100) / 100,
