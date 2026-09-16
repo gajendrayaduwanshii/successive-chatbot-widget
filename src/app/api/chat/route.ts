@@ -378,6 +378,11 @@ export async function POST(request: NextRequest) {
       serializationMs: 0, postOtherMs: 0, inlineCandidateCount: 0,
       navigationCandidateCount: 0, inlineFullScanUsed: false, navigationFullScanUsed: false,
     },
+    accounting: {
+      measuredPreMs: 0, preOtherMs: 0, measuredRetrievalMs: 0, measuredPostMs: 0,
+      postOtherMs: 0, accountedApplicationMs: 0, unaccountedApplicationMs: 0,
+      unaccountedPercent: 0,
+    },
   };
   let understandingDurationMs = 0;
   let retrievalDurationMs = 0;
@@ -2423,6 +2428,7 @@ export async function POST(request: NextRequest) {
         { headers: { ...cors.headers, "Cache-Control": "no-store" } },
       );
     }
+    const evidenceValidationStartedAt = performance.now();
     let evidenceValidation = validateEvidence({
       message: effectiveMessage,
       contextMessage: retrievalMessage,
@@ -2430,6 +2436,7 @@ export async function POST(request: NextRequest) {
       matches: selectedMatches,
       hasConversationSubject: parsed.data.history.some((item) => item.role === "user"),
     });
+    appTrace.post.evidenceValidationMs += performance.now() - evidenceValidationStartedAt;
     // Exact identity is valuable for locating a subject, but it cannot turn a
     // qualifier question into a generic capability answer. Those questions
     // must continue through subject-local attribute validation.
@@ -2570,11 +2577,13 @@ export async function POST(request: NextRequest) {
     const isWhitepaperCollectionQuery =
       isWhitepaperQuery &&
       /\b(?:total|all|list|count|how many)\b/i.test(effectiveMessage);
+    const alignmentStartedAt = performance.now();
     const preGenerationAlignment = selectAlignedSecondaryMatches({
       matches: validatedMatches,
       understanding,
       limit: 4,
     });
+    appTrace.post.matchAlignmentMs += performance.now() - alignmentStartedAt;
     if (!preGenerationAlignment.primary &&
         (understanding.topics.length > 0 || understanding.entities.length > 0) &&
         !["solve_problem", "recommendation"].includes(understanding.intent)) {
@@ -2616,9 +2625,12 @@ export async function POST(request: NextRequest) {
     contextConstructionDurationMs = performance.now() - contextStartedAt;
     // The deterministic answer needs ranked evidence even when a question has
     // a dependent-looking grammatical shape but explicitly names its subject.
+    const structuralSupportStartedAt = performance.now();
     const structuralSupport = selectedMatches[0]
       ? structuralCanonicalSupport(selectedMatches[0], await getResponseCorpus())
       : undefined;
+    appTrace.post.structuralSupportMs += performance.now() - structuralSupportStartedAt;
+    const evidencePackageStartedAt = performance.now();
     const questionEvidencePackage = selectedMatches[0]
       ? buildGroundedEvidencePackage({
         userQuery: effectiveMessage,
@@ -2632,6 +2644,8 @@ export async function POST(request: NextRequest) {
       !isDependentFollowUp(effectiveMessage)
       ? questionEvidencePackage
       : undefined;
+    appTrace.post.evidencePackageMs += performance.now() - evidencePackageStartedAt;
+    const deterministicAnswerStartedAt = performance.now();
     let deterministicGroundedAnswer = buildQuestionFocusedFallback(
       buildGroundedRetrievalAnswer(selectedMatches),
       questionEvidencePackage,
@@ -2677,6 +2691,7 @@ export async function POST(request: NextRequest) {
         })
       : undefined;
     if (strongDeterministic?.answer) deterministicGroundedAnswer = strongDeterministic.answer;
+    appTrace.post.deterministicAnswerMs += performance.now() - deterministicAnswerStartedAt;
     // Keep the deeper evidence-package/elaboration composer for other queries.
     const elaboration = evidencePackage || strongDeterministic?.answer ? undefined : planGroundedElaboration({
       answer: deterministicGroundedAnswer,
@@ -2876,7 +2891,10 @@ export async function POST(request: NextRequest) {
     const alignedMatches = [alignment.primary, ...alignment.related].filter(
       (match): match is SearchMatch => Boolean(match),
     );
+    const suggestionCorpusStartedAt = performance.now();
     const responseCorpus = await getResponseCorpus();
+    appTrace.post.suggestionCorpusMs += performance.now() - suggestionCorpusStartedAt;
+    const inlineStartedAt = performance.now();
     const bodyLinkCandidates = preparedIdentityCandidates(responseCorpus, categoryAnswer);
     const navigationCandidates = alignment.primary
       ? preparedIdentityCandidates(
@@ -2891,11 +2909,15 @@ export async function POST(request: NextRequest) {
       bodyLinkCandidates,
       false,
     );
+    appTrace.post.inlineCandidateLookupMs += performance.now() - inlineStartedAt;
+    appTrace.post.inlineCandidateCount = bodyLinkCandidates.length;
+    const inlineLinkStartedAt = performance.now();
     const validatedBodyUrls = bodyLinkMatches.map(({ document }) => document.url);
     const inlineLinkedAnswer = enrichAnswerWithValidatedInlineLinks(
       retainValidatedInlineLinks(categoryAnswer, validatedBodyUrls),
       bodyLinkMatches,
     );
+    appTrace.post.inlineLinksMs += performance.now() - inlineLinkStartedAt;
     const hasBodyLink = Boolean(alignment.primary?.document.url && hasCanonicalBodyLink(inlineLinkedAnswer, alignment.primary.document.url));
     const cta = shouldAppendFinalCta(Boolean(evidencePackage), hasBodyLink)
       ? alignedCta(alignment.primary, understanding)
@@ -2941,6 +2963,7 @@ export async function POST(request: NextRequest) {
       exactResource: Boolean(exactNamedResource),
       personEntity: isNamedSuccessivePersonQuery && alignment.primary?.document.role === "company",
     });
+    const navigationStartedAt = performance.now();
     const relatedEvidenceActions = alignment.primary
       ? suggestionContextType === "INDIVIDUAL_PAGE_CONTEXT" ? buildIndividualPageNavigationActions({
           source: alignment.primary.document,
@@ -2957,6 +2980,8 @@ export async function POST(request: NextRequest) {
           allowFullFallback: false,
         })
       : [];
+    appTrace.post.navigationRelationshipScoringMs += performance.now() - navigationStartedAt;
+    appTrace.post.navigationCandidateCount = navigationCandidates.length;
     const suggestionActions = relatedEvidenceActions
       .filter((action, index, all) => all.findIndex((candidate) => candidate.id === action.id) === index)
       .slice(0, 3);
@@ -3010,7 +3035,27 @@ export async function POST(request: NextRequest) {
       applicationDurationMs - roundedPreRetrievalApplicationDurationMs - roundedRetrievalDurationMs - roundedContextConstructionDurationMs,
     );
     appTrace.preOtherBreakdown.otherMs = appTrace.pre.preOtherMs;
-    appTrace.post.postOtherMs = postRetrievalApplicationDurationMs;
+    const measuredPostMs = Object.entries(appTrace.post)
+      .filter(([key, value]) => key.endsWith("Ms") && key !== "postOtherMs" && typeof value === "number")
+      .reduce((total, [, value]) => total + (value as number), 0);
+    appTrace.post.postOtherMs = Math.max(0, postRetrievalApplicationDurationMs - measuredPostMs);
+    const measuredPreMs = appTrace.pre.requestPreparationMs + appTrace.pre.historyFollowupMs +
+      appTrace.pre.normalizationTypoMs + appTrace.pre.intentFacetCollectionMs +
+      appTrace.title.titleResolutionTotalMs;
+    const measuredRetrievalMs = appTrace.literalRetrieval.initialRetrievalMs + appTrace.literalRetrieval.secondRetrievalMs;
+    const accountedApplicationMs = measuredPreMs + appTrace.pre.preOtherMs + measuredRetrievalMs +
+      measuredPostMs + appTrace.post.postOtherMs;
+    const unaccountedApplicationMs = Math.max(0, applicationDurationMs - accountedApplicationMs);
+    appTrace.accounting = {
+      measuredPreMs,
+      preOtherMs: appTrace.pre.preOtherMs,
+      measuredRetrievalMs,
+      measuredPostMs,
+      postOtherMs: appTrace.post.postOtherMs,
+      accountedApplicationMs,
+      unaccountedApplicationMs,
+      unaccountedPercent: applicationDurationMs ? unaccountedApplicationMs / applicationDurationMs * 100 : 0,
+    };
     const chatMetrics = {
       totalDurationMs,
       applicationDurationMs,
