@@ -387,6 +387,8 @@ export async function POST(request: NextRequest) {
   let understandingDurationMs = 0;
   let retrievalDurationMs = 0;
   let finalLlmDurationMs = 0;
+  let finalLlmStatus: "success" | "timeout" | "error" | "skipped" = "skipped";
+  let finalLlmPath: "lightweight-enhancer" | "full-composer" | "none" = "none";
   let contextConstructionDurationMs = 0;
   let preRetrievalApplicationDurationMs = 0;
   let reusedInitialRetrievalForLiteral = false;
@@ -2726,8 +2728,9 @@ export async function POST(request: NextRequest) {
     // Validated deterministic evidence already exists here. An unavailable
     // provider must not turn that answer into AI_NOT_CONFIGURED.
     if (!deterministicOverview && !strongDeterministic?.answer && getEnv().AI_API_KEY) {
+      finalLlmPath = lightweightEnhancement ? "lightweight-enhancer" : "full-composer";
+      const finalLlmStartedAt = performance.now();
       try {
-        const finalLlmStartedAt = performance.now();
         const generated = await getLLMProvider().generateStructuredResponse(lightweightEnhancement ? {
           message: parsed.data.message,
           presentationBase: deterministicGroundedAnswer,
@@ -2751,9 +2754,13 @@ export async function POST(request: NextRequest) {
         });
         const validated = assistantResponseSchema.safeParse(generated);
         if (validated.success) generatedData = validated.data;
-        finalLlmDurationMs = performance.now() - finalLlmStartedAt;
-      } catch {
+        finalLlmStatus = "success";
+      } catch (caught) {
+        const message = caught instanceof Error ? `${caught.name} ${caught.message}` : String(caught);
+        finalLlmStatus = /(?:timeout|timed out|abort)/i.test(message) ? "timeout" : "error";
         // Continue with a deterministic source-backed story below.
+      } finally {
+        finalLlmDurationMs = performance.now() - finalLlmStartedAt;
       }
     }
     let generatedAnswer =
@@ -3095,6 +3102,8 @@ export async function POST(request: NextRequest) {
       rankingDurationMs: retrieval.timings?.rankingMs ?? 0,
       contextConstructionDurationMs: roundedContextConstructionDurationMs,
       finalLlmDurationMs: roundedFinalLlmDurationMs,
+      finalLlmStatus,
+      finalLlmPath,
       postRetrievalApplicationDurationMs,
       wordpress: getContentLoadDiagnostics(),
       index: getIndexDiagnostics(),
