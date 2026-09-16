@@ -62,7 +62,10 @@ function isFacetClause(clause: string): boolean {
   return /\b(?:what|which|who(?:'s|s)?|where|how|does|do|is|are|can|could|show|find|give|tell|explain|summarize|any|latest|newest|case stud(?:y|ies)|customer example|article|blog|news|service|partner|cost|pricing|price)\b/i.test(clause);
 }
 
-export function extractQueryFacets(message: string): QueryFacet[] {
+export function extractQueryFacets(
+  message: string,
+  singleQueryUnderstanding?: QueryUnderstanding,
+): QueryFacet[] {
   const normalized = message.replace(/\s+/g, " ").trim();
   const clauses = normalized
     .split(/\s*(?:[?;]+|[.!]\s+(?=(?:(?:then|also)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|explain|describe|list|any|what|which|who|where|how|latest|newest)\b)|,\s+(?=(?:(?:and|also|then)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b)|\s+and\s+(?=(?:(?:(?:then|also)\s+)?(?:do|does|can|could|is|are|show|find|give|tell|any|what|which|who|where|how|latest|newest)\b|(?:show\s+)?(?:a\s+)?(?:relevant|related)\s+(?:case stud(?:y|ies)|resources?|articles?)|(?:project\s+)?(?:cost|pricing|price)\b|(?:cost|pricing|price)\s+of\b)))\s*/i)
@@ -71,7 +74,12 @@ export function extractQueryFacets(message: string): QueryFacet[] {
   const candidates = clauses.length >= 2 ? clauses : [normalized];
   let activeSubject: string | null = null;
   return candidates.slice(0, 4).map((text, index) => {
-    const parsed = buildDeterministicUnderstanding(text);
+    // The route has already parsed the ordinary one-part visitor request.
+    // Preserve all multi-part parsing, while avoiding a second regex-heavy
+    // deterministic pass for the common single-query path.
+    const parsed = candidates.length === 1 && singleQueryUnderstanding
+      ? singleQueryUnderstanding
+      : buildDeterministicUnderstanding(text);
     const dependent = isDependentRelationClause(text);
     const explicitSubject = dependent ? null : explicitFacetSubject(text, parsed);
     const subject = explicitSubject ?? (dependent ? activeSubject : null);

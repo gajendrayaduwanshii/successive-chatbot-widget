@@ -559,6 +559,11 @@ export async function POST(request: NextRequest) {
   // replace a resolvable standalone entity before fact/no-content routing.
   const currentExplicitSubject = actionMessage
     ? undefined : extractExplicitInformationalSubject(preparedQuery.englishQuery);
+  const effectiveExplicitSubject = currentExplicitSubject &&
+    normalizeSearchText(effectiveMessage) === normalizeSearchText(preparedQuery.englishQuery)
+    ? currentExplicitSubject
+    : extractExplicitInformationalSubject(effectiveMessage);
+  const detectedCommercialIntent = detectCommercialIntent(effectiveMessage);
   const titleResolutionTimings: RouteTitleResolutionTimings = {
     corpusLookupMs: 0,
     structuredFallbackMs: 0,
@@ -587,13 +592,18 @@ export async function POST(request: NextRequest) {
   appTrace.title.persistedReadMs = indexLoadTrace.persistedReadMs;
   appTrace.title.jsonParseMs = indexLoadTrace.jsonParseMs;
   appTrace.title.hydrationMs = indexLoadTrace.preparedIdentityHydrationMs;
+  // Keep one facet parse for the entire request. For the common standalone
+  // query, reuse the deterministic understanding already computed above.
+  const currentFacets = normalizeSearchText(effectiveMessage) === normalizeSearchText(preparedQuery.englishQuery)
+    ? extractQueryFacets(effectiveMessage, explicitTurnUnderstanding)
+    : extractQueryFacets(effectiveMessage);
   const intentFacetCollectionEndedAt = performance.now();
   appTrace.pre.intentFacetCollectionMs = intentFacetCollectionEndedAt - intentFacetCollectionStartedAt - appTrace.title.titleResolutionTotalMs;
   if (!parsed.data.history.length && !actionMessage && !exactTitleLock &&
       !detectCommercialIntent(preparedQuery.englishQuery) &&
       !isExplicitRequestedRoleRelation(preparedQuery.englishQuery) &&
       !understandStructuredRequest(preparedQuery.englishQuery) &&
-      extractQueryFacets(preparedQuery.englishQuery).length < 2 &&
+      currentFacets.length < 2 &&
       isDependentFollowUp(preparedQuery.englishQuery)) {
     const role = explicitTurnUnderstanding.requestedContentType?.replace("-", " ");
     const answer = role
@@ -675,7 +685,6 @@ export async function POST(request: NextRequest) {
       buildStructuredConversationState(parsed.data.history.slice(-8)).activeTopic,
     );
 
-  const currentFacets = extractQueryFacets(effectiveMessage);
   if (currentFacets.length > 1) {
     const facetRequests = currentFacets.map(({ text }, index) => {
       const structured = understandStructuredRequest(text);
@@ -719,7 +728,7 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  if (currentFacets.length > 1 && !detectCommercialIntent(effectiveMessage)) {
+  if (currentFacets.length > 1 && !detectedCommercialIntent) {
     const parts: Array<{ answer: string; documents: SuccessiveSearchDocument[]; understanding: QueryUnderstanding;
       subject?: string | null; structured?: StructuredRequest }> = [];
     for (const facet of currentFacets) {
@@ -990,7 +999,7 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  if (!exactTitleLock && !detectCommercialIntent(effectiveMessage) &&
+  if (!exactTitleLock && !detectedCommercialIntent &&
       /\b(?:client|customer|partner|work did|did you do|tell me about)\b/i.test(effectiveMessage)) {
     try {
       const items = await fetchAllPublishedContent();
@@ -1052,7 +1061,7 @@ export async function POST(request: NextRequest) {
   // Strong sales requests must reach the commercial route before private-price
   // evidence safeguards; the commercial route already refuses invented prices
   // and attaches only the validated Contact Us destination.
-  const unsupportedAnswer = exactTitleLock || explicitTurnUnderstanding.requestedContentType || detectCommercialIntent(effectiveMessage)
+  const unsupportedAnswer = exactTitleLock || explicitTurnUnderstanding.requestedContentType || detectedCommercialIntent
     ? null
     : safeUnsupportedQueryResponse(effectiveMessage);
   if (unsupportedAnswer) {
@@ -1140,8 +1149,7 @@ export async function POST(request: NextRequest) {
   const deterministicUnderstanding = actionMessage
     ? buildDeterministicUnderstanding(effectiveMessage)
     : explicitTurnUnderstanding;
-  const compoundFacets = exactTitleLock || detectCommercialIntent(effectiveMessage)
-    ? [] : extractQueryFacets(effectiveMessage);
+  const compoundFacets = exactTitleLock || detectedCommercialIntent ? [] : currentFacets;
   const compoundStructuredRequests = compoundFacets.length > 1
     ? compoundFacets.map(({ text }) => understandStructuredRequest(text))
     : [];
@@ -1181,7 +1189,7 @@ export async function POST(request: NextRequest) {
   // indexed alias. Its explicit structured role is stronger than that title
   // lock and must use the same path as the sentence-form role query.
   const structuredPersonRoleOwnsTurn = Boolean(directStructuredRequest?.requestedRole);
-  const structuredRequest = detectCommercialIntent(effectiveMessage) ||
+  const structuredRequest = detectedCommercialIntent ||
     currentFacets.length > 1 ||
     // A catalog-like word embedded in an exact resource title is title text,
     // not an instruction to replace that resource with a company catalog.
@@ -1293,7 +1301,7 @@ export async function POST(request: NextRequest) {
     canUseEnglishQueryDirectly(parsed.data.message) && currentFacets.length <= 1 &&
     // As in the existing commercial route, an indexed title owns identity;
     // commercial vocabulary inside a bare title is not a pricing request.
-    (!detectCommercialIntent(effectiveMessage) ||
+    (!detectedCommercialIntent ||
       normalizeSearchText(effectiveMessage) === normalizeSearchText(currentExplicitSubject)) &&
     !deterministicUnderstanding.isFollowUp && !deterministicUnderstanding.needsClarification &&
     !deterministicUnderstanding.containsPremise && !deterministicUnderstanding.temporalIntent &&
@@ -1402,7 +1410,7 @@ export async function POST(request: NextRequest) {
   // active subject. It is not itself a request to buy or contact sales.
   const dependentCompatibility = isDependentFollowUp(effectiveMessage) &&
     /\b(?:integrat(?:e|es|ed|ing|ion)|compatib(?:le|ility)|interoperab(?:le|ility)|connect(?:s|ed|ing|ion)?)\b/i.test(effectiveMessage);
-  const commercialIntent = exactTitleLock || dependentCompatibility ? null : detectCommercialIntent(effectiveMessage);
+  const commercialIntent = exactTitleLock || dependentCompatibility ? null : detectedCommercialIntent;
   const isNamedSuccessivePersonQuery =
     understanding.targetScope === "company" && understanding.entities.length > 0;
   const shouldDeduplicate = shouldDeduplicateDiscoveryResults(
@@ -2211,7 +2219,7 @@ export async function POST(request: NextRequest) {
         isBroadQuery: false,
       };
     }
-    const facets = extractQueryFacets(effectiveMessage);
+    const facets = currentFacets;
     const facetResults: Array<{ facet: typeof facets[number]; understanding: QueryUnderstanding;
       result: Awaited<ReturnType<typeof retrieveFromIndex>>; matches: SearchMatch[] }> = [];
     if (facets.length > 1) {
@@ -2604,7 +2612,7 @@ export async function POST(request: NextRequest) {
         confidence: "low", insufficientContext: true,
       }}, { headers: { ...cors.headers, "Cache-Control": "no-store" } });
     }
-    const explicitInformationalSubject = extractExplicitInformationalSubject(effectiveMessage);
+    const explicitInformationalSubject = effectiveExplicitSubject;
     const shortTechnicalSubject = Boolean(explicitInformationalSubject && isShortSemanticSubject(explicitInformationalSubject));
     const contextMatches = preGenerationAlignment.primary
       ? [preGenerationAlignment.primary, ...(shortTechnicalSubject ? [] : preGenerationAlignment.related)]
@@ -2839,7 +2847,7 @@ export async function POST(request: NextRequest) {
       /\bSuccessive\s+(?:does not|doesn't|cannot|can't|has no|only)\b/i.test(generatedAnswer)
     )
       generatedAnswer = buildGroundedRetrievalAnswer(selectedMatches);
-    const directDefinitionSubject = extractExplicitInformationalSubject(effectiveMessage);
+    const directDefinitionSubject = effectiveExplicitSubject;
     const enforceDefinitionSerialization = Boolean(directDefinitionSubject &&
       isDirectDefinitionQuery(effectiveMessage) && isCompactDefinitionSubject(directDefinitionSubject));
     const finalDefinitionEvidence = enforceDefinitionSerialization
